@@ -1,0 +1,14 @@
+{
+  "entropy_threshold": 4.5,
+  "minority_cluster_ratio": 0.1,
+  "dbscan_tolerance": 0.05,
+  "dbscan_min_samples": 2,
+  "normalize_features": true,
+  "suspicious_path_patterns": [
+    "/tmp/",
+    "/dev/shm/",
+    "/var/tmp/",
+    "/home/[^/]+/\\.[^/]+",
+    "^\\./"
+  ]
+}
