@@ -2,6 +2,8 @@
 
 > **"Where's Waldo?" for Cybersecurity** — Fleet-wide anomaly detection powered by unsupervised machine learning.
 
+Created with [Claude.ai](https://claude.ai) but supervised by a human (me apparently).
+
 IronSift is a high-performance Rust-based cybersecurity tool that analyzes massive process logs to identify compromised machines in server fleets. Using DBSCAN clustering and TF-IDF feature engineering, it detects threats without requiring known attack signatures.
 
 ---
@@ -342,27 +344,6 @@ We welcome contributions! Areas of interest:
 - Real-time streaming analysis
 - Integration with SIEM platforms
 - Custom feature extractors
-
----
-
-## 📄 License
-
-MIT License - see LICENSE file
-
----
-
-## 🙏 Acknowledgments
-
-Built with:
-- [Linfa](https://github.com/rust-ml/linfa) - Rust ML framework
-- [Rayon](https://github.com/rayon-rs/rayon) - Parallel processing
-- [ndarray](https://github.com/rust-ndarray/ndarray) - N-dimensional arrays
-
----
-
-## 📧 Contact
-
-Questions? Open an issue or contact [@yourhandle](https://github.com/yourhandle)
 
 ---
 
