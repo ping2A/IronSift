@@ -1,6 +1,6 @@
 [package]
 name = "ironsift"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Where's Waldo?"
 
@@ -14,7 +14,19 @@ path = "bin/generator.rs"
 
 [[bin]]
 name = "ironsift"
-path = "src/main.rs"
+path = "bin/main.rs"
+
+[[example]]
+name = "simple"
+path = "examples/simple.rs"
+
+[[example]]
+name = "builder"
+path = "examples/builder.rs"
+
+[[example]]
+name = "json_parsing"
+path = "examples/json_parsing.rs"
 
 [dependencies]
 # Serialization

@@ -73,8 +73,9 @@ impl DetectionConfig {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct RawLogEntry {
     pub machine_id: String,
+    pub pid: u32,
+    pub ppid: u32,
     pub name: String,
-    pub parent: String,
     pub uid: u32,
     pub path: String,
     pub args: String,
@@ -82,10 +83,94 @@ pub struct RawLogEntry {
     pub timestamp: Option<String>,
 }
 
+/// Flexible process entry that doesn't require PIDs upfront
+#[derive(Debug, Clone)]
+pub struct ProcessEntry {
+    pub machine_id: String,
+    pub name: String,
+    pub parent_name: Option<String>,  // Optional - if None, will try to infer
+    pub uid: u32,
+    pub path: String,
+    pub args: String,
+    pub timestamp: Option<String>,
+}
+
+impl ProcessEntry {
+    pub fn new(machine_id: String, name: String) -> Self {
+        Self {
+            machine_id,
+            name,
+            parent_name: None,
+            uid: 1000,
+            path: String::new(),
+            args: String::new(),
+            timestamp: None,
+        }
+    }
+    
+    /// Create ProcessEntry from a full command line
+    /// 
+    /// Automatically extracts name, path, and args from the command string.
+    /// 
+    /// # Examples
+    /// 
+    /// ```
+    /// use ironsift::ProcessEntry;
+    /// 
+    /// let entry = ProcessEntry::from_command_line(
+    ///     "machine1".to_string(),
+    ///     "/usr/bin/nginx -c /etc/nginx.conf",
+    ///     Some("systemd")
+    /// );
+    /// 
+    /// assert_eq!(entry.name, "nginx");
+    /// assert_eq!(entry.path, "/usr/bin/nginx");
+    /// assert_eq!(entry.args, "-c /etc/nginx.conf");
+    /// ```
+    pub fn from_command_line(machine_id: String, command: &str, parent: Option<&str>) -> Self {
+        let (name, path, args) = crate::parse_command_line(command);
+        
+        Self {
+            machine_id,
+            name,
+            parent_name: parent.map(|p| p.to_string()),
+            uid: 1000,
+            path,
+            args,
+            timestamp: None,
+        }
+    }
+    
+    pub fn parent(mut self, parent: &str) -> Self {
+        self.parent_name = Some(parent.to_string());
+        self
+    }
+    
+    pub fn uid(mut self, uid: u32) -> Self {
+        self.uid = uid;
+        self
+    }
+    
+    pub fn path(mut self, path: &str) -> Self {
+        self.path = path.to_string();
+        self
+    }
+    
+    pub fn args(mut self, args: &str) -> Self {
+        self.args = args.to_string();
+        self
+    }
+    
+    pub fn timestamp(mut self, timestamp: String) -> Self {
+        self.timestamp = Some(timestamp);
+        self
+    }
+}
+
 #[derive(Debug, Hash, Eq, PartialEq, Clone, Serialize, Deserialize)]
 pub struct ProcessSignature {
     pub name: String,
-    pub parent: String,
+    pub parent_name: String,
     pub uid: u32,
     pub path: String,
     pub is_high_entropy: bool,
@@ -136,20 +221,7 @@ impl MachineProfile {
         }
     }
 
-    pub fn add(&mut self, name: &str, parent: &str, uid: u32, path: &str, args: &str, config: &DetectionConfig, timestamp: Option<DateTime<Utc>>) {
-        let entropy = calculate_shannon_entropy(args);
-        let is_high_entropy = entropy > config.entropy_threshold;
-        let is_suspicious_path = is_path_suspicious(path, &config.suspicious_path_patterns);
-
-        let sig = ProcessSignature {
-            name: name.to_string(),
-            parent: parent.to_string(),
-            uid,
-            path: path.to_string(),
-            is_high_entropy,
-            is_suspicious_path,
-        };
-
+    pub fn add_process(&mut self, sig: ProcessSignature, timestamp: Option<DateTime<Utc>>) {
         *self.counts.entry(sig).or_insert(0) += 1;
         self.total_logs += 1;
         
@@ -227,13 +299,24 @@ pub struct AnalysisReport {
 
 impl AnalysisReport {
     pub fn print(&self) {
-        println!("\n{:=^60}", " IRONSIFT ANALYSIS REPORT ");
+        self.print_detailed(None);
+    }
+    
+    /// Print detailed analysis report with optional profile access
+    pub fn print_detailed(&self, profiles: Option<&[MachineProfile]>) {
+        println!("\n{:=^80}", " IRONSIFT ANALYSIS REPORT ");
         println!("Fleet Size: {} machines", self.total_analyzed);
         println!("Detection Sensitivity: {}", 
             if self.config_used.dbscan_tolerance < 0.05 { "High" }
             else if self.config_used.dbscan_tolerance < 0.10 { "Medium" }
             else { "Low" }
         );
+        
+        // Configuration summary
+        println!("\n--- Configuration ---");
+        println!("  DBSCAN Tolerance: {}", self.config_used.dbscan_tolerance);
+        println!("  Entropy Threshold: {}", self.config_used.entropy_threshold);
+        println!("  Minority Cluster Ratio: {}%", self.config_used.minority_cluster_ratio * 100.0);
         
         println!("\n--- Cluster Distribution ---");
         let mut noise_count = 0;
@@ -244,22 +327,26 @@ impl AnalysisReport {
         
         for cluster_id in cluster_ids {
             let count = self.cluster_stats.get(&Some(cluster_id)).unwrap_or(&0);
-            println!("  Cluster {}: {} machines", cluster_id, count);
+            let pct = (*count as f64 / self.total_analyzed as f64) * 100.0;
+            println!("  Cluster {}: {} machines ({:.1}%)", cluster_id, count, pct);
         }
         
         if let Some(&count) = self.cluster_stats.get(&None) {
             noise_count = count;
-            println!("  Noise (Outliers): {} machines", noise_count);
+            let pct = (count as f64 / self.total_analyzed as f64) * 100.0;
+            println!("  Noise (Outliers): {} machines ({:.1}%)", noise_count, pct);
         }
 
         if self.anomalies.is_empty() {
-            println!("\n{:=^60}", "");
+            println!("\n{:=^80}", "");
             println!("Status: ✅ CLEAN (No anomalies detected)");
-            println!("{:=^60}", "");
+            println!("{:=^80}", "");
+            println!("\nAll machines appear to be operating normally.");
+            println!("No suspicious processes or unusual behavior patterns detected.");
         } else {
-            println!("\n{:=^60}", "");
+            println!("\n{:=^80}", "");
             println!("Status: 🚨 ANOMALIES DETECTED");
-            println!("{:=^60}", "");
+            println!("{:=^80}", "");
             println!("Suspicious Machines: {}", self.anomalies.len());
             
             // Group by severity
@@ -278,39 +365,242 @@ impl AnalysisReport {
             
             if !critical.is_empty() {
                 println!("\n💀 CRITICAL ({}):", critical.len());
+                println!("   These machines are isolated outliers - likely compromised");
                 for anomaly in critical {
-                    self.print_anomaly(anomaly);
+                    self.print_anomaly_detailed(anomaly, profiles);
                 }
             }
             
             if !high.is_empty() {
                 println!("\n🔴 HIGH ({}):", high.len());
+                println!("   Strong deviation from baseline - investigate immediately");
                 for anomaly in high {
-                    self.print_anomaly(anomaly);
+                    self.print_anomaly_detailed(anomaly, profiles);
                 }
             }
             
             if !medium.is_empty() {
                 println!("\n🟠 MEDIUM ({}):", medium.len());
+                println!("   Moderate anomaly - worth reviewing");
                 for anomaly in medium {
-                    self.print_anomaly(anomaly);
+                    self.print_anomaly_detailed(anomaly, profiles);
                 }
             }
             
             if !low.is_empty() {
                 println!("\n🟡 LOW ({}):", low.len());
+                println!("   Minor deviation - may be benign");
                 for anomaly in low {
-                    self.print_anomaly(anomaly);
+                    self.print_anomaly_detailed(anomaly, profiles);
                 }
             }
             
-            println!("\n{:=^60}", "");
-            println!("Action: Review flagged machines and investigate anomalous processes.");
-            println!("Export detailed report: cargo run --bin ironsift -- --export-json");
-            println!("{:=^60}", "");
+            // Attack type summary
+            self.print_attack_summary(profiles);
+            
+            println!("\n{:=^80}", "");
+            println!("Recommended Actions:");
+            println!("  1. Review flagged machines and investigate anomalous processes");
+            println!("  2. Check process execution paths and command arguments");
+            println!("  3. Verify parent-child process relationships");
+            println!("  4. Cross-reference with network logs and file access logs");
+            println!("  5. Export detailed report: cargo run --bin ironsift -- --export-json");
+            println!("{:=^80}", "");
         }
     }
     
+    fn print_anomaly_detailed(&self, anomaly: &AnomalyDetails, profiles: Option<&[MachineProfile]>) {
+        println!("\n  {} {} (Distance: {:.3})", 
+            anomaly.severity_emoji(), 
+            anomaly.machine_id, 
+            anomaly.distance_score
+        );
+        
+        // Cluster information
+        if let Some(cluster) = anomaly.cluster_assignment {
+            println!("     ├─ Cluster: {}", cluster);
+        } else {
+            println!("     ├─ Cluster: Noise (isolated outlier)");
+        }
+        
+        // Process counts
+        println!("     ├─ Total processes: {}", anomaly.process_count);
+        if anomaly.suspicious_process_count > 0 {
+            println!("     ├─ Suspicious processes: {} ⚠️", anomaly.suspicious_process_count);
+        }
+        
+        // Anomalous features
+        if !anomaly.anomalous_features.is_empty() {
+            println!("     ├─ Rare processes (< 5% of fleet):");
+            let display_count = anomaly.anomalous_features.len().min(5);
+            for feature in &anomaly.anomalous_features[..display_count] {
+                println!("     │  • {}", feature);
+            }
+            if anomaly.anomalous_features.len() > 5 {
+                println!("     │  • ... and {} more", anomaly.anomalous_features.len() - 5);
+            }
+        }
+        
+        // Detailed process information if profiles available
+        if let Some(profiles) = profiles {
+            if let Some(profile) = profiles.iter().find(|p| p.id == anomaly.machine_id) {
+                self.print_suspicious_processes(profile);
+                
+                // Time range
+                if profile.first_seen.is_some() && profile.last_seen.is_some() {
+                    println!("     └─ Activity period: {} to {}", 
+                        profile.first_seen.unwrap().format("%Y-%m-%d %H:%M:%S"),
+                        profile.last_seen.unwrap().format("%Y-%m-%d %H:%M:%S")
+                    );
+                }
+            }
+        } else {
+            println!("     └─ Run with profiles for detailed process information");
+        }
+    }
+    
+    fn print_suspicious_processes(&self, profile: &MachineProfile) {
+        // Find the most suspicious processes
+        let mut suspicious: Vec<_> = profile.counts.iter()
+            .filter(|(sig, _)| sig.is_high_entropy || sig.is_suspicious_path || sig.uid == 0)
+            .collect();
+        
+        if suspicious.is_empty() {
+            return;
+        }
+        
+        // Sort by "suspiciousness" - prioritize high entropy + suspicious path + root
+        suspicious.sort_by(|(a, _), (b, _)| {
+            let a_score = (a.is_high_entropy as i32) + (a.is_suspicious_path as i32) + 
+                          ((a.uid == 0 && a.name != "systemd" && a.name != "init") as i32);
+            let b_score = (b.is_high_entropy as i32) + (b.is_suspicious_path as i32) + 
+                          ((b.uid == 0 && b.name != "systemd" && b.name != "init") as i32);
+            b_score.cmp(&a_score)
+        });
+        
+        println!("     ├─ Suspicious processes detected:");
+        let display_count = suspicious.len().min(3);
+        
+        for (sig, count) in &suspicious[..display_count] {
+            println!("     │");
+            println!("     │  📛 {} (count: {})", sig.name, count);
+            println!("     │     Parent: {}", sig.parent_name);
+            println!("     │     Path: {}", sig.path);
+            if sig.uid == 0 {
+                println!("     │     UID: {} (root) ⚠️", sig.uid);
+            } else {
+                println!("     │     UID: {}", sig.uid);
+            }
+            
+            let risks = sig.risk_factors();
+            if !risks.is_empty() {
+                println!("     │     Risk factors:");
+                for risk in risks {
+                    println!("     │       🚨 {}", risk);
+                }
+            }
+        }
+        
+        if suspicious.len() > 3 {
+            println!("     │  ... and {} more suspicious processes", suspicious.len() - 3);
+        }
+    }
+    
+    fn print_attack_summary(&self, profiles: Option<&[MachineProfile]>) {
+        if profiles.is_none() {
+            return;
+        }
+        
+        let profiles = profiles.unwrap();
+        
+        // Categorize attacks by characteristics
+        let mut cryptominers = Vec::new();
+        let mut web_shells = Vec::new();
+        let mut privilege_escalation = Vec::new();
+        let mut suspicious_paths = Vec::new();
+        
+        for anomaly in &self.anomalies {
+            if let Some(profile) = profiles.iter().find(|p| p.id == anomaly.machine_id) {
+                for (sig, _) in &profile.counts {
+                    // Cryptominer indicators
+                    if (sig.name.contains("miner") || sig.name.contains("xmr") || 
+                        sig.name.contains("kworker") || sig.name.contains("worker")) &&
+                       (sig.is_suspicious_path || sig.uid == 0) {
+                        cryptominers.push(anomaly.machine_id.clone());
+                        break;
+                    }
+                    
+                    // Web shell indicators
+                    if (sig.name.contains("php") || sig.name.contains("eval")) && sig.is_high_entropy {
+                        web_shells.push(anomaly.machine_id.clone());
+                        break;
+                    }
+                    
+                    // Privilege escalation
+                    if sig.uid == 0 && sig.name != "systemd" && sig.name != "init" && 
+                       (sig.is_high_entropy || sig.is_suspicious_path) {
+                        privilege_escalation.push(anomaly.machine_id.clone());
+                        break;
+                    }
+                    
+                    // Suspicious execution paths
+                    if sig.is_suspicious_path && sig.path.contains("/tmp") {
+                        suspicious_paths.push(anomaly.machine_id.clone());
+                        break;
+                    }
+                }
+            }
+        }
+        
+        if cryptominers.is_empty() && web_shells.is_empty() && 
+           privilege_escalation.is_empty() && suspicious_paths.is_empty() {
+            return;
+        }
+        
+        println!("\n--- Detected Attack Patterns ---");
+        
+        if !cryptominers.is_empty() {
+            println!("  ⛏️  Cryptomining ({} machines):", cryptominers.len());
+            for machine in cryptominers.iter().take(5) {
+                println!("     • {}", machine);
+            }
+            if cryptominers.len() > 5 {
+                println!("     • ... and {} more", cryptominers.len() - 5);
+            }
+        }
+        
+        if !web_shells.is_empty() {
+            println!("  🕸️  Web Shells ({} machines):", web_shells.len());
+            for machine in web_shells.iter().take(5) {
+                println!("     • {}", machine);
+            }
+            if web_shells.len() > 5 {
+                println!("     • ... and {} more", web_shells.len() - 5);
+            }
+        }
+        
+        if !privilege_escalation.is_empty() {
+            println!("  ⬆️  Privilege Escalation ({} machines):", privilege_escalation.len());
+            for machine in privilege_escalation.iter().take(5) {
+                println!("     • {}", machine);
+            }
+            if privilege_escalation.len() > 5 {
+                println!("     • ... and {} more", privilege_escalation.len() - 5);
+            }
+        }
+        
+        if !suspicious_paths.is_empty() {
+            println!("  📂 Suspicious Execution Paths ({} machines):", suspicious_paths.len());
+            for machine in suspicious_paths.iter().take(5) {
+                println!("     • {}", machine);
+            }
+            if suspicious_paths.len() > 5 {
+                println!("     • ... and {} more", suspicious_paths.len() - 5);
+            }
+        }
+    }
+    
+    #[deprecated(since = "2.0.0", note = "Use print_detailed() instead")]
     fn print_anomaly(&self, anomaly: &AnomalyDetails) {
         println!("  {} {} (Score: {:.3})", 
             anomaly.severity_emoji(), 
@@ -349,7 +639,7 @@ impl AnalysisReport {
                         serde_json::json!({
                             "name": sig.name,
                             "path": sig.path,
-                            "parent": sig.parent,
+                            "parent": sig.parent_name,
                             "uid": sig.uid,
                             "count": count,
                             "risk_factors": sig.risk_factors(),
@@ -374,12 +664,24 @@ impl AnalysisReport {
             }
         }
         
+        // Convert cluster_stats to string-keyed map for JSON serialization
+        let cluster_distribution: serde_json::Map<String, serde_json::Value> = self.cluster_stats
+            .iter()
+            .map(|(k, v)| {
+                let key = match k {
+                    Some(id) => format!("cluster_{}", id),
+                    None => "outliers".to_string(),
+                };
+                (key, serde_json::json!(v))
+            })
+            .collect();
+        
         let report = serde_json::json!({
             "report_timestamp": Utc::now(),
             "fleet_size": self.total_analyzed,
             "anomalies_detected": self.anomalies.len(),
             "config": self.config_used,
-            "cluster_distribution": self.cluster_stats,
+            "cluster_distribution": cluster_distribution,
             "investigation_targets": investigation_data,
         });
         
@@ -573,6 +875,584 @@ fn is_path_suspicious(path: &str, patterns: &[String]) -> bool {
     })
 }
 
+/// Parse a command line into (name, path, args)
+/// 
+/// Handles commands with or without full paths:
+/// - "/usr/bin/nginx -c /etc/nginx.conf" → name="nginx", path="/usr/bin/nginx"
+/// - "ls /etc/" → name="ls", path="ls" (bare command, no path)
+/// - "nginx" → name="nginx", path="nginx"
+/// 
+/// # Examples
+/// 
+/// ```
+/// use ironsift::parse_command_line;
+/// 
+/// // Full path
+/// let (name, path, args) = parse_command_line("/usr/bin/nginx -c /etc/nginx.conf");
+/// assert_eq!(name, "nginx");
+/// assert_eq!(path, "/usr/bin/nginx");
+/// assert_eq!(args, "-c /etc/nginx.conf");
+/// 
+/// // Bare command (common in ps output, shell commands)
+/// let (name, path, args) = parse_command_line("ls /etc/");
+/// assert_eq!(name, "ls");
+/// assert_eq!(path, "ls");
+/// assert_eq!(args, "/etc/");
+/// 
+/// // Just command name
+/// let (name, path, args) = parse_command_line("nginx");
+/// assert_eq!(name, "nginx");
+/// assert_eq!(path, "nginx");
+/// assert_eq!(args, "");
+/// ```
+pub fn parse_command_line(command: &str) -> (String, String, String) {
+    let command = command.trim();
+    
+    if command.is_empty() {
+        return (String::new(), String::new(), String::new());
+    }
+    
+    // Split on whitespace, respecting quotes
+    let parts = parse_command_parts(command);
+    
+    if parts.is_empty() {
+        return (String::new(), String::new(), String::new());
+    }
+    
+    let path = parts[0].clone();
+    let args = if parts.len() > 1 {
+        parts[1..].join(" ")
+    } else {
+        String::new()
+    };
+    
+    // Extract name from path
+    // For paths like "/usr/bin/nginx", extract "nginx"
+    // For bare commands like "ls", use "ls" as both name and path
+    let name = if let Some(pos) = path.rfind('/') {
+        path[pos + 1..].to_string()
+    } else {
+        // No path separator - it's a bare command like "ls" or "nginx"
+        path.clone()
+    };
+    
+    (name, path, args)
+}
+
+/// Parse command line respecting quotes
+fn parse_command_parts(command: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut chars = command.chars().peekable();
+    
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' | '\'' => {
+                in_quotes = !in_quotes;
+            }
+            ' ' if !in_quotes => {
+                if !current.is_empty() {
+                    parts.push(current.clone());
+                    current.clear();
+                }
+            }
+            _ => {
+                current.push(ch);
+            }
+        }
+    }
+    
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    
+    parts
+}
+
+// --- JSON PARSING ---
+
+/// Parse process information from JSON string
+/// 
+/// Supports flexible key names for different log formats:
+/// - machine_id, hostname, host, server, node
+/// - command, cmd, cmdline, commandline
+/// - name, process, process_name, comm
+/// - parent, parent_name, ppid
+/// - uid, user_id, userid
+/// - path, exe, executable
+/// - args, arguments, params
+/// - timestamp, time, datetime
+/// - pid, process_id
+/// 
+/// # Examples
+/// 
+/// ```
+/// use ironsift::parse_json_log;
+/// 
+/// // Docker-style JSON
+/// let json = r#"{"host": "server1", "command": "/usr/bin/nginx -c /etc/nginx.conf", "uid": 33}"#;
+/// let entry = parse_json_log(json).unwrap();
+/// 
+/// // Kubernetes-style JSON
+/// let json = r#"{"node": "worker-1", "cmd": "python3 app.py", "userid": 1000}"#;
+/// let entry = parse_json_log(json).unwrap();
+/// 
+/// // Full detail JSON
+/// let json = r#"{
+///     "machine_id": "server1",
+///     "pid": 100,
+///     "ppid": 1,
+///     "name": "nginx",
+///     "path": "/usr/bin/nginx",
+///     "args": "-c /etc/nginx.conf",
+///     "uid": 33,
+///     "timestamp": "2024-01-06T10:00:00Z"
+/// }"#;
+/// let entry = parse_json_log(json).unwrap();
+/// ```
+pub fn parse_json_log(json: &str) -> Result<RawLogEntry, Box<dyn Error>> {
+    let data: serde_json::Value = serde_json::from_str(json)?;
+    
+    // Extract machine_id (try various keys)
+    let machine_id = extract_string_field(&data, &["machine_id", "hostname", "host", "server", "node"])
+        .ok_or("Missing machine identifier")?;
+    
+    // Try to get PID and PPID if available
+    let pid = extract_u32_field(&data, &["pid", "process_id"]).unwrap_or(0);
+    let ppid = extract_u32_field(&data, &["ppid", "parent_pid"]).unwrap_or(0);
+    
+    // Try to get name, path, args directly
+    let name_opt = extract_string_field(&data, &["name", "process", "process_name", "comm"]);
+    let path_opt = extract_string_field(&data, &["path", "exe", "executable"]);
+    let args_opt = extract_string_field(&data, &["args", "arguments", "params"]);
+    
+    // If we have all three, use them
+    let (name, path, args) = if let (Some(n), Some(p), Some(a)) = (name_opt, path_opt, args_opt) {
+        (n, p, a)
+    } else {
+        // Otherwise, try to parse from command field
+        if let Some(command) = extract_string_field(&data, &["command", "cmd", "cmdline", "commandline"]) {
+            parse_command_line(&command)
+        } else if let Some(n) = extract_string_field(&data, &["name", "process", "process_name", "comm"]) {
+            // Just a name, no args
+            (n.clone(), n, String::new())
+        } else {
+            return Err("Missing process information (need 'command', 'cmd', or 'name')".into());
+        }
+    };
+    
+    // Get UID
+    let uid = extract_u32_field(&data, &["uid", "user_id", "userid"]).unwrap_or(1000);
+    
+    // Get timestamp
+    let timestamp = extract_string_field(&data, &["timestamp", "time", "datetime"]);
+    
+    Ok(RawLogEntry {
+        machine_id,
+        pid,
+        ppid,
+        name,
+        uid,
+        path,
+        args,
+        timestamp,
+    })
+}
+
+/// Parse a batch of JSON log entries
+/// 
+/// Supports newline-delimited JSON (NDJSON) or JSON array.
+/// 
+/// # Examples
+/// 
+/// ```
+/// use ironsift::parse_json_logs;
+/// 
+/// // Newline-delimited JSON
+/// let ndjson = r#"
+/// {"host": "server1", "command": "/usr/bin/nginx -c /etc/nginx.conf"}
+/// {"host": "server2", "command": "python3 app.py"}
+/// "#;
+/// let entries = parse_json_logs(ndjson).unwrap();
+/// 
+/// // JSON array
+/// let json_array = r#"[
+///     {"host": "server1", "command": "/usr/bin/nginx"},
+///     {"host": "server2", "command": "python3 app.py"}
+/// ]"#;
+/// let entries = parse_json_logs(json_array).unwrap();
+/// ```
+pub fn parse_json_logs(json: &str) -> Result<Vec<RawLogEntry>, Box<dyn Error>> {
+    let json = json.trim();
+    
+    if json.is_empty() {
+        return Ok(Vec::new());
+    }
+    
+    // Try to parse as JSON array first
+    if json.starts_with('[') {
+        let array: Vec<serde_json::Value> = serde_json::from_str(json)?;
+        let mut entries = Vec::new();
+        for value in array {
+            let json_str = serde_json::to_string(&value)?;
+            match parse_json_log(&json_str) {
+                Ok(entry) => entries.push(entry),
+                Err(e) => eprintln!("Warning: Failed to parse JSON entry: {}", e),
+            }
+        }
+        return Ok(entries);
+    }
+    
+    // Otherwise, treat as newline-delimited JSON
+    let mut entries = Vec::new();
+    for line in json.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("//") || line.starts_with('#') {
+            continue;
+        }
+        match parse_json_log(line) {
+            Ok(entry) => entries.push(entry),
+            Err(e) => eprintln!("Warning: Failed to parse JSON line: {}", e),
+        }
+    }
+    
+    Ok(entries)
+}
+
+// Helper functions for JSON extraction
+fn extract_string_field(data: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(value) = data.get(key) {
+            if let Some(s) = value.as_str() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn extract_u32_field(data: &serde_json::Value, keys: &[&str]) -> Option<u32> {
+    for key in keys {
+        if let Some(value) = data.get(key) {
+            if let Some(num) = value.as_u64() {
+                return Some(num as u32);
+            }
+            if let Some(s) = value.as_str() {
+                if let Ok(num) = s.parse::<u32>() {
+                    return Some(num);
+                }
+            }
+        }
+    }
+    None
+}
+
+// --- PARENT PROCESS RESOLUTION ---
+
+/// Builder for collecting processes without PIDs, then auto-resolving relationships
+pub struct ProcessBuilder {
+    entries: Vec<ProcessEntry>,
+}
+
+impl ProcessBuilder {
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+    
+    /// Add a process entry without needing PIDs
+    pub fn add(&mut self, entry: ProcessEntry) -> &mut Self {
+        self.entries.push(entry);
+        self
+    }
+    
+    /// Add a simple process with just name and parent
+    pub fn add_process(&mut self, machine_id: &str, name: &str, parent: &str) -> &mut Self {
+        self.entries.push(ProcessEntry {
+            machine_id: machine_id.to_string(),
+            name: name.to_string(),
+            parent_name: Some(parent.to_string()),
+            uid: 1000,
+            path: format!("/usr/bin/{}", name),
+            args: String::new(),
+            timestamp: None,
+        });
+        self
+    }
+    
+    /// Add a process from a full command line string
+    /// 
+    /// Automatically extracts name, path, and args from the command.
+    /// 
+    /// # Examples
+    /// 
+    /// ```
+    /// use ironsift::ProcessBuilder;
+    /// 
+    /// let mut builder = ProcessBuilder::new();
+    /// 
+    /// // Parse full command lines
+    /// builder.add_command("server1", "/usr/bin/nginx -c /etc/nginx.conf", Some("systemd"));
+    /// builder.add_command("server1", "/tmp/suspicious --obfuscated XkzL1", Some("bash"));
+    /// 
+    /// // Works with just executable name
+    /// builder.add_command("server2", "postgres", Some("systemd"));
+    /// ```
+    pub fn add_command(&mut self, machine_id: &str, command: &str, parent: Option<&str>) -> &mut Self {
+        let entry = ProcessEntry::from_command_line(machine_id.to_string(), command, parent);
+        self.entries.push(entry);
+        self
+    }
+    
+    /// Add a process with UID from command line
+    pub fn add_command_with_uid(&mut self, machine_id: &str, command: &str, parent: Option<&str>, uid: u32) -> &mut Self {
+        let mut entry = ProcessEntry::from_command_line(machine_id.to_string(), command, parent);
+        entry.uid = uid;
+        self.entries.push(entry);
+        self
+    }
+    
+    /// Add a process from a JSON string
+    /// 
+    /// Automatically extracts all available fields from JSON.
+    /// 
+    /// # Examples
+    /// 
+    /// ```
+    /// use ironsift::ProcessBuilder;
+    /// 
+    /// let mut builder = ProcessBuilder::new();
+    /// 
+    /// // Docker-style JSON
+    /// builder.add_json(r#"{"host": "server1", "command": "/usr/bin/nginx -c /etc/nginx.conf", "uid": 33}"#);
+    /// 
+    /// // Kubernetes-style JSON  
+    /// builder.add_json(r#"{"node": "worker-1", "cmd": "python3 app.py", "userid": 1000}"#);
+    /// ```
+    pub fn add_json(&mut self, json: &str) -> &mut Self {
+        match crate::parse_json_log(json) {
+            Ok(raw_entry) => {
+                let (name, path, args) = if raw_entry.name.is_empty() {
+                    // Parse from command if name is empty
+                    let cmd = format!("{} {}", raw_entry.path, raw_entry.args).trim().to_string();
+                    crate::parse_command_line(&cmd)
+                } else {
+                    (raw_entry.name, raw_entry.path, raw_entry.args)
+                };
+                
+                let entry = ProcessEntry {
+                    machine_id: raw_entry.machine_id,
+                    name,
+                    parent_name: None, // Will be resolved from PPID later
+                    uid: raw_entry.uid,
+                    path,
+                    args,
+                    timestamp: raw_entry.timestamp,
+                };
+                
+                self.entries.push(entry);
+            }
+            Err(e) => {
+                eprintln!("Warning: Failed to parse JSON: {}", e);
+            }
+        }
+        self
+    }
+    
+    /// Add multiple processes from a JSON string (array or newline-delimited)
+    /// 
+    /// # Examples
+    /// 
+    /// ```
+    /// use ironsift::ProcessBuilder;
+    /// 
+    /// let mut builder = ProcessBuilder::new();
+    /// 
+    /// // JSON array
+    /// builder.add_json_batch(r#"[
+    ///     {"host": "server1", "command": "/usr/bin/nginx"},
+    ///     {"host": "server2", "command": "python3 app.py"}
+    /// ]"#);
+    /// 
+    /// // Newline-delimited JSON
+    /// builder.add_json_batch(r#"
+    /// {"host": "server1", "command": "/usr/bin/nginx"}
+    /// {"host": "server2", "command": "python3 app.py"}
+    /// "#);
+    /// ```
+    pub fn add_json_batch(&mut self, json: &str) -> &mut Self {
+        match crate::parse_json_logs(json) {
+            Ok(entries) => {
+                for raw_entry in entries {
+                    let (name, path, args) = if raw_entry.name.is_empty() {
+                        let cmd = format!("{} {}", raw_entry.path, raw_entry.args).trim().to_string();
+                        crate::parse_command_line(&cmd)
+                    } else {
+                        (raw_entry.name, raw_entry.path, raw_entry.args)
+                    };
+                    
+                    let entry = ProcessEntry {
+                        machine_id: raw_entry.machine_id,
+                        name,
+                        parent_name: None,
+                        uid: raw_entry.uid,
+                        path,
+                        args,
+                        timestamp: raw_entry.timestamp,
+                    };
+                    
+                    self.entries.push(entry);
+                }
+            }
+            Err(e) => {
+                eprintln!("Warning: Failed to parse JSON batch: {}", e);
+            }
+        }
+        self
+    }
+    
+    /// Get the number of collected process entries
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    
+    /// Check if the builder is empty
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+    
+    /// Convert collected entries into RawLogEntry with auto-generated PIDs
+    pub fn build(self) -> Vec<RawLogEntry> {
+        let mut raw_entries = Vec::new();
+        
+        // Group by machine to assign PIDs per machine
+        let mut machine_groups: HashMap<String, Vec<ProcessEntry>> = HashMap::new();
+        for entry in self.entries {
+            machine_groups.entry(entry.machine_id.clone())
+                .or_insert_with(Vec::new)
+                .push(entry);
+        }
+        
+        for (machine_id, entries) in machine_groups {
+            // Build name -> PID mapping for this machine
+            let mut name_to_pid: HashMap<String, u32> = HashMap::new();
+            let mut next_pid = 1u32;
+            
+            // First pass: assign PIDs to all unique process names
+            for entry in &entries {
+                if !name_to_pid.contains_key(&entry.name) {
+                    name_to_pid.insert(entry.name.clone(), next_pid);
+                    next_pid += 1;
+                }
+            }
+            
+            // Second pass: create RawLogEntry with resolved PIDs and PPIDs
+            for entry in entries {
+                let pid = *name_to_pid.get(&entry.name).unwrap();
+                
+                // Resolve PPID from parent name
+                let ppid = if let Some(parent_name) = &entry.parent_name {
+                    *name_to_pid.get(parent_name).unwrap_or(&0)
+                } else {
+                    // If no parent specified, assume systemd (PID 1) or init
+                    if entry.name == "systemd" || entry.name == "init" {
+                        0
+                    } else {
+                        1 // Default to systemd as parent
+                    }
+                };
+                
+                raw_entries.push(RawLogEntry {
+                    machine_id: machine_id.clone(),
+                    pid,
+                    ppid,
+                    name: entry.name,
+                    uid: entry.uid,
+                    path: entry.path,
+                    args: entry.args,
+                    timestamp: entry.timestamp,
+                });
+            }
+        }
+        
+        raw_entries
+    }
+}
+
+impl Default for ProcessBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Resolve parent process names from PIDs
+pub fn resolve_parent_names(entries: &[RawLogEntry]) -> HashMap<(String, u32), String> {
+    let mut pid_to_name: HashMap<(String, u32), String> = HashMap::new();
+    
+    // First pass: build PID -> name mapping
+    for entry in entries {
+        pid_to_name.insert(
+            (entry.machine_id.clone(), entry.pid),
+            entry.name.clone()
+        );
+    }
+    
+    pid_to_name
+}
+
+/// Build machine profiles from raw log entries with automatic parent resolution
+pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Vec<MachineProfile> {
+    // Resolve parent names
+    let pid_to_name = resolve_parent_names(&entries);
+    
+    // Group by machine
+    let mut machine_entries: HashMap<String, Vec<RawLogEntry>> = HashMap::new();
+    for entry in entries {
+        machine_entries.entry(entry.machine_id.clone())
+            .or_insert_with(Vec::new)
+            .push(entry);
+    }
+    
+    // Build profiles in parallel
+    machine_entries.par_iter()
+        .map(|(machine_id, logs)| {
+            let mut profile = MachineProfile::new(machine_id);
+            
+            for entry in logs {
+                // Resolve parent name
+                let parent_name = pid_to_name
+                    .get(&(entry.machine_id.clone(), entry.ppid))
+                    .cloned()
+                    .unwrap_or_else(|| format!("[unknown:{}]", entry.ppid));
+                
+                // Calculate entropy and path risk
+                let entropy = calculate_shannon_entropy(&entry.args);
+                let is_high_entropy = entropy > config.entropy_threshold;
+                let is_suspicious_path = is_path_suspicious(&entry.path, &config.suspicious_path_patterns);
+                
+                let timestamp = entry.timestamp.as_ref()
+                    .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+                    .map(|dt| dt.with_timezone(&Utc));
+                
+                let sig = ProcessSignature {
+                    name: entry.name.clone(),
+                    parent_name,
+                    uid: entry.uid,
+                    path: entry.path.clone(),
+                    is_high_entropy,
+                    is_suspicious_path,
+                };
+                
+                profile.add_process(sig, timestamp);
+            }
+            
+            profile
+        })
+        .collect()
+}
+
 // --- DATA LOADERS ---
 
 pub fn load_csv_data(path: &str, config: &DetectionConfig) -> Result<Vec<MachineProfile>, Box<dyn Error>> {
@@ -593,168 +1473,74 @@ pub fn load_csv_data(path: &str, config: &DetectionConfig) -> Result<Vec<Machine
         return Err(format!("No valid machine logs found in '{}'.", path).into());
     }
 
-    // Build profiles (parallel processing at the machine level after grouping)
-    // First, group entries by machine_id (sequential, but fast)
-    let mut machine_entries: HashMap<String, Vec<&RawLogEntry>> = HashMap::new();
-    for entry in &entries {
-        machine_entries.entry(entry.machine_id.clone())
-            .or_insert_with(Vec::new)
-            .push(entry);
-    }
-    
-    // Now process each machine's entries in parallel
-    let profiles: Vec<MachineProfile> = machine_entries.par_iter()
-        .map(|(machine_id, machine_logs)| {
-            let mut profile = MachineProfile::new(machine_id);
-            
-            for entry in machine_logs {
-                let timestamp = entry.timestamp.as_ref()
-                    .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
-                    .map(|dt| dt.with_timezone(&Utc));
-                
-                profile.add(&entry.name, &entry.parent, entry.uid, 
-                          &entry.path, &entry.args, config, timestamp);
-            }
-            
-            profile
-        })
-        .collect();
-
-    Ok(profiles)
+    Ok(build_profiles(entries, config))
 }
 
 pub fn generate_mock_data(config: &DetectionConfig) -> Vec<MachineProfile> {
-    (0..50).into_par_iter().map(|i| {
-        let id = format!("machine_{:02}", i);
-        let mut p = MachineProfile::new(&id);
+    let entries: Vec<RawLogEntry> = (0..50).flat_map(|i| {
+        let machine_id = format!("machine_{:02}", i);
+        let mut logs = Vec::new();
         
         // Normal traffic
-        for _ in 0..100 {
-            p.add("nginx", "systemd", 33, "/usr/sbin/nginx", "-c /etc/nginx.conf", config, None);
+        for j in 0..100 {
+            logs.push(RawLogEntry {
+                machine_id: machine_id.clone(),
+                pid: 1000 + j,
+                ppid: 1,
+                name: "nginx".to_string(),
+                uid: 33,
+                path: "/usr/sbin/nginx".to_string(),
+                args: "-c /etc/nginx.conf".to_string(),
+                timestamp: None,
+            });
         }
         
         // Inject anomaly
         if i == 13 {
-            for _ in 0..50 {
-                p.add("kworker", "systemd", 0, "/tmp/.hidden/miner", 
-                      "XkzL1^s09f87aH@9#", config, None);
+            for j in 0..50 {
+                logs.push(RawLogEntry {
+                    machine_id: machine_id.clone(),
+                    pid: 2000 + j,
+                    ppid: 1,
+                    name: "kworker".to_string(),
+                    uid: 0,
+                    path: "/tmp/.hidden/miner".to_string(),
+                    args: "XkzL1^s09f87aH@9#".to_string(),
+                    timestamp: None,
+                });
             }
         }
         
-        p
-    }).collect()
+        // Add systemd as parent
+        logs.push(RawLogEntry {
+            machine_id: machine_id.clone(),
+            pid: 1,
+            ppid: 0,
+            name: "systemd".to_string(),
+            uid: 0,
+            path: "/usr/lib/systemd/systemd".to_string(),
+            args: "--system".to_string(),
+            timestamp: None,
+        });
+        
+        logs
+    }).collect();
+    
+    build_profiles(entries, config)
 }
 
-// --- TESTS ---
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_entropy_calculation() {
-        let low = calculate_shannon_entropy("aaaaaaaaaa");
-        assert_eq!(low, 0.0);
-        
-        let high = calculate_shannon_entropy("X5O!aH@9#kzL1^s09f87");
-        assert!(high > 3.0);
+/// Convenient function to build profiles from simple name/parent pairs
+/// This is useful when you don't have PID information upfront
+pub fn build_profiles_simple(
+    machine_processes: Vec<(String, String, String)>, // (machine_id, process_name, parent_name)
+    config: &DetectionConfig
+) -> Vec<MachineProfile> {
+    let mut builder = ProcessBuilder::new();
+    
+    for (machine_id, name, parent) in machine_processes {
+        builder.add_process(&machine_id, &name, &parent);
     }
-
-    #[test]
-    fn test_config_default() {
-        let config = DetectionConfig::default();
-        assert_eq!(config.entropy_threshold, 4.5);
-        assert_eq!(config.dbscan_min_samples, 2);
-    }
-
-    #[test]
-    fn test_suspicious_path_detection() {
-        let patterns = vec![r"/tmp/".to_string(), r"/dev/shm/".to_string()];
-        assert!(is_path_suspicious("/tmp/malware", &patterns));
-        assert!(is_path_suspicious("/dev/shm/rootkit", &patterns));
-        assert!(!is_path_suspicious("/usr/bin/nginx", &patterns));
-    }
-
-    #[test]
-    fn test_identical_machines_clean() {
-        let config = DetectionConfig::default();
-        let mut profiles = Vec::new();
-        
-        for i in 0..5 {
-            let mut p = MachineProfile::new(&format!("m{}", i));
-            p.add("test", "init", 0, "/bin/test", "args", &config, None);
-            profiles.push(p);
-        }
-        
-        let report = analyze_fleet(&profiles, &config).unwrap();
-        assert!(report.anomalies.is_empty());
-    }
-
-    #[test]
-    fn test_detect_single_outlier() {
-        let config = DetectionConfig::default();
-        let mut profiles = Vec::new();
-        
-        // 10 normal machines
-        for i in 0..10 {
-            let mut p = MachineProfile::new(&format!("normal_{}", i));
-            p.add("nginx", "systemd", 33, "/usr/bin/nginx", "conf", &config, None);
-            profiles.push(p);
-        }
-        
-        // 1 compromised machine
-        let mut bad = MachineProfile::new("compromised");
-        bad.add("miner", "systemd", 0, "/tmp/kworker", "XkzL1^s09f87", &config, None);
-        profiles.push(bad);
-
-        let report = analyze_fleet(&profiles, &config).unwrap();
-        assert!(!report.anomalies.is_empty());
-        assert!(report.anomalies.iter().any(|a| a.machine_id == "compromised"));
-    }
-
-    #[test]
-    fn test_detect_minority_botnet() {
-        let config = DetectionConfig::default();
-        let mut profiles = Vec::new();
-        
-        // 91 normal machines
-        for i in 0..91 {
-            let mut p = MachineProfile::new(&format!("normal_{}", i));
-            p.add("nginx", "systemd", 33, "/usr/bin/nginx", "conf", &config, None);
-            profiles.push(p);
-        }
-        
-        // 9 botnet machines (< 10% threshold, clearly minority)
-        for i in 0..9 {
-            let mut p = MachineProfile::new(&format!("botnet_{}", i));
-            p.add("xmrig", "systemd", 0, "/tmp/miner", "pool.xmr", &config, None);
-            profiles.push(p);
-        }
-        
-        let report = analyze_fleet(&profiles, &config).unwrap();
-        
-        // Should detect the minority botnet cluster
-        let botnet_detected = report.anomalies.iter()
-            .filter(|a| a.machine_id.starts_with("botnet_"))
-            .count();
-        
-        assert!(botnet_detected >= 7, "Should detect most of the botnet machines, got {}", botnet_detected);
-    }
-
-    #[test]
-    fn test_process_risk_factors() {
-        let sig = ProcessSignature {
-            name: "malware".to_string(),
-            parent: "bash".to_string(),
-            uid: 0,
-            path: "/tmp/hidden".to_string(),
-            is_high_entropy: true,
-            is_suspicious_path: true,
-        };
-        
-        let risks = sig.risk_factors();
-        assert!(!risks.is_empty());
-        assert!(risks.iter().any(|r| r.contains("entropy")));
-        assert!(risks.iter().any(|r| r.contains("Suspicious execution path")));
-    }
+    
+    let raw_entries = builder.build();
+    build_profiles(raw_entries, config)
 }

@@ -100,8 +100,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("• Running DBSCAN clustering analysis...");
     let report = analyze_fleet(&profiles, &config)?;
     
-    // 3. Display Results
-    report.print();
+    // 3. Display Results with detailed information
+    report.print_detailed(Some(&profiles));
 
     // 4. Export JSON if requested
     if export_json {
