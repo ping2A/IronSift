@@ -1476,6 +1476,45 @@ pub fn load_csv_data(path: &str, config: &DetectionConfig) -> Result<Vec<Machine
     Ok(build_profiles(entries, config))
 }
 
+/// Load and parse JSON log data from a file
+/// Supports JSON arrays, NDJSON (newline-delimited JSON), and single JSON objects
+/// 
+/// # Arguments
+/// * `path` - Path to the JSON file
+/// * `config` - Detection configuration
+/// 
+/// # Returns
+/// Vector of machine profiles ready for analysis
+/// 
+/// # Examples
+/// ```
+/// let config = DetectionConfig::default();
+/// let profiles = load_json_data("logs.json", &config)?;
+/// ```
+pub fn load_json_data(path: &str, config: &DetectionConfig) -> Result<Vec<MachineProfile>, Box<dyn Error>> {
+    if !Path::new(path).exists() {
+        return Err(format!("Input file not found: '{}'", path).into());
+    }
+    
+    let metadata = fs::metadata(path)?;
+    if metadata.len() == 0 {
+        return Err(format!("Input file is empty: '{}'", path).into());
+    }
+
+    // Read the entire file content
+    let content = fs::read_to_string(path)?;
+    
+    // Parse JSON logs (supports arrays, NDJSON, and single objects)
+    let entries = parse_json_logs(&content)?;
+
+    if entries.is_empty() {
+        return Err(format!("No valid machine logs found in '{}'.", path).into());
+    }
+
+    println!("• Loaded {} process entries from JSON", entries.len());
+    Ok(build_profiles(entries, config))
+}
+
 pub fn generate_mock_data(config: &DetectionConfig) -> Vec<MachineProfile> {
     let entries: Vec<RawLogEntry> = (0..50).flat_map(|i| {
         let machine_id = format!("machine_{:02}", i);
