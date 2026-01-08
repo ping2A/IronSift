@@ -119,6 +119,9 @@ fn generate_log_entries() -> Result<Vec<RawLogEntry>, Box<dyn Error>> {
         "eval(base64_decode('aGVsbG8gd29ybGQ='));",
         "system($_GET['cmd']);",
         "<?php @eval($_POST['x']);?>",
+        "eval(base64_decode('ZWNobyBzeXN0ZW0oJF9HRVRbJ2NtZCddKTs='));",
+        "<?php eval(gzinflate(base64_decode('K0ktSgEA')));?>",
+        "system('cat /etc/passwd | base64');",
     ];
     
     let privesc_processes = [
@@ -129,7 +132,10 @@ fn generate_log_entries() -> Result<Vec<RawLogEntry>, Box<dyn Error>> {
     
     let lateral_movement = [
         ("ssh", "/usr/bin/ssh", "-o StrictHostKeyChecking=no root@10.0.1.5", 0),
+        ("ssh", "/usr/bin/ssh", "root@192.168.1.10", 0),
+        ("ssh", "/usr/bin/ssh", "-i /tmp/.ssh/id_rsa admin@172.16.0.50", 0),
         ("scp", "/usr/bin/scp", "-r /etc/shadow user@192.168.1.100:/tmp", 0),
+        ("ssh", "/usr/bin/ssh", "root@10.0.2.15 'cat /etc/passwd'", 0),
     ];
 
     println!("Scenario Overview:");
@@ -189,11 +195,21 @@ fn generate_log_entries() -> Result<Vec<RawLogEntry>, Box<dyn Error>> {
                 ppid = 1;
             }
 
-            // Web Shells (Machine 9)
-            if i == 9 && name == "apache2" && rng.gen_bool(0.10) {
-                name = "php-fpm";
-                ppid = 108;
-                args = web_shell_payloads[rng.gen_range(0..web_shell_payloads.len())].to_string();
+            // Web Shells (Machine 9) - php-fpm with eval payloads
+            if i == 9 && name == "apache2" {
+                // Convert most apache2 to php-fpm (its child process)
+                if rng.gen_bool(0.60) {
+                    name = "php-fpm";
+                    path = "/usr/sbin/php-fpm";
+                    ppid = 108; // apache2 parent
+                    
+                    // 50% of php-fpm processes get malicious payloads
+                    if rng.gen_bool(0.50) {
+                        args = web_shell_payloads[rng.gen_range(0..web_shell_payloads.len())].to_string();
+                    } else {
+                        args = "/usr/sbin/php-fpm --fpm-config /etc/php/fpm/php-fpm.conf".to_string();
+                    }
+                }
             }
 
             // Privilege Escalation (Machines 6, 15)
@@ -206,8 +222,9 @@ fn generate_log_entries() -> Result<Vec<RawLogEntry>, Box<dyn Error>> {
                 ppid = 103;
             }
 
-            // Lateral Movement (Machine 12)
-            if i == 12 && rng.gen_bool(0.10) {
+            // Lateral Movement (Machine 12) - SSH to internal IPs
+            if i == 12 && rng.gen_bool(0.40) {
+                // High frequency of SSH connections to internal IPs
                 let lateral = lateral_movement[rng.gen_range(0..lateral_movement.len())];
                 name = lateral.0;
                 path = lateral.1;
@@ -251,6 +268,31 @@ fn write_csv(entries: &[RawLogEntry], path: &str) -> Result<(), Box<dyn Error>> 
 fn write_json(entries: &[RawLogEntry], path: &str) -> Result<(), Box<dyn Error>> {
     let mut file = File::create(path)?;
     
+    // JSON Schema for IronSift:
+    // 
+    // REQUIRED KEYS (at least one from each group):
+    //   Machine identifier: "machine_id", "hostname", "host", "server", "node", "container", "pod"
+    //   Process info: EITHER:
+    //     - "command", "cmd", "cmdline", "commandline" (full command line)
+    //     OR
+    //     - "name", "process", "process_name", "comm" (process name only)
+    //
+    // OPTIONAL KEYS (with defaults if missing):
+    //   "pid", "process_id" (default: auto-generated)
+    //   "ppid", "parent_pid" (default: 0)
+    //   "uid", "user_id", "userid" (default: 1000)
+    //   "path", "exe", "executable" (default: parsed from command or /usr/bin/{name})
+    //   "args", "arguments", "params" (default: parsed from command or empty)
+    //   "timestamp", "time", "datetime" (default: none)
+    //
+    // MINIMAL VALID EXAMPLE:
+    //   {"host": "server1", "cmd": "nginx"}
+    //
+    // FULL EXAMPLE (what this generator produces):
+    //   {"machine_id": "server1", "pid": 100, "ppid": 1, "name": "nginx", 
+    //    "uid": 33, "path": "/usr/sbin/nginx", "args": "-c /etc/nginx.conf",
+    //    "timestamp": "2025-01-06T10:00:00Z"}
+    
     writeln!(file, "[")?;
     
     for (i, entry) in entries.iter().enumerate() {
@@ -258,15 +300,23 @@ fn write_json(entries: &[RawLogEntry], path: &str) -> Result<(), Box<dyn Error>>
             writeln!(file, ",")?;
         }
         
+        // Write all fields for complete compatibility
+        // machine_id: REQUIRED - machine identifier
+        // pid/ppid: OPTIONAL - will be auto-generated if not provided
+        // name: REQUIRED (or can be derived from command)
+        // uid: OPTIONAL - defaults to 1000 if not provided
+        // path: OPTIONAL - can be parsed from command or name
+        // args: OPTIONAL - can be parsed from command
+        // timestamp: OPTIONAL - used for temporal analysis if provided
         write!(file, r#"  {{"machine_id": "{}", "pid": {}, "ppid": {}, "name": "{}", "uid": {}, "path": "{}", "args": "{}", "timestamp": "{}"}}"#,
-            entry.machine_id,
-            entry.pid,
-            entry.ppid,
-            entry.name,
-            entry.uid,
-            entry.path,
-            entry.args.replace('"', "\\\""),
-            entry.timestamp.as_ref().unwrap_or(&"".to_string())
+            entry.machine_id,  // REQUIRED: machine identifier
+            entry.pid,         // OPTIONAL: process ID (auto-generated if 0)
+            entry.ppid,        // OPTIONAL: parent process ID (defaults to 0)
+            entry.name,        // REQUIRED: process name
+            entry.uid,         // OPTIONAL: user ID (defaults to 1000)
+            entry.path,        // OPTIONAL: executable path
+            entry.args.replace('"', "\\\""),  // OPTIONAL: command arguments
+            entry.timestamp.as_ref().unwrap_or(&"".to_string())  // OPTIONAL: timestamp
         )?;
     }
     
@@ -304,7 +354,7 @@ fn print_detection_instructions(output_file: &str) {
     println!("   With --tolerance 0.05, you should detect:");
     println!("   ⚠️  machine_003 (cryptominer in /tmp)");
     println!("   ⚠️  machine_006 (privilege escalation - node as root)");
-    println!("   ⚠️  machine_009 (web shell - php eval payloads)");
+    println!("   ⚠️  machine_009 (web shell - php-fpm eval payloads) 🔴");
     println!("   ⚠️  machine_012 (lateral movement - SSH activity)");
     println!("   ⚠️  machine_015 (privilege escalation - python3 in /tmp)");
     println!("   ⚠️  machine_017 (cryptominer in /dev/shm)");

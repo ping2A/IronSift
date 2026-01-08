@@ -9,6 +9,36 @@
     "/dev/shm/",
     "/var/tmp/",
     "/home/[^/]+/\\.[^/]+",
-    "^\\./"
-  ]
+    "^\\.\\/",
+    "/opt/.hidden/"
+  ],
+  "exclude_kernel_threads": true,
+  "common_root_processes": [
+    "systemd",
+    "init",
+    "sshd",
+    "cron",
+    "crond",
+    "rsyslogd",
+    "dockerd",
+    "containerd",
+    "kubelet",
+    "networkd",
+    "systemd-networkd",
+    "systemd-resolved",
+    "systemd-journald",
+    "systemd-logind",
+    "systemd-udevd",
+    "dbus-daemon",
+    "polkitd",
+    "snapd",
+    "unattended-upgr",
+    "accounts-daemon",
+    "rtkit-daemon",
+    "cups-browsed",
+    "cupsd",
+    "avahi-daemon"
+  ],
+  "flag_unexpected_root": true,
+  "debug_ppid_resolution": false
 }

@@ -31,6 +31,21 @@ pub struct DetectionConfig {
     
     /// Suspicious path patterns (regex)
     pub suspicious_path_patterns: Vec<String>,
+    
+    /// Exclude Linux kernel threads (names starting with '[' and ending with ']')
+    /// Examples: [kworker/1:0], [migration/0], [ksoftirqd/1]
+    pub exclude_kernel_threads: bool,
+    
+    /// Common system processes that legitimately run as root (UID 0)
+    /// These will not be flagged as suspicious just for being root
+    pub common_root_processes: Vec<String>,
+    
+    /// Penalize root processes that are NOT in common_root_processes list
+    /// If false, root processes are not considered suspicious
+    pub flag_unexpected_root: bool,
+    
+    /// Enable debug output for PPID resolution
+    pub debug_ppid_resolution: bool,
 }
 
 impl Default for DetectionConfig {
@@ -48,6 +63,35 @@ impl Default for DetectionConfig {
                 r"/home/[^/]+/\.[^/]+".to_string(), // Hidden dirs in home
                 r"^\./".to_string(), // Relative paths
             ],
+            exclude_kernel_threads: true,
+            common_root_processes: vec![
+                "systemd".to_string(),
+                "init".to_string(),
+                "sshd".to_string(),
+                "cron".to_string(),
+                "crond".to_string(),
+                "rsyslogd".to_string(),
+                "dockerd".to_string(),
+                "containerd".to_string(),
+                "kubelet".to_string(),
+                "networkd".to_string(),
+                "systemd-networkd".to_string(),
+                "systemd-resolved".to_string(),
+                "systemd-journald".to_string(),
+                "systemd-logind".to_string(),
+                "systemd-udevd".to_string(),
+                "dbus-daemon".to_string(),
+                "polkitd".to_string(),
+                "snapd".to_string(),
+                "unattended-upgr".to_string(),  // Ubuntu auto-updates
+                "accounts-daemon".to_string(),
+                "rtkit-daemon".to_string(),
+                "cups-browsed".to_string(),
+                "cupsd".to_string(),
+                "avahi-daemon".to_string(),
+            ],
+            flag_unexpected_root: true,
+            debug_ppid_resolution: false,
         }
     }
 }
@@ -178,8 +222,20 @@ pub struct ProcessSignature {
 }
 
 impl ProcessSignature {
+    /// Check if this is an unexpected root process (not in common list)
+    pub fn is_unexpected_root(&self, common_root_processes: &[String]) -> bool {
+        if self.uid != 0 {
+            return false;
+        }
+        
+        // Check if it's in the common root processes list
+        !common_root_processes.iter().any(|common| {
+            self.name == *common || self.name.starts_with(common)
+        })
+    }
+    
     /// Create a human-readable description of why this process is suspicious
-    pub fn risk_factors(&self) -> Vec<String> {
+    pub fn risk_factors(&self, config: &DetectionConfig) -> Vec<String> {
         let mut factors = Vec::new();
         
         if self.is_high_entropy {
@@ -190,8 +246,8 @@ impl ProcessSignature {
             factors.push(format!("Suspicious execution path: {}", self.path));
         }
         
-        if self.uid == 0 && self.name != "systemd" && self.name != "init" {
-            factors.push("Running as root (UID 0)".to_string());
+        if config.flag_unexpected_root && self.is_unexpected_root(&config.common_root_processes) {
+            factors.push(format!("Unexpected process running as root (UID 0): {}", self.name));
         }
         
         if self.path.contains("/tmp") {
@@ -199,6 +255,13 @@ impl ProcessSignature {
         }
         
         factors
+    }
+    
+    /// Legacy method for backwards compatibility (uses default config)
+    #[deprecated(since = "2.0.0", note = "Use risk_factors(&config) instead")]
+    pub fn risk_factors_legacy(&self) -> Vec<String> {
+        let config = DetectionConfig::default();
+        self.risk_factors(&config)
     }
 }
 
@@ -492,7 +555,7 @@ impl AnalysisReport {
                 println!("     │     UID: {}", sig.uid);
             }
             
-            let risks = sig.risk_factors();
+            let risks = sig.risk_factors(&self.config_used);
             if !risks.is_empty() {
                 println!("     │     Risk factors:");
                 for risk in risks {
@@ -642,7 +705,7 @@ impl AnalysisReport {
                             "parent": sig.parent_name,
                             "uid": sig.uid,
                             "count": count,
-                            "risk_factors": sig.risk_factors(),
+                            "risk_factors": sig.risk_factors(&self.config_used),
                         })
                     })
                     .collect();
@@ -855,16 +918,45 @@ pub fn analyze_fleet(profiles: &[MachineProfile], config: &DetectionConfig) -> R
 pub fn calculate_shannon_entropy(s: &str) -> f64 {
     if s.is_empty() { return 0.0; }
     
+    // For very long strings (> 100 chars), entropy naturally increases
+    // due to more unique characters, which causes false positives.
+    // We normalize by considering entropy density rather than absolute entropy.
+    
+    // Remove common path separators and normalize to focus on actual content
+    // Long paths like "/home/ecbuilds/proj/subproj/file" should not be penalized
+    let normalized = s.replace('/', " ")
+                      .replace('.', " ")
+                      .replace('-', " ")
+                      .replace('_', " ");
+    
     let mut counts = HashMap::new();
-    for c in s.chars() {
-        *counts.entry(c).or_insert(0) += 1;
+    for c in normalized.chars() {
+        if !c.is_whitespace() {  // Ignore whitespace in entropy calculation
+            *counts.entry(c).or_insert(0) += 1;
+        }
     }
     
-    let len = s.len() as f64;
-    counts.values().fold(0.0, |acc, &count| {
+    if counts.is_empty() { return 0.0; }
+    
+    let len = normalized.chars().filter(|c| !c.is_whitespace()).count() as f64;
+    if len == 0.0 { return 0.0; }
+    
+    let entropy = counts.values().fold(0.0, |acc, &count| {
         let p = count as f64 / len;
         acc - p * p.log2()
-    })
+    });
+    
+    // Normalize entropy for length to reduce false positives from long paths
+    // Base entropy on character diversity, not string length
+    // Typical paths have lower diversity than obfuscated strings
+    //
+    // For reference:
+    // - Normal paths: entropy ~2.5-3.5 (limited character set: a-z, 0-9, /)
+    // - Obfuscated: entropy ~4.5-5.5 (high character diversity, random-looking)
+    // - Base64: entropy ~5.5-6.0 (high entropy by design)
+    //
+    // We want to catch obfuscated/encoded strings, not legitimate long paths
+    entropy
 }
 
 fn is_path_suspicious(path: &str, patterns: &[String]) -> bool {
@@ -912,6 +1004,14 @@ pub fn parse_command_line(command: &str) -> (String, String, String) {
         return (String::new(), String::new(), String::new());
     }
     
+    // SPECIAL CASE: Linux kernel threads with bracket notation
+    // Examples: "[kworker/1:0]", "[migration/0]", "[ksoftirqd/1]"
+    // These have no arguments and should be treated specially
+    if command.starts_with('[') && command.ends_with(']') {
+        // It's a kernel thread - use the full bracketed name
+        return (command.to_string(), command.to_string(), String::new());
+    }
+    
     // Split on whitespace, respecting quotes
     let parts = parse_command_parts(command);
     
@@ -928,12 +1028,18 @@ pub fn parse_command_line(command: &str) -> (String, String, String) {
     
     // Extract name from path
     // For paths like "/usr/bin/nginx", extract "nginx"
+    // For paths like "/home/ecbuilds/some/long/path/executable", extract "executable"
     // For bare commands like "ls", use "ls" as both name and path
     let name = if let Some(pos) = path.rfind('/') {
         path[pos + 1..].to_string()
     } else {
         // No path separator - it's a bare command like "ls" or "nginx"
-        path.clone()
+        // Check if it's a kernel thread notation
+        if path.starts_with('[') && path.ends_with(']') {
+            path.clone()
+        } else {
+            path.clone()
+        }
     };
     
     (name, path, args)
@@ -974,28 +1080,71 @@ fn parse_command_parts(command: &str) -> Vec<String> {
 
 /// Parse process information from JSON string
 /// 
-/// Supports flexible key names for different log formats:
-/// - machine_id, hostname, host, server, node
-/// - command, cmd, cmdline, commandline
-/// - name, process, process_name, comm
-/// - parent, parent_name, ppid
-/// - uid, user_id, userid
-/// - path, exe, executable
-/// - args, arguments, params
-/// - timestamp, time, datetime
-/// - pid, process_id
+/// # JSON Key Matching (Priority Order - First Match Wins)
+/// 
+/// ## ✅ REQUIRED KEYS (at least ONE from each group)
+/// 
+/// ### Group 1: Machine Identifier (REQUIRED)
+/// Priority order:
+/// 1. `machine_id` ⭐ (recommended)
+/// 2. `hostname`
+/// 3. `host`
+/// 4. `server`
+/// 5. `node`
+/// 6. `container` (Docker)
+/// 7. `pod` (Kubernetes)
+/// 
+/// ### Group 2: Process Information (REQUIRED - use EITHER Option A or B)
+/// 
+/// **Option A: Full Command Line** (priority order):
+/// 1. `command` ⭐ (recommended)
+/// 2. `cmd`
+/// 3. `cmdline`
+/// 4. `commandline`
+/// 
+/// **Option B: Process Name** (priority order):
+/// 1. `name` ⭐ (recommended)
+/// 2. `process`
+/// 3. `process_name`
+/// 4. `comm`
+/// 
+/// ## 🔧 OPTIONAL KEYS (with defaults)
+/// 
+/// - **Process IDs** (default: 0, auto-generated)
+///   - `pid`, `process_id`
+///   - `ppid`, `parent_pid`
+/// 
+/// - **User ID** (default: 1000)
+///   - `uid`, `user_id`, `userid`
+/// 
+/// - **Executable Path** (default: parsed from command or name)
+///   - `path`, `exe`, `executable`
+/// 
+/// - **Arguments** (default: parsed from command or empty string)
+///   - `args`, `arguments`, `params`
+/// 
+/// - **Timestamp** (default: None)
+///   - `timestamp`, `time`, `datetime`
 /// 
 /// # Examples
 /// 
 /// ```
 /// use ironsift::parse_json_log;
 /// 
+/// // Minimal (2 required keys)
+/// let json = r#"{"host": "server1", "cmd": "nginx"}"#;
+/// let entry = parse_json_log(json).unwrap();
+/// 
 /// // Docker-style JSON
-/// let json = r#"{"host": "server1", "command": "/usr/bin/nginx -c /etc/nginx.conf", "uid": 33}"#;
+/// let json = r#"{"container": "web-prod-1", "command": "/usr/bin/nginx", "uid": 33}"#;
 /// let entry = parse_json_log(json).unwrap();
 /// 
 /// // Kubernetes-style JSON
-/// let json = r#"{"node": "worker-1", "cmd": "python3 app.py", "userid": 1000}"#;
+/// let json = r#"{"node": "worker-1", "pod": "nginx-7d8b", "cmd": "nginx", "userid": 0}"#;
+/// let entry = parse_json_log(json).unwrap();
+/// 
+/// // CloudWatch-style JSON
+/// let json = r#"{"hostname": "ec2-10-0-1-50", "commandline": "/usr/sbin/sshd -D", "user_id": "0"}"#;
 /// let entry = parse_json_log(json).unwrap();
 /// 
 /// // Full detail JSON
@@ -1004,7 +1153,7 @@ fn parse_command_parts(command: &str) -> Vec<String> {
 ///     "pid": 100,
 ///     "ppid": 1,
 ///     "name": "nginx",
-///     "path": "/usr/bin/nginx",
+///     "path": "/usr/sbin/nginx",
 ///     "args": "-c /etc/nginx.conf",
 ///     "uid": 33,
 ///     "timestamp": "2024-01-06T10:00:00Z"
@@ -1014,38 +1163,77 @@ fn parse_command_parts(command: &str) -> Vec<String> {
 pub fn parse_json_log(json: &str) -> Result<RawLogEntry, Box<dyn Error>> {
     let data: serde_json::Value = serde_json::from_str(json)?;
     
-    // Extract machine_id (try various keys)
-    let machine_id = extract_string_field(&data, &["machine_id", "hostname", "host", "server", "node"])
-        .ok_or("Missing machine identifier")?;
+    // ═══════════════════════════════════════════════════════════════════════════
+    // REQUIRED GROUP 1: Machine Identifier
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Tries multiple key names in priority order (first match wins):
+    // - machine_id (⭐ standard/recommended)
+    // - hostname (system logs)
+    // - host (Docker, generic logging)
+    // - server (monitoring systems)
+    // - node (Kubernetes cluster nodes)
+    // - container (Docker containers)
+    // - pod (Kubernetes pods)
+    let machine_id = extract_string_field(&data, &[
+        "machine_id", "hostname", "host", "server", "node", "container", "pod"
+    ])
+    .ok_or("Missing machine identifier (need: machine_id, hostname, host, server, node, container, or pod)")?;
     
-    // Try to get PID and PPID if available
+    // ═══════════════════════════════════════════════════════════════════════════
+    // OPTIONAL: Process IDs (auto-generated if not provided)
+    // ═══════════════════════════════════════════════════════════════════════════
+    // pid: Process ID - defaults to 0 (will be auto-generated sequentially per machine)
+    // ppid: Parent Process ID - defaults to 0 (typically init/systemd)
     let pid = extract_u32_field(&data, &["pid", "process_id"]).unwrap_or(0);
     let ppid = extract_u32_field(&data, &["ppid", "parent_pid"]).unwrap_or(0);
     
-    // Try to get name, path, args directly
+    // ═══════════════════════════════════════════════════════════════════════════
+    // OPTIONAL: Direct process attributes (if available)
+    // ═══════════════════════════════════════════════════════════════════════════
     let name_opt = extract_string_field(&data, &["name", "process", "process_name", "comm"]);
     let path_opt = extract_string_field(&data, &["path", "exe", "executable"]);
     let args_opt = extract_string_field(&data, &["args", "arguments", "params"]);
     
-    // If we have all three, use them
+    // ═══════════════════════════════════════════════════════════════════════════
+    // REQUIRED GROUP 2: Process Information
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Strategy (in order):
+    // 1. If name + path + args all provided → use them directly
+    // 2. Else if command field exists → parse it into (name, path, args)
+    // 3. Else if name field exists → use name (no args)
+    // 4. Else → ERROR (missing required process info)
     let (name, path, args) = if let (Some(n), Some(p), Some(a)) = (name_opt, path_opt, args_opt) {
+        // All three fields provided directly - use as-is
         (n, p, a)
     } else {
-        // Otherwise, try to parse from command field
+        // Try to parse from command field (most common in modern logs)
+        // Keys tried: command (⭐), cmd, cmdline, commandline
         if let Some(command) = extract_string_field(&data, &["command", "cmd", "cmdline", "commandline"]) {
+            // Parse full command line into (name, path, args)
+            // Example: "/usr/bin/nginx -c /etc/nginx.conf" → ("nginx", "/usr/bin/nginx", "-c /etc/nginx.conf")
             parse_command_line(&command)
         } else if let Some(n) = extract_string_field(&data, &["name", "process", "process_name", "comm"]) {
-            // Just a name, no args
+            // Only name available, no command - use name as both name and path, empty args
             (n.clone(), n, String::new())
         } else {
-            return Err("Missing process information (need 'command', 'cmd', or 'name')".into());
+            // No process information found - this is an error
+            return Err("Missing process information (need: 'command', 'cmd', 'cmdline', 'commandline', OR 'name', 'process', 'process_name', 'comm')".into());
         }
     };
     
-    // Get UID
+    // ═══════════════════════════════════════════════════════════════════════════
+    // OPTIONAL: User ID (defaults to 1000 = typical non-root user)
+    // ═══════════════════════════════════════════════════════════════════════════
+    // uid: User ID running the process
+    // Keys tried: uid (⭐ Unix standard), user_id, userid
+    // Default: 1000 (typical first non-root user on Linux)
     let uid = extract_u32_field(&data, &["uid", "user_id", "userid"]).unwrap_or(1000);
     
-    // Get timestamp
+    // ═══════════════════════════════════════════════════════════════════════════
+    // OPTIONAL: Timestamp (for temporal/time-series analysis)
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Keys tried: timestamp (⭐ ISO 8601), time, datetime
+    // Format: ISO 8601 recommended (e.g., "2024-01-06T10:00:00Z")
     let timestamp = extract_string_field(&data, &["timestamp", "time", "datetime"]);
     
     Ok(RawLogEntry {
@@ -1404,8 +1592,44 @@ pub fn resolve_parent_names(entries: &[RawLogEntry]) -> HashMap<(String, u32), S
 
 /// Build machine profiles from raw log entries with automatic parent resolution
 pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Vec<MachineProfile> {
+    // Debug: Show PPID resolution statistics if enabled
+    if config.debug_ppid_resolution {
+        println!("🔍 PPID Resolution Debug Info:");
+        println!("   Total entries to process: {}", entries.len());
+    }
+    
     // Resolve parent names
     let pid_to_name = resolve_parent_names(&entries);
+    
+    if config.debug_ppid_resolution {
+        println!("   Resolved {} PID-to-name mappings", pid_to_name.len());
+        println!("   Sample mappings:");
+        for ((machine, pid), name) in pid_to_name.iter().take(5) {
+            println!("     {}:{} -> {}", machine, pid, name);
+        }
+        println!();
+    }
+    
+    // Filter out kernel threads if configured
+    let entries: Vec<RawLogEntry> = if config.exclude_kernel_threads {
+        let before_count = entries.len();
+        let filtered: Vec<_> = entries.into_iter()
+            .filter(|e| !is_kernel_thread(&e.name))
+            .collect();
+        let after_count = filtered.len();
+        
+        if config.debug_ppid_resolution {
+            println!("   Kernel thread filtering:");
+            println!("     Before: {} entries", before_count);
+            println!("     After: {} entries", after_count);
+            println!("     Filtered out: {} kernel threads", before_count - after_count);
+            println!();
+        }
+        
+        filtered
+    } else {
+        entries
+    };
     
     // Group by machine
     let mut machine_entries: HashMap<String, Vec<RawLogEntry>> = HashMap::new();
@@ -1413,6 +1637,11 @@ pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Ve
         machine_entries.entry(entry.machine_id.clone())
             .or_insert_with(Vec::new)
             .push(entry);
+    }
+    
+    if config.debug_ppid_resolution {
+        println!("   Grouped into {} machines", machine_entries.len());
+        println!();
     }
     
     // Build profiles in parallel
@@ -1425,7 +1654,13 @@ pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Ve
                 let parent_name = pid_to_name
                     .get(&(entry.machine_id.clone(), entry.ppid))
                     .cloned()
-                    .unwrap_or_else(|| format!("[unknown:{}]", entry.ppid));
+                    .unwrap_or_else(|| {
+                        if config.debug_ppid_resolution && entry.ppid != 0 {
+                            eprintln!("⚠️  Unresolved PPID for {}:{} (PPID: {})", 
+                                entry.machine_id, entry.name, entry.ppid);
+                        }
+                        format!("[unknown:{}]", entry.ppid)
+                    });
                 
                 // Calculate entropy and path risk
                 let entropy = calculate_shannon_entropy(&entry.args);
@@ -1451,6 +1686,11 @@ pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Ve
             profile
         })
         .collect()
+}
+
+/// Check if a process name indicates a Linux kernel thread
+fn is_kernel_thread(name: &str) -> bool {
+    name.starts_with('[') && name.ends_with(']')
 }
 
 // --- DATA LOADERS ---
@@ -1487,9 +1727,15 @@ pub fn load_csv_data(path: &str, config: &DetectionConfig) -> Result<Vec<Machine
 /// Vector of machine profiles ready for analysis
 /// 
 /// # Examples
-/// ```
+/// ```no_run
+/// use ironsift::{load_json_data, DetectionConfig};
+/// 
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let config = DetectionConfig::default();
 /// let profiles = load_json_data("logs.json", &config)?;
+/// println!("Loaded {} machine profiles", profiles.len());
+/// # Ok(())
+/// # }
 /// ```
 pub fn load_json_data(path: &str, config: &DetectionConfig) -> Result<Vec<MachineProfile>, Box<dyn Error>> {
     if !Path::new(path).exists() {

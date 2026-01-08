@@ -1216,3 +1216,814 @@ fn test_ppid_resolution_with_missing_parents() {
     
     println!("✅ Missing parent PPID test passed!");
 }
+
+#[test]
+fn test_process_builder_len_and_is_empty() {
+    let mut builder = ProcessBuilder::new();
+    
+    // Empty builder
+    assert_eq!(builder.len(), 0);
+    assert!(builder.is_empty());
+    
+    // Add one entry
+    builder.add_process("server1", "nginx", "systemd");
+    assert_eq!(builder.len(), 1);
+    assert!(!builder.is_empty());
+    
+    // Add more entries
+    builder.add_process("server1", "worker", "nginx");
+    builder.add_process("server2", "postgres", "systemd");
+    assert_eq!(builder.len(), 3);
+    assert!(!builder.is_empty());
+    
+    // Add via command parsing
+    builder.add_command("server3", "/usr/bin/nginx -c /etc/nginx.conf", Some("systemd"));
+    assert_eq!(builder.len(), 4);
+    
+    // Add via JSON
+    builder.add_json(r#"{"host": "server4", "cmd": "python3 app.py"}"#);
+    assert_eq!(builder.len(), 5);
+    
+    println!("✅ ProcessBuilder len() and is_empty() test passed!");
+}
+
+#[test]
+fn test_load_json_data_array() {
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+    
+    let config = DetectionConfig::default();
+    
+    // Create temporary JSON file with array format
+    let mut temp_file = NamedTempFile::new().unwrap();
+    let json_content = r#"[
+        {"machine_id": "server1", "pid": 1, "ppid": 0, "name": "systemd", "uid": 0, "path": "/usr/lib/systemd/systemd", "args": "--system"},
+        {"machine_id": "server1", "pid": 100, "ppid": 1, "name": "nginx", "uid": 33, "path": "/usr/sbin/nginx", "args": "-c /etc/nginx.conf"},
+        {"machine_id": "server2", "pid": 1, "ppid": 0, "name": "systemd", "uid": 0, "path": "/usr/lib/systemd/systemd", "args": "--system"},
+        {"machine_id": "server2", "pid": 200, "ppid": 1, "name": "miner", "uid": 0, "path": "/tmp/miner", "args": "--pool xmr"}
+    ]"#;
+    
+    temp_file.write_all(json_content.as_bytes()).unwrap();
+    temp_file.flush().unwrap();
+    
+    // Load JSON data
+    let profiles = load_json_data(temp_file.path().to_str().unwrap(), &config).unwrap();
+    
+    // Verify profiles loaded correctly
+    assert_eq!(profiles.len(), 2);
+    assert!(profiles.iter().any(|p| p.id == "server1"));
+    assert!(profiles.iter().any(|p| p.id == "server2"));
+    
+    println!("✅ load_json_data (array format) test passed!");
+}
+
+#[test]
+fn test_load_json_data_ndjson() {
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+    
+    let config = DetectionConfig::default();
+    
+    // Create temporary JSON file with NDJSON format
+    let mut temp_file = NamedTempFile::new().unwrap();
+    let json_content = r#"{"machine_id": "web1", "pid": 1, "ppid": 0, "name": "systemd", "uid": 0, "path": "/usr/lib/systemd/systemd", "args": ""}
+{"machine_id": "web1", "pid": 100, "ppid": 1, "name": "nginx", "uid": 33, "path": "/usr/sbin/nginx", "args": ""}
+{"machine_id": "web2", "pid": 1, "ppid": 0, "name": "systemd", "uid": 0, "path": "/usr/lib/systemd/systemd", "args": ""}
+{"machine_id": "web2", "pid": 100, "ppid": 1, "name": "apache2", "uid": 33, "path": "/usr/sbin/apache2", "args": ""}
+"#;
+    
+    temp_file.write_all(json_content.as_bytes()).unwrap();
+    temp_file.flush().unwrap();
+    
+    // Load JSON data
+    let profiles = load_json_data(temp_file.path().to_str().unwrap(), &config).unwrap();
+    
+    // Verify profiles loaded correctly
+    assert_eq!(profiles.len(), 2);
+    assert!(profiles.iter().any(|p| p.id == "web1"));
+    assert!(profiles.iter().any(|p| p.id == "web2"));
+    
+    println!("✅ load_json_data (NDJSON format) test passed!");
+}
+
+#[test]
+fn test_load_json_data_nonexistent_file() {
+    let config = DetectionConfig::default();
+    
+    // Try to load non-existent file
+    let result = load_json_data("nonexistent_file.json", &config);
+    
+    // Should return error
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("not found"));
+    
+    println!("✅ load_json_data (nonexistent file) test passed!");
+}
+
+#[test]
+fn test_load_json_data_empty_file() {
+    use tempfile::NamedTempFile;
+    
+    let config = DetectionConfig::default();
+    
+    // Create empty file
+    let temp_file = NamedTempFile::new().unwrap();
+    
+    // Try to load empty file
+    let result = load_json_data(temp_file.path().to_str().unwrap(), &config);
+    
+    // Should return error
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("empty"));
+    
+    println!("✅ load_json_data (empty file) test passed!");
+}
+
+#[test]
+fn test_load_json_data_simplified_format() {
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+    
+    let config = DetectionConfig::default();
+    
+    // Create JSON with flexible key names (Docker/K8s style)
+    let mut temp_file = NamedTempFile::new().unwrap();
+    let json_content = r#"[
+        {"host": "container1", "cmd": "nginx", "uid": 33},
+        {"host": "container1", "cmd": "postgres", "uid": 70},
+        {"node": "worker1", "command": "python3 app.py", "userid": 1000},
+        {"container": "web-prod", "commandline": "/usr/bin/node server.js", "user_id": 1000}
+    ]"#;
+    
+    temp_file.write_all(json_content.as_bytes()).unwrap();
+    temp_file.flush().unwrap();
+    
+    // Load JSON data with flexible keys
+    let profiles = load_json_data(temp_file.path().to_str().unwrap(), &config).unwrap();
+    
+    // Should parse flexible key names correctly
+    assert!(!profiles.is_empty());
+    
+    println!("✅ load_json_data (flexible keys) test passed!");
+}
+
+// ============================================================================
+// GENERATOR DETECTION TESTS - Verify all malicious machines are detected
+// ============================================================================
+
+/// Test that web shell payloads have high entropy
+#[test]
+fn test_web_shell_entropy() {
+    let web_shell_payloads = vec![
+        "eval(base64_decode('aGVsbG8gd29ybGQ='));",
+        "system($_GET['cmd']);",
+        "<?php @eval($_POST['x']);?>",
+        "eval(base64_decode('ZWNobyBzeXN0ZW0oJF9HRVRbJ2NtZCddKTs='));",
+        "<?php eval(gzinflate(base64_decode('K0ktSgEA')));?>",
+        "system('cat /etc/passwd | base64');",
+    ];
+    
+    let threshold = 4.5;
+    let mut high_entropy_count = 0;
+    
+    for (i, payload) in web_shell_payloads.iter().enumerate() {
+        let entropy = calculate_shannon_entropy(payload);
+        println!("Web shell #{}: entropy = {:.2}", i + 1, entropy);
+        
+        if entropy > threshold {
+            high_entropy_count += 1;
+        }
+    }
+    
+    // At least 50% of web shell payloads should have high entropy
+    assert!(
+        high_entropy_count >= web_shell_payloads.len() / 2,
+        "Only {}/{} web shell payloads have high entropy (threshold: {}). Need at least {}.",
+        high_entropy_count, web_shell_payloads.len(), threshold, web_shell_payloads.len() / 2
+    );
+    
+    println!("✅ Web shell entropy test passed: {}/{} payloads have high entropy",
+        high_entropy_count, web_shell_payloads.len());
+}
+
+/// Test that cryptominer paths are detected as suspicious
+#[test]
+fn test_cryptominer_detection() {
+    let config = DetectionConfig::default();
+    
+    let miner_paths = vec![
+        "/tmp/.X11-unix/kworker",
+        "/var/tmp/.cache/systemd",
+        "/dev/shm/.config/worker",
+    ];
+    
+    for path in miner_paths {
+        let is_suspicious = is_path_suspicious(path, &config.suspicious_path_patterns);
+        assert!(
+            is_suspicious,
+            "Cryptominer path '{}' should be detected as suspicious",
+            path
+        );
+    }
+    
+    println!("✅ Cryptominer path detection test passed!");
+}
+
+/// Test that privilege escalation is detected (unexpected root processes)
+#[test]
+fn test_privilege_escalation_detection() {
+    let config = DetectionConfig::default();
+    
+    // These should be flagged as unexpected root
+    let unexpected_root = vec![
+        ("node", "/usr/bin/node", "server.js"),
+        ("python3", "/tmp/backdoor", "shell.py"),
+        ("miner", "/tmp/kworker", "--donate-level 1"),
+    ];
+    
+    for (name, path, _args) in unexpected_root {
+        let sig = ProcessSignature {
+            name: name.to_string(),
+            parent_name: "systemd".to_string(),
+            uid: 0,
+            path: path.to_string(),
+            is_high_entropy: false,
+            is_suspicious_path: false,
+        };
+        
+        let is_unexpected = sig.is_unexpected_root(&config.common_root_processes);
+        assert!(
+            is_unexpected,
+            "Process '{}' as root should be unexpected",
+            name
+        );
+    }
+    
+    // These should NOT be flagged (in whitelist)
+    let expected_root = vec!["systemd", "sshd", "cron", "dockerd"];
+    
+    for name in expected_root {
+        let sig = ProcessSignature {
+            name: name.to_string(),
+            parent_name: "init".to_string(),
+            uid: 0,
+            path: format!("/usr/sbin/{}", name),
+            is_high_entropy: false,
+            is_suspicious_path: false,
+        };
+        
+        let is_unexpected = sig.is_unexpected_root(&config.common_root_processes);
+        assert!(
+            !is_unexpected,
+            "Process '{}' as root should be expected (in whitelist)",
+            name
+        );
+    }
+    
+    println!("✅ Privilege escalation detection test passed!");
+}
+
+/// Test detection with realistic malicious machine data
+#[test]
+fn test_malicious_machine_detection() {
+    let config = DetectionConfig::default();
+    let mut entries = Vec::new();
+    
+    // Create 10 normal machines
+    for i in 0..10 {
+        let machine_id = format!("normal_{:03}", i);
+        
+        // systemd
+        entries.push(RawLogEntry {
+            machine_id: machine_id.clone(),
+            pid: 1,
+            ppid: 0,
+            name: "systemd".to_string(),
+            uid: 0,
+            path: "/usr/lib/systemd/systemd".to_string(),
+            args: "--system".to_string(),
+            timestamp: None,
+        });
+        
+        // Normal processes (50 each)
+        for j in 0..50 {
+            entries.push(RawLogEntry {
+                machine_id: machine_id.clone(),
+                pid: 100 + j,
+                ppid: 1,
+                name: "nginx".to_string(),
+                uid: 33,
+                path: "/usr/sbin/nginx".to_string(),
+                args: "-c /etc/nginx.conf".to_string(),
+                timestamp: None,
+            });
+        }
+    }
+    
+    // Create 1 machine with web shell (like machine_009)
+    let web_shell_id = "web_shell_machine".to_string();
+    
+    // systemd
+    entries.push(RawLogEntry {
+        machine_id: web_shell_id.clone(),
+        pid: 1,
+        ppid: 0,
+        name: "systemd".to_string(),
+        uid: 0,
+        path: "/usr/lib/systemd/systemd".to_string(),
+        args: "--system".to_string(),
+        timestamp: None,
+    });
+    
+    // apache2 parent
+    entries.push(RawLogEntry {
+        machine_id: web_shell_id.clone(),
+        pid: 108,
+        ppid: 1,
+        name: "apache2".to_string(),
+        uid: 33,
+        path: "/usr/sbin/apache2".to_string(),
+        args: "-k start".to_string(),
+        timestamp: None,
+    });
+    
+    // Normal processes
+    for j in 0..35 {
+        entries.push(RawLogEntry {
+            machine_id: web_shell_id.clone(),
+            pid: 200 + j,
+            ppid: 1,
+            name: "nginx".to_string(),
+            uid: 33,
+            path: "/usr/sbin/nginx".to_string(),
+            args: "-c /etc/nginx.conf".to_string(),
+            timestamp: None,
+        });
+    }
+    
+    // php-fpm with malicious payloads (like the generator creates)
+    for j in 0..10 {
+        entries.push(RawLogEntry {
+            machine_id: web_shell_id.clone(),
+            pid: 300 + j,
+            ppid: 108, // apache2 parent
+            name: "php-fpm".to_string(),
+            uid: 33,
+            path: "/usr/sbin/php-fpm".to_string(),
+            // High entropy payloads
+            args: "eval(base64_decode('ZWNobyBzeXN0ZW0oJF9HRVRbJ2NtZCddKTs='));".to_string(),
+            timestamp: None,
+        });
+    }
+    
+    // Build profiles and analyze
+    let profiles = build_profiles(entries, &config);
+    let report = analyze_fleet(&profiles, &config).unwrap();
+    
+    // Verify web shell machine is detected
+    assert_eq!(profiles.len(), 11, "Should have 11 machines total");
+    assert!(
+        !report.anomalies.is_empty(),
+        "Should detect at least one anomaly"
+    );
+    
+    let web_shell_detected = report.anomalies.iter()
+        .any(|a| a.machine_id == web_shell_id);
+    
+    assert!(
+        web_shell_detected,
+        "Web shell machine should be detected as anomaly. Detected anomalies: {:?}",
+        report.anomalies.iter().map(|a| &a.machine_id).collect::<Vec<_>>()
+    );
+    
+    println!("✅ Malicious machine detection test passed!");
+    println!("   Detected {} anomalies out of 11 machines", report.anomalies.len());
+}
+
+/// Test that ALL 6 attack types from generator are detectable
+#[test]
+fn test_all_attack_types_detectable() {
+    let config = DetectionConfig::default();
+    let mut entries = Vec::new();
+    
+    // Create baseline: 10 normal machines
+    for i in 0..10 {
+        let machine_id = format!("normal_{:03}", i);
+        add_normal_machine(&mut entries, &machine_id, 50);
+    }
+    
+    // Attack Type 1: Cryptominer in /tmp
+    let miner1_id = "cryptominer_tmp".to_string();
+    add_normal_machine(&mut entries, &miner1_id, 30);
+    for j in 0..15 {
+        entries.push(RawLogEntry {
+            machine_id: miner1_id.clone(),
+            pid: 500 + j,
+            ppid: 1,
+            name: "kworker".to_string(),
+            uid: 0,
+            path: "/tmp/.X11-unix/kworker".to_string(),
+            args: "--url stratum+tcp://pool.minexmr.com:4444".to_string(),
+            timestamp: None,
+        });
+    }
+    
+    // Attack Type 2: Cryptominer in /dev/shm
+    let miner2_id = "cryptominer_shm".to_string();
+    add_normal_machine(&mut entries, &miner2_id, 30);
+    for j in 0..15 {
+        entries.push(RawLogEntry {
+            machine_id: miner2_id.clone(),
+            pid: 600 + j,
+            ppid: 1,
+            name: "[kthreadd]".to_string(),
+            uid: 0,
+            path: "/dev/shm/.config/worker".to_string(),
+            args: "-o xmr-eu1.nanopool.org:14444".to_string(),
+            timestamp: None,
+        });
+    }
+    
+    // Attack Type 3: Web Shell
+    let webshell_id = "web_shell".to_string();
+    add_normal_machine(&mut entries, &webshell_id, 30);
+    // Add apache2
+    entries.push(RawLogEntry {
+        machine_id: webshell_id.clone(),
+        pid: 108,
+        ppid: 1,
+        name: "apache2".to_string(),
+        uid: 33,
+        path: "/usr/sbin/apache2".to_string(),
+        args: "-k start".to_string(),
+        timestamp: None,
+    });
+    // Add php-fpm with malicious payloads
+    for j in 0..10 {
+        entries.push(RawLogEntry {
+            machine_id: webshell_id.clone(),
+            pid: 700 + j,
+            ppid: 108,
+            name: "php-fpm".to_string(),
+            uid: 33,
+            path: "/usr/sbin/php-fpm".to_string(),
+            args: "eval(base64_decode('ZWNobyBzeXN0ZW0oJF9HRVRbJ2NtZCddKTs='));".to_string(),
+            timestamp: None,
+        });
+    }
+    
+    // Attack Type 4: Privilege Escalation (node as root)
+    let privesc1_id = "privesc_node".to_string();
+    add_normal_machine(&mut entries, &privesc1_id, 30);
+    for j in 0..15 {
+        entries.push(RawLogEntry {
+            machine_id: privesc1_id.clone(),
+            pid: 800 + j,
+            ppid: 1,
+            name: "node".to_string(),
+            uid: 0, // root!
+            path: "/usr/bin/node".to_string(),
+            args: "server.js".to_string(),
+            timestamp: None,
+        });
+    }
+    
+    // Attack Type 5: Privilege Escalation (python3 in /tmp)
+    let privesc2_id = "privesc_python".to_string();
+    add_normal_machine(&mut entries, &privesc2_id, 30);
+    for j in 0..15 {
+        entries.push(RawLogEntry {
+            machine_id: privesc2_id.clone(),
+            pid: 900 + j,
+            ppid: 1,
+            name: "python3".to_string(),
+            uid: 0, // root!
+            path: "/tmp/backdoor".to_string(),
+            args: "shell.py".to_string(),
+            timestamp: None,
+        });
+    }
+    
+    // Attack Type 6: Lateral Movement (SSH to internal IPs)
+    let lateral_id = "lateral_movement".to_string();
+    add_normal_machine(&mut entries, &lateral_id, 20);
+    
+    // Add sshd parent
+    entries.push(RawLogEntry {
+        machine_id: lateral_id.clone(),
+        pid: 101,
+        ppid: 1,
+        name: "sshd".to_string(),
+        uid: 0,
+        path: "/usr/sbin/sshd".to_string(),
+        args: "-D".to_string(),
+        timestamp: None,
+    });
+    
+    // Add SSH client connections to internal IPs (more entries for better detection)
+    for j in 0..25 {
+        entries.push(RawLogEntry {
+            machine_id: lateral_id.clone(),
+            pid: 1000 + j,
+            ppid: 101, // sshd parent
+            name: "ssh".to_string(), // SSH CLIENT
+            uid: 0,
+            path: "/usr/bin/ssh".to_string(),
+            args: format!("-o StrictHostKeyChecking=no root@192.168.1.{}", 10 + j),
+            timestamp: None,
+        });
+    }
+    
+    // Build profiles and analyze
+    let profiles = build_profiles(entries, &config);
+    let report = analyze_fleet(&profiles, &config).unwrap();
+    
+    // Total: 10 normal + 6 malicious = 16 machines
+    assert_eq!(profiles.len(), 16, "Should have 16 machines total");
+    
+    // Check each attack type is detected
+    let attack_machines = vec![
+        &miner1_id,
+        &miner2_id,
+        &webshell_id,
+        &privesc1_id,
+        &privesc2_id,
+        &lateral_id,
+    ];
+    
+    let mut detected = Vec::new();
+    let mut missed = Vec::new();
+    
+    for machine_id in &attack_machines {
+        if report.anomalies.iter().any(|a| &a.machine_id == *machine_id) {
+            detected.push(*machine_id);
+        } else {
+            missed.push(*machine_id);
+        }
+    }
+    
+    // Print detailed results
+    println!("\n📊 Detection Results:");
+    println!("   Total machines: {}", profiles.len());
+    println!("   Anomalies detected: {}", report.anomalies.len());
+    println!("   Attack machines: {}", attack_machines.len());
+    println!("\n✅ Detected ({}/{}):", detected.len(), attack_machines.len());
+    for id in &detected {
+        println!("     - {}", id);
+    }
+    
+    if !missed.is_empty() {
+        println!("\n❌ MISSED ({}/{}):", missed.len(), attack_machines.len());
+        for id in &missed {
+            println!("     - {}", id);
+        }
+    }
+    
+    // All 6 attack types must be detected
+    assert!(
+        missed.is_empty(),
+        "Failed to detect {} attack machines: {:?}. Only detected: {:?}",
+        missed.len(), missed, detected
+    );
+    
+    println!("\n✅ All attack types detection test passed!");
+}
+
+/// Helper function to add a normal machine
+fn add_normal_machine(entries: &mut Vec<RawLogEntry>, machine_id: &str, log_count: u32) {
+    // systemd
+    entries.push(RawLogEntry {
+        machine_id: machine_id.to_string(),
+        pid: 1,
+        ppid: 0,
+        name: "systemd".to_string(),
+        uid: 0,
+        path: "/usr/lib/systemd/systemd".to_string(),
+        args: "--system".to_string(),
+        timestamp: None,
+    });
+    
+    // Normal processes
+    for j in 0..log_count {
+        entries.push(RawLogEntry {
+            machine_id: machine_id.to_string(),
+            pid: 100 + j,
+            ppid: 1,
+            name: "nginx".to_string(),
+            uid: 33,
+            path: "/usr/sbin/nginx".to_string(),
+            args: "-c /etc/nginx.conf".to_string(),
+            timestamp: None,
+        });
+    }
+}
+
+/// Test that detection is consistent with different tolerance values
+#[test]
+fn test_tolerance_sensitivity() {
+    let mut config = DetectionConfig::default();
+    let mut entries = Vec::new();
+    
+    // 5 normal machines
+    for i in 0..5 {
+        add_normal_machine(&mut entries, &format!("normal_{}", i), 50);
+    }
+    
+    // 1 obvious attacker (cryptominer)
+    let attacker_id = "attacker".to_string();
+    add_normal_machine(&mut entries, &attacker_id, 20);
+    for j in 0..25 {
+        entries.push(RawLogEntry {
+            machine_id: attacker_id.clone(),
+            pid: 500 + j,
+            ppid: 1,
+            name: "kworker".to_string(),
+            uid: 0,
+            path: "/tmp/.hidden/miner".to_string(),
+            args: "XkzL1^s09f87aH@9#kzL1^s09f87".to_string(),
+            timestamp: None,
+        });
+    }
+    
+    // Test with different tolerance values
+    let tolerances = vec![0.03, 0.05, 0.08, 0.10];
+    let mut detection_results = Vec::new();
+    
+    for tolerance in &tolerances {
+        config.dbscan_tolerance = *tolerance;
+        let profiles = build_profiles(entries.clone(), &config);
+        let report = analyze_fleet(&profiles, &config).unwrap();
+        
+        let detected = report.anomalies.iter()
+            .any(|a| a.machine_id == attacker_id);
+        
+        detection_results.push((*tolerance, detected));
+        println!("Tolerance {:.2}: attacker {} detected", 
+            tolerance, 
+            if detected { "WAS" } else { "NOT" }
+        );
+    }
+    
+    // At least with strict tolerance (0.03, 0.05), attacker should be detected
+    let strict_detections: Vec<_> = detection_results.iter()
+        .filter(|(t, _)| *t <= 0.05)
+        .collect();
+    
+    let all_strict_detected = strict_detections.iter()
+        .all(|(_, detected)| *detected);
+    
+    assert!(
+        all_strict_detected,
+        "Obvious attacker should be detected with strict tolerance (≤0.05)"
+    );
+    
+    println!("✅ Tolerance sensitivity test passed!");
+}
+
+/// Test lateral movement detection specifically (machine_012)
+#[test]
+fn test_lateral_movement_detection() {
+    let config = DetectionConfig::default();
+    let mut entries = Vec::new();
+    
+    // Create 10 normal machines with sshd (normal SSH daemon)
+    for i in 0..10 {
+        let machine_id = format!("normal_{:03}", i);
+        
+        // systemd
+        entries.push(RawLogEntry {
+            machine_id: machine_id.clone(),
+            pid: 1,
+            ppid: 0,
+            name: "systemd".to_string(),
+            uid: 0,
+            path: "/usr/lib/systemd/systemd".to_string(),
+            args: "--system".to_string(),
+            timestamp: None,
+        });
+        
+        // Normal processes including sshd (daemon)
+        for j in 0..40 {
+            entries.push(RawLogEntry {
+                machine_id: machine_id.clone(),
+                pid: 100 + j,
+                ppid: 1,
+                name: "nginx".to_string(),
+                uid: 33,
+                path: "/usr/sbin/nginx".to_string(),
+                args: "-c /etc/nginx.conf".to_string(),
+                timestamp: None,
+            });
+        }
+        
+        // Add some normal sshd daemon entries
+        for j in 0..5 {
+            entries.push(RawLogEntry {
+                machine_id: machine_id.clone(),
+                pid: 200 + j,
+                ppid: 1,
+                name: "sshd".to_string(),
+                uid: 0,
+                path: "/usr/sbin/sshd".to_string(),
+                args: "-D".to_string(),
+                timestamp: None,
+            });
+        }
+    }
+    
+    // Create machine_012 with lateral movement (SSH client to internal IPs)
+    let lateral_id = "lateral_movement_machine".to_string();
+    
+    // systemd
+    entries.push(RawLogEntry {
+        machine_id: lateral_id.clone(),
+        pid: 1,
+        ppid: 0,
+        name: "systemd".to_string(),
+        uid: 0,
+        path: "/usr/lib/systemd/systemd".to_string(),
+        args: "--system".to_string(),
+        timestamp: None,
+    });
+    
+    // sshd parent
+    entries.push(RawLogEntry {
+        machine_id: lateral_id.clone(),
+        pid: 101,
+        ppid: 1,
+        name: "sshd".to_string(),
+        uid: 0,
+        path: "/usr/sbin/sshd".to_string(),
+        args: "-D".to_string(),
+        timestamp: None,
+    });
+    
+    // Normal processes
+    for j in 0..30 {
+        entries.push(RawLogEntry {
+            machine_id: lateral_id.clone(),
+            pid: 200 + j,
+            ppid: 1,
+            name: "nginx".to_string(),
+            uid: 33,
+            path: "/usr/sbin/nginx".to_string(),
+            args: "-c /etc/nginx.conf".to_string(),
+            timestamp: None,
+        });
+    }
+    
+    // SSH client connections to internal IPs (lateral movement)
+    let internal_ips = vec![
+        "root@10.0.1.5",
+        "root@192.168.1.10",
+        "admin@172.16.0.50",
+        "root@10.0.2.15",
+        "user@192.168.1.100",
+    ];
+    
+    for j in 0..20 {
+        let ip = internal_ips[j % internal_ips.len()];
+        entries.push(RawLogEntry {
+            machine_id: lateral_id.clone(),
+            pid: 300 + j,
+            ppid: 101, // sshd parent
+            name: "ssh".to_string(), // ssh CLIENT (not sshd daemon)
+            uid: 0,
+            path: "/usr/bin/ssh".to_string(),
+            args: format!("-o StrictHostKeyChecking=no {}", ip),
+            timestamp: None,
+        });
+    }
+    
+    // Build profiles and analyze
+    let profiles = build_profiles(entries, &config);
+    let report = analyze_fleet(&profiles, &config).unwrap();
+    
+    // Verify lateral movement machine is detected
+    assert_eq!(profiles.len(), 11, "Should have 11 machines total");
+    assert!(
+        !report.anomalies.is_empty(),
+        "Should detect at least one anomaly"
+    );
+    
+    let lateral_detected = report.anomalies.iter()
+        .any(|a| a.machine_id == lateral_id);
+    
+    // Debug output
+    println!("\n📊 Lateral Movement Detection:");
+    println!("   Total machines: {}", profiles.len());
+    println!("   Anomalies detected: {}", report.anomalies.len());
+    println!("   Detected anomalies: {:?}", 
+        report.anomalies.iter().map(|a| &a.machine_id).collect::<Vec<_>>()
+    );
+    
+    assert!(
+        lateral_detected,
+        "Lateral movement machine (machine_012 equivalent) should be detected as anomaly. \
+         Detected anomalies: {:?}",
+        report.anomalies.iter().map(|a| &a.machine_id).collect::<Vec<_>>()
+    );
+    
+    println!("✅ Lateral movement detection test passed!");
+    println!("   Machine with SSH connections to internal IPs was detected");
+}
