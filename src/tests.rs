@@ -539,6 +539,27 @@ fn test_parse_command_line() {
     assert_eq!(name, "");
     assert_eq!(path, "");
     assert_eq!(args, "");
+    
+    // Linux kernel threads - critical test cases!
+    let (name, path, args) = parse_command_line("[kworker/1:0]");
+    assert_eq!(name, "[kworker/1:0]");
+    assert_eq!(path, "[kworker/1:0]");
+    assert_eq!(args, "");
+    
+    let (name, path, args) = parse_command_line("[migration/0]");
+    assert_eq!(name, "[migration/0]");
+    assert_eq!(path, "[migration/0]");
+    assert_eq!(args, "");
+    
+    let (name, path, args) = parse_command_line("[ksoftirqd/1]");
+    assert_eq!(name, "[ksoftirqd/1]");
+    assert_eq!(path, "[ksoftirqd/1]");
+    assert_eq!(args, "");
+    
+    let (name, path, args) = parse_command_line("[kthreadd]");
+    assert_eq!(name, "[kthreadd]");
+    assert_eq!(path, "[kthreadd]");
+    assert_eq!(args, "");
 }
 
 #[test]
@@ -2026,4 +2047,134 @@ fn test_lateral_movement_detection() {
     
     println!("✅ Lateral movement detection test passed!");
     println!("   Machine with SSH connections to internal IPs was detected");
+}
+
+/// Test kernel thread handling - parsing and filtering
+#[test]
+fn test_kernel_thread_handling() {
+    let config = DetectionConfig::default();
+    
+    // Test 1: Kernel thread names are parsed correctly
+    let kernel_threads = vec![
+        "[kworker/1:0]",
+        "[migration/0]",
+        "[ksoftirqd/1]",
+        "[kthreadd]",
+        "[watchdog/0]",
+        "[kswapd0]",
+        "[ksmd]",
+    ];
+    
+    println!("\n🔍 Testing kernel thread parsing:");
+    for thread_name in &kernel_threads {
+        let (name, path, args) = parse_command_line(thread_name);
+        
+        println!("   {} → name='{}', path='{}', args='{}'", thread_name, name, path, args);
+        
+        assert_eq!(name, *thread_name, "Name should be preserved");
+        assert_eq!(path, *thread_name, "Path should equal name");
+        assert_eq!(args, "", "Kernel threads have no args");
+    }
+    
+    // Test 2: Kernel threads are filtered when config says so
+    let mut entries = Vec::new();
+    let machine_id = "test_machine".to_string();
+    
+    // Add systemd
+    entries.push(RawLogEntry {
+        machine_id: machine_id.clone(),
+        pid: 1,
+        ppid: 0,
+        name: "systemd".to_string(),
+        uid: 0,
+        path: "/usr/lib/systemd/systemd".to_string(),
+        args: "--system".to_string(),
+        timestamp: None,
+    });
+    
+    // Add kernel threads
+    for (i, thread_name) in kernel_threads.iter().enumerate() {
+        entries.push(RawLogEntry {
+            machine_id: machine_id.clone(),
+            pid: 10 + i as u32,
+            ppid: 0,
+            name: thread_name.to_string(),
+            uid: 0,
+            path: thread_name.to_string(),
+            args: String::new(),
+            timestamp: None,
+        });
+    }
+    
+    // Add normal processes
+    for j in 0..10 {
+        entries.push(RawLogEntry {
+            machine_id: machine_id.clone(),
+            pid: 100 + j,
+            ppid: 1,
+            name: "nginx".to_string(),
+            uid: 33,
+            path: "/usr/sbin/nginx".to_string(),
+            args: "-c /etc/nginx.conf".to_string(),
+            timestamp: None,
+        });
+    }
+    
+    let total_entries = entries.len();
+    let kernel_thread_count = kernel_threads.len();
+    
+    println!("\n🔍 Testing kernel thread filtering:");
+    println!("   Total entries: {}", total_entries);
+    println!("   Kernel threads: {}", kernel_thread_count);
+    println!("   Normal processes: {}", total_entries - kernel_thread_count - 1);
+    
+    // Test with filtering enabled (default)
+    let mut config_filter = config.clone();
+    config_filter.exclude_kernel_threads = true;
+    
+    let profiles_filtered = build_profiles(entries.clone(), &config_filter);
+    let profile = &profiles_filtered[0];
+    
+    // Check that kernel threads were filtered out
+    let has_kernel_threads = profile.counts.keys().any(|sig| {
+        sig.name.starts_with('[') && sig.name.ends_with(']')
+    });
+    
+    assert!(
+        !has_kernel_threads,
+        "Kernel threads should be filtered out when exclude_kernel_threads=true"
+    );
+    
+    println!("   ✅ With filtering: {} process signatures (kernel threads removed)", 
+        profile.counts.len());
+    
+    // Test with filtering disabled
+    let mut config_no_filter = config.clone();
+    config_no_filter.exclude_kernel_threads = false;
+    
+    let profiles_no_filter = build_profiles(entries.clone(), &config_no_filter);
+    let profile_no_filter = &profiles_no_filter[0];
+    
+    // Check that kernel threads are included
+    let has_kernel_threads_no_filter = profile_no_filter.counts.keys().any(|sig| {
+        sig.name.starts_with('[') && sig.name.ends_with(']')
+    });
+    
+    assert!(
+        has_kernel_threads_no_filter,
+        "Kernel threads should be included when exclude_kernel_threads=false"
+    );
+    
+    println!("   ✅ Without filtering: {} process signatures (kernel threads included)", 
+        profile_no_filter.counts.len());
+    
+    // Verify the difference
+    assert!(
+        profile_no_filter.counts.len() > profile.counts.len(),
+        "Profile without filtering should have more signatures"
+    );
+    
+    println!("\n✅ Kernel thread handling test passed!");
+    println!("   Parsing: Correct ✓");
+    println!("   Filtering: Working ✓");
 }
