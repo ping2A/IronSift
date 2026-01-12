@@ -40,5 +40,13 @@
     "avahi-daemon"
   ],
   "flag_unexpected_root": true,
-  "debug_ppid_resolution": false
+  "debug_ppid_resolution": false,
+  "exclude_init_children": true,
+  "whitelisted_path_patterns": [
+    "/opt/conda/*",
+    "/usr/local/bin/*",
+    "/home/*/venv/*",
+    "/home/*/anaconda3/*",
+    "/opt/custom-app/*"
+  ]
 }

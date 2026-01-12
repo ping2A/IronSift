@@ -3,7 +3,7 @@ use std::error::Error;
 use std::fs::{self, File};
 use std::path::Path;
 use serde::{Deserialize, Serialize};
-use ndarray::{Array2, Axis};
+use ndarray::Array2;
 use linfa::traits::Transformer;
 use linfa_clustering::Dbscan;
 use rayon::prelude::*;
@@ -46,6 +46,15 @@ pub struct DetectionConfig {
     
     /// Enable debug output for PPID resolution
     pub debug_ppid_resolution: bool,
+    
+    /// Exclude processes that are direct children of init/systemd (PPID = 1)
+    /// Many system services run as children of init and are typically normal
+    pub exclude_init_children: bool,
+    
+    /// Path whitelist patterns (glob-style wildcards: * and ?)
+    /// Processes with paths matching these patterns will not be flagged as suspicious
+    /// Examples: "/opt/conda/*", "/usr/local/bin/*", "/home/*/venv/*"
+    pub whitelisted_path_patterns: Vec<String>,
 }
 
 impl Default for DetectionConfig {
@@ -92,6 +101,8 @@ impl Default for DetectionConfig {
             ],
             flag_unexpected_root: true,
             debug_ppid_resolution: false,
+            exclude_init_children: false,  // Off by default to avoid over-filtering
+            whitelisted_path_patterns: vec![],  // Empty by default
         }
     }
 }
@@ -265,6 +276,7 @@ impl ProcessSignature {
     }
 }
 
+#[derive(Debug)]
 pub struct MachineProfile {
     pub id: String,
     pub counts: HashMap<ProcessSignature, u32>,
@@ -311,23 +323,59 @@ impl MachineProfile {
 
 #[derive(Debug, Clone, Serialize)]
 pub enum AnomalyLevel {
-    Low,      // Distance 0.0-0.3 from cluster
-    Medium,   // Distance 0.3-0.6
-    High,     // Distance 0.6-1.0
-    Critical, // Distance > 1.0 or noise
+    Low,      // Distance 0.0 - <0.3 from cluster
+    Medium,   // Distance 0.3 - <0.6
+    High,     // Distance 0.6 - <1.0
+    Critical, // Distance >= 1.0 or noise
 }
 
 impl AnomalyLevel {
-    fn from_distance(distance: f64) -> Self {
-        if distance > 1.0 {
+    pub fn from_distance(distance: f64) -> Self {
+        if distance >= 1.0 {
             AnomalyLevel::Critical
-        } else if distance > 0.6 {
+        } else if distance >= 0.6 {
             AnomalyLevel::High
-        } else if distance > 0.3 {
+        } else if distance >= 0.3 {
             AnomalyLevel::Medium
         } else {
             AnomalyLevel::Low
         }
+    }
+    
+    /// Get severity as string
+    pub fn as_str(&self) -> &str {
+        match self {
+            AnomalyLevel::Low => "LOW",
+            AnomalyLevel::Medium => "MEDIUM",
+            AnomalyLevel::High => "HIGH",
+            AnomalyLevel::Critical => "CRITICAL",
+        }
+    }
+    
+    /// Get emoji representation
+    pub fn emoji(&self) -> &str {
+        match self {
+            AnomalyLevel::Low => "🟡",
+            AnomalyLevel::Medium => "🟠",
+            AnomalyLevel::High => "🔴",
+            AnomalyLevel::Critical => "💀",
+        }
+    }
+    
+    /// Get numeric severity score (0-3)
+    pub fn score(&self) -> u8 {
+        match self {
+            AnomalyLevel::Low => 0,
+            AnomalyLevel::Medium => 1,
+            AnomalyLevel::High => 2,
+            AnomalyLevel::Critical => 3,
+        }
+    }
+}
+
+impl std::fmt::Display for AnomalyLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
     }
 }
 
@@ -344,12 +392,11 @@ pub struct AnomalyDetails {
 
 impl AnomalyDetails {
     fn severity_emoji(&self) -> &str {
-        match self.severity {
-            AnomalyLevel::Low => "🟡",
-            AnomalyLevel::Medium => "🟠",
-            AnomalyLevel::High => "🔴",
-            AnomalyLevel::Critical => "💀",
-        }
+        self.severity.emoji()
+    }
+    
+    fn severity_str(&self) -> &str {
+        self.severity.as_str()
     }
 }
 
@@ -382,7 +429,6 @@ impl AnalysisReport {
         println!("  Minority Cluster Ratio: {}%", self.config_used.minority_cluster_ratio * 100.0);
         
         println!("\n--- Cluster Distribution ---");
-        let mut noise_count = 0;
         let mut cluster_ids: Vec<_> = self.cluster_stats.keys()
             .filter_map(|k| *k)
             .collect();
@@ -394,9 +440,8 @@ impl AnalysisReport {
             println!("  Cluster {}: {} machines ({:.1}%)", cluster_id, count, pct);
         }
         
-        if let Some(&count) = self.cluster_stats.get(&None) {
-            noise_count = count;
-            let pct = (count as f64 / self.total_analyzed as f64) * 100.0;
+        if let Some(&noise_count) = self.cluster_stats.get(&None) {
+            let pct = (noise_count as f64 / self.total_analyzed as f64) * 100.0;
             println!("  Noise (Outliers): {} machines ({:.1}%)", noise_count, pct);
         }
 
@@ -425,6 +470,21 @@ impl AnalysisReport {
             let low: Vec<_> = self.anomalies.iter()
                 .filter(|a| matches!(a.severity, AnomalyLevel::Low))
                 .collect();
+            
+            // Severity breakdown
+            println!("\nSeverity Breakdown:");
+            if !critical.is_empty() {
+                println!("  💀 CRITICAL: {} machine(s)", critical.len());
+            }
+            if !high.is_empty() {
+                println!("  🔴 HIGH: {} machine(s)", high.len());
+            }
+            if !medium.is_empty() {
+                println!("  🟠 MEDIUM: {} machine(s)", medium.len());
+            }
+            if !low.is_empty() {
+                println!("  🟡 LOW: {} machine(s)", low.len());
+            }
             
             if !critical.is_empty() {
                 println!("\n💀 CRITICAL ({}):", critical.len());
@@ -473,9 +533,10 @@ impl AnalysisReport {
     }
     
     fn print_anomaly_detailed(&self, anomaly: &AnomalyDetails, profiles: Option<&[MachineProfile]>) {
-        println!("\n  {} {} (Distance: {:.3})", 
+        println!("\n  {} {} [{}] (Distance: {:.3})", 
             anomaly.severity_emoji(), 
-            anomaly.machine_id, 
+            anomaly.machine_id,
+            anomaly.severity_str(),
             anomaly.distance_score
         );
         
@@ -664,30 +725,6 @@ impl AnalysisReport {
     }
     
     #[deprecated(since = "2.0.0", note = "Use print_detailed() instead")]
-    fn print_anomaly(&self, anomaly: &AnomalyDetails) {
-        println!("  {} {} (Score: {:.3})", 
-            anomaly.severity_emoji(), 
-            anomaly.machine_id, 
-            anomaly.distance_score
-        );
-        
-        if anomaly.suspicious_process_count > 0 {
-            println!("     └─ {} suspicious processes detected", anomaly.suspicious_process_count);
-        }
-        
-        if !anomaly.anomalous_features.is_empty() {
-            let preview = if anomaly.anomalous_features.len() <= 2 {
-                anomaly.anomalous_features.join(", ")
-            } else {
-                format!("{}, {} and {} more", 
-                    anomaly.anomalous_features[0],
-                    anomaly.anomalous_features[1],
-                    anomaly.anomalous_features.len() - 2
-                )
-            };
-            println!("     └─ Unusual: {}", preview);
-        }
-    }
     
     /// Export detailed forensic report as JSON
     pub fn export_json(&self, profiles: &[MachineProfile], path: &str) -> Result<(), Box<dyn Error>> {
@@ -712,7 +749,11 @@ impl AnalysisReport {
                 
                 investigation_data.push(serde_json::json!({
                     "machine_id": anomaly.machine_id,
-                    "severity": format!("{:?}", anomaly.severity),
+                    "severity": {
+                        "level": anomaly.severity.as_str(),
+                        "score": anomaly.severity.score(),
+                        "emoji": anomaly.severity.emoji(),
+                    },
                     "distance_score": anomaly.distance_score,
                     "cluster": anomaly.cluster_assignment,
                     "total_processes": profile.total_logs,
@@ -959,7 +1000,42 @@ pub fn calculate_shannon_entropy(s: &str) -> f64 {
     entropy
 }
 
-fn is_path_suspicious(path: &str, patterns: &[String]) -> bool {
+/// Check if a path matches a glob-style pattern with wildcards (* and ?)
+/// Examples:
+///   - "/opt/conda/*" matches "/opt/conda/bin/python"
+///   - "/usr/*/bin" matches "/usr/local/bin"
+///   - "/home/user/*.py" matches "/home/user/script.py"
+pub fn matches_wildcard(path: &str, pattern: &str) -> bool {
+    // Convert glob pattern to regex
+    // Escape regex special chars except * and ?
+    let mut regex_pattern = String::new();
+    regex_pattern.push('^');
+    
+    for ch in pattern.chars() {
+        match ch {
+            '*' => regex_pattern.push_str(".*"),      // * matches anything
+            '?' => regex_pattern.push('.'),            // ? matches one char
+            '.' | '+' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' | '\\' => {
+                regex_pattern.push('\\');
+                regex_pattern.push(ch);
+            }
+            _ => regex_pattern.push(ch),
+        }
+    }
+    
+    regex_pattern.push('$');
+    
+    Regex::new(&regex_pattern)
+        .map(|re| re.is_match(path))
+        .unwrap_or(false)
+}
+
+/// Check if path matches any whitelisted pattern
+pub fn is_path_whitelisted(path: &str, whitelist: &[String]) -> bool {
+    whitelist.iter().any(|pattern| matches_wildcard(path, pattern))
+}
+
+pub fn is_path_suspicious(path: &str, patterns: &[String]) -> bool {
     patterns.iter().any(|pattern| {
         Regex::new(pattern)
             .map(|re| re.is_match(path))
@@ -1631,6 +1707,27 @@ pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Ve
         entries
     };
     
+    // Filter out init children if configured
+    let entries: Vec<RawLogEntry> = if config.exclude_init_children {
+        let before_count = entries.len();
+        let filtered: Vec<_> = entries.into_iter()
+            .filter(|e| e.ppid != 1)
+            .collect();
+        let after_count = filtered.len();
+        
+        if config.debug_ppid_resolution {
+            println!("   Init children filtering:");
+            println!("     Before: {} entries", before_count);
+            println!("     After: {} entries", after_count);
+            println!("     Filtered out: {} init children (PPID=1)", before_count - after_count);
+            println!();
+        }
+        
+        filtered
+    } else {
+        entries
+    };
+    
     // Group by machine
     let mut machine_entries: HashMap<String, Vec<RawLogEntry>> = HashMap::new();
     for entry in entries {
@@ -1665,7 +1762,14 @@ pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Ve
                 // Calculate entropy and path risk
                 let entropy = calculate_shannon_entropy(&entry.args);
                 let is_high_entropy = entropy > config.entropy_threshold;
-                let is_suspicious_path = is_path_suspicious(&entry.path, &config.suspicious_path_patterns);
+                
+                // Check if path is whitelisted first, then check if suspicious
+                let is_whitelisted = is_path_whitelisted(&entry.path, &config.whitelisted_path_patterns);
+                let is_suspicious_path = if is_whitelisted {
+                    false  // Whitelisted paths are never suspicious
+                } else {
+                    is_path_suspicious(&entry.path, &config.suspicious_path_patterns)
+                };
                 
                 let timestamp = entry.timestamp.as_ref()
                     .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
@@ -1829,3 +1933,6 @@ pub fn build_profiles_simple(
     let raw_entries = builder.build();
     build_profiles(raw_entries, config)
 }
+
+#[cfg(test)]
+mod tests;
