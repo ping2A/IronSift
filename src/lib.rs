@@ -62,7 +62,7 @@ impl Default for DetectionConfig {
         Self {
             entropy_threshold: 4.5,
             minority_cluster_ratio: 0.10,
-            dbscan_tolerance: 0.05,
+            dbscan_tolerance: 0.35,
             dbscan_min_samples: 2,
             normalize_features: true,
             suspicious_path_patterns: vec![
@@ -253,7 +253,7 @@ impl ProcessEntry {
 pub struct ProcessSignature {
     pub name: String,
     pub parent_name: String,
-    pub ppid: u32,  // ⭐ PPID preserved for forensics
+    //pub ppid: u32,  // ⭐ PPID preserved for forensics
     pub uid: u32,
     pub path: String,
     pub is_high_entropy: bool,
@@ -638,12 +638,12 @@ impl AnalysisReport {
             println!("     │  📛 {} (count: {})", sig.name, count);
             
             // ⭐ Show PPID alongside parent name
-            if sig.ppid > 0 {
+      /*       if sig.ppid > 0 {
                 println!("     │     Parent: {} (PPID: {})", sig.parent_name, sig.ppid);
             } else {
                 println!("     │     Parent: {}", sig.parent_name);
             }
-            
+         */   
             println!("     │     Path: {}", sig.path);
             if sig.uid == 0 {
                 println!("     │     UID: {} (root) ⚠️", sig.uid);
@@ -774,7 +774,10 @@ impl AnalysisReport {
             if let Some(profile) = profiles.iter().find(|p| p.id == anomaly.machine_id) {
                 // Find the most suspicious processes
                 let suspicious_procs: Vec<_> = profile.counts.iter()
-                    .filter(|(sig, _)| sig.is_high_entropy || sig.is_suspicious_path || sig.uid == 0)
+                    .filter(|(sig, _)| {
+                        let is_common = self.config_used.common_root_processes.iter().any(|p| sig.name.contains(p));
+                        sig.is_high_entropy || sig.is_suspicious_path || (sig.uid == 0 && !is_common)
+                    })
                     .map(|(sig, count)| {
                         // Calculate entropy for args display
                         let entropy_status = if sig.is_high_entropy { "HIGH" } else { "NORMAL" };
@@ -783,7 +786,7 @@ impl AnalysisReport {
                             "name": sig.name,
                             "path": sig.path,
                             "parent": sig.parent_name,
-                            "ppid": sig.ppid,  // ⭐ PPID included for forensics!
+                   //         "ppid": sig.ppid,  // ⭐ PPID included for forensics!
                             "uid": sig.uid,
                             "count": count,
                             "is_high_entropy": sig.is_high_entropy,
@@ -800,7 +803,7 @@ impl AnalysisReport {
                         serde_json::json!({
                             "name": sig.name,
                             "parent": sig.parent_name,
-                            "ppid": sig.ppid,  // ⭐ PPID for complete process tree
+                //            "ppid": sig.ppid,  // ⭐ PPID for complete process tree
                             "uid": sig.uid,
                             "path": sig.path,
                             "count": count,
@@ -862,8 +865,121 @@ impl AnalysisReport {
 }
 
 // --- CORE ANALYSIS LOGIC ---
-
 pub fn analyze_fleet(profiles: &[MachineProfile], config: &DetectionConfig) -> Result<AnalysisReport, Box<dyn Error>> {
+    if profiles.is_empty() {
+        return Ok(AnalysisReport {
+            anomalies: vec![], cluster_stats: HashMap::new(), total_analyzed: 0, config_used: config.clone(),
+        });
+    }
+
+    // 1. Feature Extraction
+    let mut unique_features: HashSet<&ProcessSignature> = HashSet::new();
+    for p in profiles {
+        for key in p.counts.keys() { unique_features.insert(key); }
+    }
+    
+    let mut feature_list: Vec<&ProcessSignature> = unique_features.into_iter().collect();
+    let n_samples = profiles.len();
+    let n_features = feature_list.len();
+
+    // 2. Build Matrix
+    let mut data = Array2::<f64>::zeros((n_samples, n_features));
+    for (row_idx, profile) in profiles.iter().enumerate() {
+        if profile.total_logs == 0 { continue; }
+        for (col_idx, feature) in feature_list.iter().enumerate() {
+            if let Some(&count) = profile.counts.get(feature) {
+                let tf = count as f64 / profile.total_logs as f64;
+                let doc_count = profiles.iter().filter(|p| p.counts.contains_key(feature)).count();
+                // Standard IDF
+                let idf = ((n_samples as f64) / (doc_count as f64 + 1.0)).ln() + 1.0;
+                data[[row_idx, col_idx]] = tf * idf;
+            }
+        }
+    }
+
+    // 3. Normalize
+    if config.normalize_features {
+        for mut row in data.rows_mut() {
+            let norm = row.mapv(|x| x * x).sum().sqrt();
+            if norm > 0.0 { row.mapv_inplace(|x| x / norm); }
+        }
+    }
+
+    // 4. DBSCAN
+    let clusters = Dbscan::params(config.dbscan_min_samples)
+        .tolerance(config.dbscan_tolerance)
+        .transform(&data)?;
+
+    let mut cluster_counts: HashMap<Option<usize>, usize> = HashMap::new();
+    for cluster_id in clusters.iter() {
+        *cluster_counts.entry(*cluster_id).or_insert(0) += 1;
+    }
+
+    let largest_cluster = cluster_counts.iter()
+        .filter(|(k, _)| k.is_some())
+        .max_by_key(|(_, v)| *v)
+        .map(|(k, _)| k.unwrap());
+
+    let mut anomalies = Vec::new();
+    
+    for (i, cluster_id) in clusters.iter().enumerate() {
+        let profile = &profiles[i];
+        let mut suspicious_count = 0;
+        let mut anomalous_features = Vec::new();
+        let mut has_genuine_risk = false;
+
+        for (sig, count) in &profile.counts {
+            // RISK CHECK: Is this process dangerous?
+            let is_common_root = config.common_root_processes.iter().any(|p| sig.name.contains(p));
+            let is_behavioral_risk = sig.is_high_entropy || sig.is_suspicious_path;
+            let is_unexpected_root = sig.uid == 0 && !is_common_root; // "exploit" (UID 0) != "sshd" -> True
+            
+            if is_behavioral_risk || is_unexpected_root {
+                suspicious_count += *count;
+                has_genuine_risk = true; 
+                anomalous_features.push(format!("RISK DETECTED: {} (root/path/entropy)", sig.name));
+            }
+            
+            // Still check for statistical rarity
+            let doc_count = profiles.iter().filter(|p| p.counts.contains_key(sig)).count();
+            if doc_count == 1 && !is_common_root { 
+                anomalous_features.push(format!("Rare process: {}", sig.name));
+            }
+        }
+
+        // --- NEW DETECTION LOGIC ---
+        let is_noise = cluster_id.is_none();
+        let is_minority = cluster_id.is_some() && cluster_id.unwrap() != largest_cluster.unwrap_or(999);
+        
+        // FIX: Flag if (Statistical Outlier) OR (Behavioral Risk)
+        if is_noise || is_minority || has_genuine_risk {
+            // Determine severity based on WHY it was flagged
+            let severity = if has_genuine_risk {
+                // If it has rootkits/exploits, it's Critical/High regardless of clustering
+                if suspicious_count > 5 { AnomalyLevel::Critical } else { AnomalyLevel::High }
+            } else {
+                // If just a statistical outlier (Noise), it's Medium
+                AnomalyLevel::Medium 
+            };
+
+            anomalies.push(AnomalyDetails {
+                machine_id: profile.id.clone(),
+                severity,
+                distance_score: if is_noise { 1.5 } else { 0.8 }, // Manual score override
+                cluster_assignment: *cluster_id,
+                anomalous_features, // Now includes "RISK DETECTED" tags
+                process_count: profile.total_logs,
+                suspicious_process_count: suspicious_count,
+            });
+        }
+    }
+
+    Ok(AnalysisReport {
+        anomalies, cluster_stats: cluster_counts, total_analyzed: n_samples, config_used: config.clone(),
+    })
+}
+
+pub fn analyze_fleet2(profiles: &[MachineProfile], config: &DetectionConfig) -> Result<AnalysisReport, Box<dyn Error>> {
     if profiles.is_empty() {
         return Ok(AnalysisReport {
             anomalies: vec![],
@@ -1870,7 +1986,7 @@ pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Ve
                 let sig = ProcessSignature {
                     name: entry.name.clone(),
                     parent_name,
-                    ppid: entry.ppid,  // ⭐ PRESERVE PPID!
+           //         ppid: entry.ppid,  // ⭐ PRESERVE PPID!
                     uid: entry.uid,
                     path: entry.path.clone(),
                     is_high_entropy,

@@ -1,7 +1,7 @@
 {
   "entropy_threshold": 4.5,
   "minority_cluster_ratio": 0.1,
-  "dbscan_tolerance": 0.05,
+  "dbscan_tolerance": 0.35,
   "dbscan_min_samples": 2,
   "normalize_features": true,
   "suspicious_path_patterns": [
@@ -9,8 +9,7 @@
     "/dev/shm/",
     "/var/tmp/",
     "/home/[^/]+/\\.[^/]+",
-    "^\\.\\/",
-    "/opt/.hidden/"
+    "^\\.\\/"
   ],
   "exclude_kernel_threads": true,
   "common_root_processes": [
@@ -41,7 +40,7 @@
   ],
   "flag_unexpected_root": true,
   "debug_ppid_resolution": false,
-  "exclude_init_children": true,
+  "exclude_init_children": false,
   "whitelisted_path_patterns": [
     "/opt/conda/*",
     "/usr/local/bin/*",
