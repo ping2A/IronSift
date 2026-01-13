@@ -1,50 +1,10 @@
-# IronSift v0.3.0 🔍🛡️
+# IronSift 🔍🛡️
 
 > **"Where's Waldo?" for Cybersecurity** — Fleet-wide anomaly detection powered by unsupervised machine learning.
 
-**Latest Release: v0.3.0** - Enhanced Output, Command Parsing, JSON Support
-
 Created with [Claude.ai](https://claude.ai) but supervised by a human (me apparently).
 
-IronSift is a high-performance Rust-based cybersecurity tool that analyzes massive process logs to identify compromised machines in server fleets. Using DBSCAN clustering and TF-IDF feature engineering, it detects threats without requiring known attack signatures.
-
----
-
-## 🎉 What's New in v0.3.0
-
-### 🆕 Major New Features
-
-#### 1. Enhanced Detailed Console Output
-Rich, actionable console reporting with no JSON export needed for triage:
-- **Detailed per-machine breakdowns** - Top 3 suspicious processes with full forensics
-- **Risk factors explained** - Specific threat indicators (high entropy, suspicious paths, root execution)
-- **Attack pattern categorization** - Automatic classification (cryptomining, web shells, privilege escalation)
-- **Time range analysis** - Activity periods for correlation
-- **Configuration summary** - Detection parameters at a glance
-- **Actionable recommendations** - Step-by-step incident response guidance
-
-#### 2. Automatic Command Line Parsing
-Parse full command strings automatically - no manual splitting required:
-- **Full paths:** `/usr/bin/nginx -c /etc/nginx.conf` → auto-extracts name, path, args
-- **⭐ Bare commands:** `ls /etc/`, `grep error app.log` → works perfectly!
-- **Complex arguments:** Handles quotes, special characters, whitespace
-- **Lightning fast:** <1μs per command
-
-#### 3. Native JSON Log Parsing
-Direct support for modern log formats - Docker, Kubernetes, CloudWatch, Elasticsearch:
-- **Single entry:** `builder.add_json(json_string)`
-- **Batch processing:** JSON arrays and NDJSON
-- **Flexible key names:** Recognizes host/hostname/node/container/pod and 20+ variations
-- **Fault-tolerant:** Continues on errors with warnings
-- **Fast:** <20μs per entry
-
-### 🔄 Enhanced from v0.2.0
-- **Three Flexible APIs** - No PIDs required (Simple, Builder, Direct)
-- **Automatic PID/PPID Resolution** - Parent processes resolved automatically
-- **Organized Structure** - CLI separated from library code
-- **Comprehensive Documentation** - 15+ guide files
-
----
+IronSift is a high-performance Rust-based cybersecurity tool that analyzes massive process logs to identify compromised machines in server fleets. Using DBSCAN clustering and TF-IDF feature engineering, it detects threats without requiring known attack signatures.s
 
 ## 🎯 Quick Start (3 Ways)
 

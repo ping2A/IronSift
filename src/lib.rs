@@ -144,6 +144,7 @@ pub struct ProcessEntry {
     pub machine_id: String,
     pub name: String,
     pub parent_name: Option<String>,  // Optional - if None, will try to infer
+    pub ppid: Option<u32>,  // ⭐ PPID - preserved when provided
     pub uid: u32,
     pub path: String,
     pub args: String,
@@ -152,10 +153,12 @@ pub struct ProcessEntry {
 
 impl ProcessEntry {
     pub fn new(machine_id: String, name: String) -> Self {
+        println!("🔧 Creating ProcessEntry: machine={}, name={}", machine_id, name);
         Self {
             machine_id,
             name,
             parent_name: None,
+            ppid: None,  // ⭐ Initialize PPID as None
             uid: 1000,
             path: String::new(),
             args: String::new(),
@@ -185,10 +188,13 @@ impl ProcessEntry {
     pub fn from_command_line(machine_id: String, command: &str, parent: Option<&str>) -> Self {
         let (name, path, args) = crate::parse_command_line(command);
         
+        println!("🔧 Creating ProcessEntry from command: machine={}, command={}", machine_id, command);
+        
         Self {
             machine_id,
             name,
             parent_name: parent.map(|p| p.to_string()),
+            ppid: None,  // ⭐ Initialize PPID as None
             uid: 1000,
             path,
             args,
@@ -197,26 +203,47 @@ impl ProcessEntry {
     }
     
     pub fn parent(mut self, parent: &str) -> Self {
+        println!("  ├─ Setting parent: {}", parent);
         self.parent_name = Some(parent.to_string());
         self
     }
     
+    /// Set PPID - this value will be preserved
+    pub fn ppid(mut self, ppid: u32) -> Self {
+        println!("  ├─ Setting PPID: {} ⭐", ppid);
+        self.ppid = Some(ppid);
+        self
+    }
+    
     pub fn uid(mut self, uid: u32) -> Self {
+        println!("  ├─ Setting UID: {}", uid);
         self.uid = uid;
         self
     }
     
     pub fn path(mut self, path: &str) -> Self {
+        if !path.is_empty() {
+            println!("  ├─ Setting path: {}", path);
+        }
         self.path = path.to_string();
         self
     }
     
     pub fn args(mut self, args: &str) -> Self {
+        if !args.is_empty() {
+            let display = if args.len() > 50 { 
+                format!("{}...", &args[..50]) 
+            } else { 
+                args.to_string() 
+            };
+            println!("  ├─ Setting args: {}", display);
+        }
         self.args = args.to_string();
         self
     }
     
     pub fn timestamp(mut self, timestamp: String) -> Self {
+        println!("  └─ Setting timestamp: {}", timestamp);
         self.timestamp = Some(timestamp);
         self
     }
@@ -226,6 +253,7 @@ impl ProcessEntry {
 pub struct ProcessSignature {
     pub name: String,
     pub parent_name: String,
+    pub ppid: u32,  // ⭐ PPID preserved for forensics
     pub uid: u32,
     pub path: String,
     pub is_high_entropy: bool,
@@ -608,7 +636,14 @@ impl AnalysisReport {
         for (sig, count) in &suspicious[..display_count] {
             println!("     │");
             println!("     │  📛 {} (count: {})", sig.name, count);
-            println!("     │     Parent: {}", sig.parent_name);
+            
+            // ⭐ Show PPID alongside parent name
+            if sig.ppid > 0 {
+                println!("     │     Parent: {} (PPID: {})", sig.parent_name, sig.ppid);
+            } else {
+                println!("     │     Parent: {}", sig.parent_name);
+            }
+            
             println!("     │     Path: {}", sig.path);
             if sig.uid == 0 {
                 println!("     │     UID: {} (root) ⚠️", sig.uid);
@@ -724,9 +759,14 @@ impl AnalysisReport {
         }
     }
     
-    #[deprecated(since = "2.0.0", note = "Use print_detailed() instead")]
-    
-    /// Export detailed forensic report as JSON
+    /// Export detailed forensic report as JSON with complete PPID information
+    /// 
+    /// This method exports a comprehensive forensic report including:
+    /// - Machine anomalies with severity scores
+    /// - Suspicious processes with PPID, entropy, and risk factors
+    /// - Complete process details for incident response
+    /// - Timeline information (first/last seen)
+    /// - Cluster distribution
     pub fn export_json(&self, profiles: &[MachineProfile], path: &str) -> Result<(), Box<dyn Error>> {
         let mut investigation_data = Vec::new();
         
@@ -736,13 +776,36 @@ impl AnalysisReport {
                 let suspicious_procs: Vec<_> = profile.counts.iter()
                     .filter(|(sig, _)| sig.is_high_entropy || sig.is_suspicious_path || sig.uid == 0)
                     .map(|(sig, count)| {
+                        // Calculate entropy for args display
+                        let entropy_status = if sig.is_high_entropy { "HIGH" } else { "NORMAL" };
+                        
                         serde_json::json!({
                             "name": sig.name,
                             "path": sig.path,
                             "parent": sig.parent_name,
+                            "ppid": sig.ppid,  // ⭐ PPID included for forensics!
                             "uid": sig.uid,
                             "count": count,
+                            "is_high_entropy": sig.is_high_entropy,
+                            "entropy_status": entropy_status,
+                            "is_suspicious_path": sig.is_suspicious_path,
                             "risk_factors": sig.risk_factors(&self.config_used),
+                        })
+                    })
+                    .collect();
+                
+                // ⭐ Export ALL processes for complete forensics (not just suspicious)
+                let all_procs: Vec<_> = profile.counts.iter()
+                    .map(|(sig, count)| {
+                        serde_json::json!({
+                            "name": sig.name,
+                            "parent": sig.parent_name,
+                            "ppid": sig.ppid,  // ⭐ PPID for complete process tree
+                            "uid": sig.uid,
+                            "path": sig.path,
+                            "count": count,
+                            "is_high_entropy": sig.is_high_entropy,
+                            "is_suspicious_path": sig.is_suspicious_path,
                         })
                     })
                     .collect();
@@ -759,6 +822,7 @@ impl AnalysisReport {
                     "total_processes": profile.total_logs,
                     "unique_processes": profile.counts.len(),
                     "suspicious_processes": suspicious_procs,
+                    "all_processes": all_procs,  // ⭐ Complete process list with PPID
                     "anomalous_features": &anomaly.anomalous_features,
                     "time_range": {
                         "first_seen": profile.first_seen,
@@ -1421,6 +1485,7 @@ pub struct ProcessBuilder {
 
 impl ProcessBuilder {
     pub fn new() -> Self {
+        println!("\n📦 Initializing ProcessBuilder");
         Self {
             entries: Vec::new(),
         }
@@ -1428,16 +1493,20 @@ impl ProcessBuilder {
     
     /// Add a process entry without needing PIDs
     pub fn add(&mut self, entry: ProcessEntry) -> &mut Self {
+        println!("\n➕ Adding ProcessEntry: machine={}, name={}, ppid={:?}", 
+            entry.machine_id, entry.name, entry.ppid);
         self.entries.push(entry);
         self
     }
     
     /// Add a simple process with just name and parent
     pub fn add_process(&mut self, machine_id: &str, name: &str, parent: &str) -> &mut Self {
+        println!("\n➕ Adding simple process: machine={}, name={}, parent={}", machine_id, name, parent);
         self.entries.push(ProcessEntry {
             machine_id: machine_id.to_string(),
             name: name.to_string(),
             parent_name: Some(parent.to_string()),
+            ppid: None,  // ⭐ Initialize ppid as None
             uid: 1000,
             path: format!("/usr/bin/{}", name),
             args: String::new(),
@@ -1498,6 +1567,11 @@ impl ProcessBuilder {
     pub fn add_json(&mut self, json: &str) -> &mut Self {
         match crate::parse_json_log(json) {
             Ok(raw_entry) => {
+                println!("\n➕ Processing JSON entry for machine: {}", raw_entry.machine_id);
+                if raw_entry.ppid > 0 {
+                    println!("  ├─ ⭐ PPID found in JSON: {}", raw_entry.ppid);
+                }
+                
                 let (name, path, args) = if raw_entry.name.is_empty() {
                     // Parse from command if name is empty
                     let cmd = format!("{} {}", raw_entry.path, raw_entry.args).trim().to_string();
@@ -1510,16 +1584,19 @@ impl ProcessBuilder {
                     machine_id: raw_entry.machine_id,
                     name,
                     parent_name: None, // Will be resolved from PPID later
+                    ppid: if raw_entry.ppid > 0 { Some(raw_entry.ppid) } else { None },  // ⭐ PRESERVE PPID!
                     uid: raw_entry.uid,
                     path,
                     args,
                     timestamp: raw_entry.timestamp,
                 };
                 
+                println!("  └─ Created ProcessEntry: name={}, ppid={:?}", entry.name, entry.ppid);
+                
                 self.entries.push(entry);
             }
             Err(e) => {
-                eprintln!("Warning: Failed to parse JSON: {}", e);
+                eprintln!("⚠️  Warning: Failed to parse JSON: {}", e);
             }
         }
         self
@@ -1561,6 +1638,7 @@ impl ProcessBuilder {
                         machine_id: raw_entry.machine_id,
                         name,
                         parent_name: None,
+                        ppid: if raw_entry.ppid > 0 { Some(raw_entry.ppid) } else { None },  // ⭐ PRESERVE PPID!
                         uid: raw_entry.uid,
                         path,
                         args,
@@ -1616,8 +1694,12 @@ impl ProcessBuilder {
             for entry in entries {
                 let pid = *name_to_pid.get(&entry.name).unwrap();
                 
-                // Resolve PPID from parent name
-                let ppid = if let Some(parent_name) = &entry.parent_name {
+                // ⭐ Use PPID from ProcessEntry if provided, otherwise resolve from parent name
+                let ppid = if let Some(provided_ppid) = entry.ppid {
+                    // PPID was explicitly provided - preserve it!
+                    provided_ppid
+                } else if let Some(parent_name) = &entry.parent_name {
+                    // Resolve PPID from parent name
                     *name_to_pid.get(parent_name).unwrap_or(&0)
                 } else {
                     // If no parent specified, assume systemd (PID 1) or init
@@ -1640,6 +1722,8 @@ impl ProcessBuilder {
                 });
             }
         }
+        
+        println!("\n✅ ProcessBuilder built: {} total entries", raw_entries.len());
         
         raw_entries
     }
@@ -1668,10 +1752,18 @@ pub fn resolve_parent_names(entries: &[RawLogEntry]) -> HashMap<(String, u32), S
 
 /// Build machine profiles from raw log entries with automatic parent resolution
 pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Vec<MachineProfile> {
+    println!("\n🔨 Building profiles from {} raw entries", entries.len());
+    
     // Debug: Show PPID resolution statistics if enabled
     if config.debug_ppid_resolution {
         println!("🔍 PPID Resolution Debug Info:");
         println!("   Total entries to process: {}", entries.len());
+        
+        // Show some sample entries with PPIDs
+        println!("   Sample entries with PPIDs:");
+        for entry in entries.iter().take(5) {
+            println!("     {}:{} (PPID: {})", entry.machine_id, entry.name, entry.ppid);
+        }
     }
     
     // Resolve parent names
@@ -1742,7 +1834,7 @@ pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Ve
     }
     
     // Build profiles in parallel
-    machine_entries.par_iter()
+    let profiles: Vec<MachineProfile> = machine_entries.par_iter()
         .map(|(machine_id, logs)| {
             let mut profile = MachineProfile::new(machine_id);
             
@@ -1778,6 +1870,7 @@ pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Ve
                 let sig = ProcessSignature {
                     name: entry.name.clone(),
                     parent_name,
+                    ppid: entry.ppid,  // ⭐ PRESERVE PPID!
                     uid: entry.uid,
                     path: entry.path.clone(),
                     is_high_entropy,
@@ -1789,7 +1882,14 @@ pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Ve
             
             profile
         })
-        .collect()
+        .collect();
+    
+    println!("\n✅ Built {} machine profiles", profiles.len());
+    if config.debug_ppid_resolution {
+        println!("   Profiles ready for analysis");
+    }
+    
+    profiles
 }
 
 /// Check if a process name indicates a Linux kernel thread

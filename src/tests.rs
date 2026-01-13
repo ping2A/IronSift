@@ -1021,6 +1021,7 @@ fn test_process_risk_factors() {
     let sig = ProcessSignature {
         name: "malware".to_string(),
         parent_name: "bash".to_string(),
+        ppid: 100,  // Add ppid field
         uid: 0,
         path: "/tmp/hidden".to_string(),
         is_high_entropy: true,
@@ -1459,6 +1460,7 @@ fn test_privilege_escalation_detection() {
         let sig = ProcessSignature {
             name: name.to_string(),
             parent_name: "systemd".to_string(),
+            ppid: 1,  // Add ppid field
             uid: 0,
             path: path.to_string(),
             is_high_entropy: false,
@@ -1480,6 +1482,7 @@ fn test_privilege_escalation_detection() {
         let sig = ProcessSignature {
             name: name.to_string(),
             parent_name: "init".to_string(),
+            ppid: 0,  // Add ppid field
             uid: 0,
             path: format!("/usr/sbin/{}", name),
             is_high_entropy: false,
@@ -2533,4 +2536,284 @@ fn test_severity_in_detection() {
     );
     
     println!("\n✅ Severity in detection test passed!");
+}
+// ============================================================================
+// PPID PRESERVATION TESTS ⭐
+// ============================================================================
+
+#[test]
+fn test_ppid_preservation_in_json() {
+    println!("\n🧪 Testing PPID preservation in JSON parsing");
+    
+    let mut builder = ProcessBuilder::new();
+    let json = r#"{
+        "machine_id": "server1",
+        "pid": 100,
+        "ppid": 1,
+        "name": "worker",
+        "uid": 1000,
+        "path": "/usr/bin/worker",
+        "args": "",
+        "timestamp": "2024-01-01T10:00:00Z"
+    }"#;
+    
+    builder.add_json(json);
+    let raw_entries = builder.build();
+    
+    assert_eq!(raw_entries.len(), 1);
+    assert_eq!(raw_entries[0].ppid, 1, "PPID must be preserved from JSON!");
+    assert_eq!(raw_entries[0].name, "worker");
+    
+    println!("✅ PPID preservation test passed!");
+}
+
+#[test]
+fn test_ppid_key_variations() {
+    println!("\n🧪 Testing PPID extraction from various JSON key names");
+    
+    let variations = vec![
+        (r#"{"machine_id": "s1", "name": "test", "ppid": 10, "uid": 1000, "path": "/test", "args": ""}"#, 10),
+        (r#"{"machine_id": "s2", "name": "test", "parent_pid": 20, "uid": 1000, "path": "/test", "args": ""}"#, 20),
+    ];
+    
+    for (json, expected_ppid) in variations {
+        let mut builder = ProcessBuilder::new();
+        builder.add_json(json);
+        let raw_entries = builder.build();
+        
+        assert_eq!(raw_entries.len(), 1);
+        assert_eq!(raw_entries[0].ppid, expected_ppid, 
+            "PPID {} not extracted correctly from: {}", expected_ppid, json);
+        println!("  ✓ Extracted PPID: {}", expected_ppid);
+    }
+    
+    println!("✅ All PPID key variations test passed!");
+}
+
+#[test]
+fn test_ppid_in_process_signature() {
+    println!("\n🧪 Testing PPID preservation in ProcessSignature");
+    
+    let config = DetectionConfig::default();
+    
+    let entries = vec![
+        RawLogEntry {
+            machine_id: "server1".to_string(),
+            pid: 1,
+            ppid: 0,
+            name: "systemd".to_string(),
+            uid: 0,
+            path: "/usr/lib/systemd/systemd".to_string(),
+            args: "--system".to_string(),
+            timestamp: None,
+        },
+        RawLogEntry {
+            machine_id: "server1".to_string(),
+            pid: 100,
+            ppid: 1,  // Parent is systemd (PID 1)
+            name: "nginx".to_string(),
+            uid: 0,
+            path: "/usr/bin/nginx".to_string(),
+            args: "-c /etc/nginx.conf".to_string(),
+            timestamp: None,
+        },
+    ];
+    
+    let profiles = build_profiles(entries, &config);
+    
+    assert_eq!(profiles.len(), 1);
+    let profile = &profiles[0];
+    
+    // Find nginx signature
+    let nginx_sig = profile.counts.keys()
+        .find(|sig| sig.name == "nginx")
+        .expect("nginx signature should exist");
+    
+    // ⭐ Verify PPID is preserved in signature
+    assert_eq!(nginx_sig.ppid, 1, "PPID must be preserved in ProcessSignature!");
+    assert_eq!(nginx_sig.parent_name, "systemd");
+    
+    println!("✅ PPID in ProcessSignature test passed!");
+}
+
+#[test]
+fn test_ppid_through_full_pipeline() {
+    println!("\n🧪 Testing PPID preservation through full pipeline");
+    
+    let config = DetectionConfig::default();
+    let mut builder = ProcessBuilder::new();
+    
+    // Add processes with explicit PPIDs
+    builder.add_json(r#"{"machine_id": "server1", "pid": 1, "ppid": 0, "name": "systemd", "uid": 0, "path": "/systemd", "args": ""}"#);
+    builder.add_json(r#"{"machine_id": "server1", "pid": 100, "ppid": 1, "name": "nginx", "uid": 0, "path": "/nginx", "args": ""}"#);
+    builder.add_json(r#"{"machine_id": "server1", "pid": 200, "ppid": 100, "name": "worker", "uid": 33, "path": "/worker", "args": ""}"#);
+    
+    let raw_entries = builder.build();
+    
+    // Verify PPID preservation in raw entries
+    assert_eq!(raw_entries[0].ppid, 0);
+    assert_eq!(raw_entries[1].ppid, 1);
+    assert_eq!(raw_entries[2].ppid, 100);
+    println!("  ✓ PPIDs preserved in RawLogEntry");
+    
+    // Build profiles
+    let profiles = build_profiles(raw_entries, &config);
+    assert_eq!(profiles.len(), 1);
+    
+    // Verify PPIDs in signatures
+    let profile = &profiles[0];
+    for (sig, _) in &profile.counts {
+        println!("  ✓ {} has PPID: {}", sig.name, sig.ppid);
+        
+        if sig.name == "systemd" {
+            assert_eq!(sig.ppid, 0);
+        } else if sig.name == "nginx" {
+            assert_eq!(sig.ppid, 1);
+        } else if sig.name == "worker" {
+            assert_eq!(sig.ppid, 100);
+        }
+    }
+    
+    println!("✅ Full pipeline PPID test passed!");
+}
+
+#[test]
+fn test_ppid_with_builder_api() {
+    println!("\n🧪 Testing PPID with ProcessBuilder fluent API");
+    
+    let config = DetectionConfig::default();
+    let mut builder = ProcessBuilder::new();
+    
+    // Use fluent API with explicit PPID
+    builder.add(
+        ProcessEntry::new("server1".to_string(), "worker".to_string())
+            .ppid(100)
+            .parent("nginx")
+            .uid(33)
+            .path("/usr/bin/worker")
+            .args("-c config")
+    );
+    
+    let raw_entries = builder.build();
+    assert_eq!(raw_entries.len(), 1);
+    assert_eq!(raw_entries[0].ppid, 100, "PPID from fluent API not preserved!");
+    
+    let profiles = build_profiles(raw_entries, &config);
+    let profile = &profiles[0];
+    
+    let worker_sig = profile.counts.keys()
+        .find(|sig| sig.name == "worker")
+        .expect("worker signature should exist");
+    
+    assert_eq!(worker_sig.ppid, 100);
+    
+    println!("✅ Builder API PPID test passed!");
+}
+
+#[test]
+fn test_ppid_debug_output() {
+    println!("\n🧪 Testing PPID debug output");
+    
+    let mut config = DetectionConfig::default();
+    config.debug_ppid_resolution = true;
+    
+    let entries = vec![
+        RawLogEntry {
+            machine_id: "server1".to_string(),
+            pid: 1,
+            ppid: 0,
+            name: "systemd".to_string(),
+            uid: 0,
+            path: "/systemd".to_string(),
+            args: "".to_string(),
+            timestamp: None,
+        },
+    ];
+    
+    // This should print debug info
+    let profiles = build_profiles(entries, &config);
+    assert_eq!(profiles.len(), 1);
+    
+    println!("✅ Debug output test passed (check console for debug logs)!");
+}
+
+#[test]
+fn test_process_builder_ppid_preservation_from_json() {
+    println!("\n🧪 Testing ProcessBuilder PPID preservation from JSON");
+    
+    let config = DetectionConfig::default();
+    let mut builder = ProcessBuilder::new();
+    
+    // Add JSON with various PPID values
+    builder.add_json(r#"{
+        "machine_id": "server1",
+        "pid": 100,
+        "ppid": 1,
+        "name": "nginx",
+        "uid": 0,
+        "path": "/usr/bin/nginx",
+        "args": "-c /etc/nginx.conf"
+    }"#);
+    
+    builder.add_json(r#"{
+        "machine_id": "server1",
+        "pid": 200,
+        "ppid": 100,
+        "name": "worker",
+        "uid": 33,
+        "path": "/usr/bin/nginx",
+        "args": "worker process"
+    }"#);
+    
+    let raw_entries = builder.build();
+    
+    // Verify PPIDs are preserved
+    assert_eq!(raw_entries.len(), 2);
+    assert_eq!(raw_entries[0].ppid, 1, "nginx PPID not preserved!");
+    assert_eq!(raw_entries[1].ppid, 100, "worker PPID not preserved!");
+    
+    // Build profiles and verify PPID in signatures
+    let profiles = build_profiles(raw_entries, &config);
+    assert_eq!(profiles.len(), 1);
+    
+    for (sig, _) in &profiles[0].counts {
+        if sig.name == "nginx" {
+            assert_eq!(sig.ppid, 1, "nginx PPID not in signature!");
+        } else if sig.name == "worker" {
+            assert_eq!(sig.ppid, 100, "worker PPID not in signature!");
+        }
+    }
+    
+    println!("✅ ProcessBuilder JSON PPID preservation test passed!");
+}
+
+#[test]
+fn test_ppid_zero_handling() {
+    println!("\n🧪 Testing PPID=0 handling (init/systemd)");
+    
+    let config = DetectionConfig::default();
+    
+    let entries = vec![
+        RawLogEntry {
+            machine_id: "server1".to_string(),
+            pid: 1,
+            ppid: 0,  // No parent (init)
+            name: "systemd".to_string(),
+            uid: 0,
+            path: "/usr/lib/systemd/systemd".to_string(),
+            args: "--system".to_string(),
+            timestamp: None,
+        },
+    ];
+    
+    let profiles = build_profiles(entries, &config);
+    assert_eq!(profiles.len(), 1);
+    
+    let systemd_sig = profiles[0].counts.keys()
+        .find(|sig| sig.name == "systemd")
+        .expect("systemd signature should exist");
+    
+    assert_eq!(systemd_sig.ppid, 0, "PPID=0 must be preserved!");
+    
+    println!("✅ PPID=0 handling test passed!");
 }

@@ -176,15 +176,35 @@ fn generate_log_entries() -> Result<Vec<RawLogEntry>, Box<dyn Error>> {
             timestamp: Some(current_time.to_rfc3339()),
         });
 
-        for log_idx in 0..LOGS_PER_MACHINE {
+        // ⭐ FIX: Use sequential PID counter per machine to avoid collisions
+        let mut next_pid = 100u32;  // Start from PID 100
+        
+        // Track specific parent PIDs for attack scenarios
+        let mut apache2_pid: Option<u32> = None;
+        let mut node_pid: Option<u32> = None;
+        let mut sshd_pid: Option<u32> = None;
+        
+        for _log_idx in 0..LOGS_PER_MACHINE {
             current_time = current_time + Duration::seconds(rng.gen_range(60..300));
             let timestamp = current_time.to_rfc3339();
             
             let template = normal_processes[rng.gen_range(0..normal_processes.len())];
-            let (mut name, base_pid, mut path, args_ref, mut uid) = template;
+            let (mut name, _base_pid, mut path, args_ref, mut uid) = template;
             let mut args = args_ref.to_string();
-            let pid = base_pid + log_idx;
+            let pid = next_pid;  // ⭐ Use sequential PID
+            next_pid += 1;       // ⭐ Increment for next process
             let mut ppid = 1;
+            
+            // Track parent processes for later reference
+            if name == "apache2" && apache2_pid.is_none() {
+                apache2_pid = Some(pid);
+            }
+            if name == "node" && node_pid.is_none() {
+                node_pid = Some(pid);
+            }
+            if name == "sshd" && sshd_pid.is_none() {
+                sshd_pid = Some(pid);
+            }
 
             // Inject attack scenarios
             
@@ -204,7 +224,7 @@ fn generate_log_entries() -> Result<Vec<RawLogEntry>, Box<dyn Error>> {
                 if rng.gen_bool(0.60) {
                     name = "php-fpm";
                     path = "/usr/sbin/php-fpm";
-                    ppid = 108; // apache2 parent
+                    ppid = apache2_pid.unwrap_or(1); // ⭐ Use tracked apache2 PID or fallback to systemd
                     
                     // 50% of php-fpm processes get malicious payloads
                     if rng.gen_bool(0.50) {
@@ -222,7 +242,7 @@ fn generate_log_entries() -> Result<Vec<RawLogEntry>, Box<dyn Error>> {
                 path = privesc.1;
                 args = privesc.2.to_string();
                 uid = privesc.3;
-                ppid = 103;
+                ppid = node_pid.unwrap_or(1); // ⭐ Use tracked node PID or fallback to systemd
             }
 
             // Lateral Movement (Machine 12) - SSH to internal IPs
@@ -233,7 +253,7 @@ fn generate_log_entries() -> Result<Vec<RawLogEntry>, Box<dyn Error>> {
                 path = lateral.1;
                 args = lateral.2.to_string();
                 uid = lateral.3;
-                ppid = 101;
+                ppid = sshd_pid.unwrap_or(1); // ⭐ Use tracked sshd PID or fallback to systemd
             }
 
             if rng.gen_bool(0.05) {
@@ -355,17 +375,50 @@ fn print_detection_instructions(output_file: &str) {
     println!();
     println!("📊 EXPECTED RESULTS:");
     println!("   With --tolerance 0.05, you should detect:");
-    println!("   ⚠️  machine_003 (cryptominer in /tmp)");
-    println!("   ⚠️  machine_006 (privilege escalation - node as root)");
-    println!("   ⚠️  machine_009 (web shell - php-fpm dynamic execution) 🔴");
-    println!("   ⚠️  machine_012 (lateral movement - SSH activity)");
-    println!("   ⚠️  machine_015 (privilege escalation - python3 in /tmp)");
-    println!("   ⚠️  machine_017 (cryptominer in /dev/shm)");
+    println!();
+    println!("   ⚠️  machine_003 (CRYPTOMINER)");
+    println!("       • Process: kworker, systemd, [kthreadd] (fake kernel names)");
+    println!("       • Path: /tmp/.X11-unix/kworker, /var/tmp/.cache/systemd");
+    println!("       • Args: High entropy mining pool configs");
+    println!("       • Risk: UID 0 (root), suspicious paths, high entropy");
+    println!();
+    println!("   ⚠️  machine_006 (PRIVILEGE ESCALATION)");
+    println!("       • Process: node, python3, bash");
+    println!("       • Path: /home/appuser/.npm/node, /tmp/setup.py");
+    println!("       • Risk: Unexpected processes running as root (UID 0)");
+    println!("       • Parent: node (PPID tracked)");
+    println!();
+    println!("   ⚠️  machine_009 (WEB SHELL) 🔴");
+    println!("       • Process: php-fpm (child of apache2)");
+    println!("       • Path: /usr/sbin/php-fpm");
+    println!("       • Args: Dynamic code execution patterns");
+    println!("       • Risk: High entropy payloads, runtime code execution");
+    println!("       • Parent: apache2 (PPID tracked)");
+    println!();
+    println!("   ⚠️  machine_012 (LATERAL MOVEMENT)");
+    println!("       • Process: ssh, scp");
+    println!("       • Path: /usr/bin/ssh, /usr/bin/scp");
+    println!("       • Args: Connections to internal IPs (10.0.x.x, 192.168.x.x)");
+    println!("       • Risk: High frequency SSH to internal network");
+    println!("       • Parent: sshd (PPID tracked)");
+    println!();
+    println!("   ⚠️  machine_015 (PRIVILEGE ESCALATION)");
+    println!("       • Process: node, python3, bash");
+    println!("       • Path: /home/appuser/.npm/node, /tmp/setup.py");
+    println!("       • Risk: Unexpected processes running as root (UID 0)");
+    println!("       • Parent: node (PPID tracked)");
+    println!();
+    println!("   ⚠️  machine_017 (CRYPTOMINER)");
+    println!("       • Process: kworker, systemd, [kthreadd] (fake kernel names)");
+    println!("       • Path: /dev/shm/.config/worker, /tmp/.X11-unix/kworker");
+    println!("       • Args: High entropy mining pool configs");
+    println!("       • Risk: UID 0 (root), suspicious paths, high entropy");
     println!();
     println!("💡 TIPS:");
     println!("   • Start with default, then lower tolerance if needed");
     println!("   • Check 'Attack Pattern Categorization' in output");
     println!("   • Export JSON for detailed forensic analysis");
+    println!("   • All malicious processes have PPID correctly tracked");
     println!("   • Edit ironsift_config.json to customize detection");
     println!();
 }
