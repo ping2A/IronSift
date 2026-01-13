@@ -94,12 +94,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("{:=^60}", " IRONSIFT SECURITY ANALYZER ");
     println!();
     
-    // Display config
-    println!("Configuration:");
-    println!("  Entropy Threshold: {}", config.entropy_threshold);
-    println!("  DBSCAN Tolerance: {}", config.dbscan_tolerance);
-    println!("  Min Samples: {}", config.dbscan_min_samples);
-    println!("  Minority Cluster Ratio: {}%", config.minority_cluster_ratio * 100.0);
+    // Display comprehensive config
+    config.print();
     println!();
 
     // 1. Ingest Data - Support CSV and JSON with auto-detection

@@ -238,7 +238,7 @@ config.exclude_init_children = false;
 - Focuses analysis on user-space activity
 - Significantly reduces false positives in specialized environments
 
-**Debug output:** Enable `debug_ppid_resolution` to see what's being filtered.
+**Debug output:** Enable `debug_display` to see what's being filtered.
 
 ---
 
@@ -363,7 +363,7 @@ config.common_root_processes = vec![
 
 ### Debug and Analysis
 
-#### 11. `debug_ppid_resolution` (default: `false`)
+#### 11. `debug_display` (default: `false`)
 
 **What it does:** Enable detailed debugging output for parent process resolution.
 
@@ -398,10 +398,10 @@ config.common_root_processes = vec![
 **Examples:**
 ```rust
 // Enable for debugging
-config.debug_ppid_resolution = true;
+config.debug_display = true;
 
 // Normal operation (default)
-config.debug_ppid_resolution = false;
+config.debug_display = false;
 ```
 
 ---
@@ -435,7 +435,7 @@ let config = DetectionConfig {
     exclude_kernel_threads: true,
     exclude_init_children: false,     // Include init children
     flag_unexpected_root: true,       // Flag unexpected root
-    debug_ppid_resolution: false,
+    debug_display: false,
     whitelisted_path_patterns: vec![], // No whitelist
     ..DetectionConfig::default()
 };
@@ -559,7 +559,7 @@ Run analysis and observe results.
 - Decrease `dbscan_tolerance` by 0.01-0.02
 - Decrease `entropy_threshold` by 0.5
 - Disable `exclude_init_children` to include system services
-- Enable `debug_ppid_resolution` to understand process relationships
+- Enable `debug_display` to understand process relationships
 
 ### Step 3: Refine
 
@@ -692,7 +692,7 @@ JSON format for easy editing:
     "dockerd"
   ],
   "flag_unexpected_root": true,
-  "debug_ppid_resolution": false
+  "debug_display": false
 }
 ```
 

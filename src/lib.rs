@@ -44,8 +44,8 @@ pub struct DetectionConfig {
     /// If false, root processes are not considered suspicious
     pub flag_unexpected_root: bool,
     
-    /// Enable debug output for PPID resolution
-    pub debug_ppid_resolution: bool,
+    /// Enable debug output for detailed process information
+    pub debug_display: bool,
     
     /// Exclude processes that are direct children of init/systemd (PPID = 1)
     /// Many system services run as children of init and are typically normal
@@ -100,7 +100,7 @@ impl Default for DetectionConfig {
                 "avahi-daemon".to_string(),
             ],
             flag_unexpected_root: true,
-            debug_ppid_resolution: false,
+            debug_display: false,
             exclude_init_children: false,  // Off by default to avoid over-filtering
             whitelisted_path_patterns: vec![],  // Empty by default
         }
@@ -120,6 +120,48 @@ impl DetectionConfig {
         let file = File::create(path)?;
         serde_json::to_writer_pretty(file, self)?;
         Ok(())
+    }
+    
+    /// Print comprehensive configuration display
+    pub fn print(&self) {
+        println!("Configuration:");
+        println!("  Core Detection Parameters:");
+        println!("    Entropy Threshold: {:.2}", self.entropy_threshold);
+        println!("    DBSCAN Tolerance: {:.3}", self.dbscan_tolerance);
+        println!("    DBSCAN Min Samples: {}", self.dbscan_min_samples);
+        println!("    Minority Cluster Ratio: {:.1}%", self.minority_cluster_ratio * 100.0);
+        println!("    Normalize Features: {}", self.normalize_features);
+        
+        println!("  Filtering Options:");
+        println!("    Exclude Kernel Threads: {}", self.exclude_kernel_threads);
+        println!("    Exclude Init Children (PPID=1): {}", self.exclude_init_children);
+        println!("    Flag Unexpected Root: {}", self.flag_unexpected_root);
+        println!("    Debug Display: {}", self.debug_display);
+        
+        if !self.suspicious_path_patterns.is_empty() {
+            println!("  Suspicious Path Patterns ({}):", self.suspicious_path_patterns.len());
+            for pattern in &self.suspicious_path_patterns {
+                println!("    • {}", pattern);
+            }
+        }
+        
+        if !self.whitelisted_path_patterns.is_empty() {
+            println!("  Whitelisted Path Patterns ({}):", self.whitelisted_path_patterns.len());
+            for pattern in &self.whitelisted_path_patterns {
+                println!("    • {}", pattern);
+            }
+        }
+        
+        if !self.common_root_processes.is_empty() {
+            println!("  Common Root Processes ({}):", self.common_root_processes.len());
+            let display_count = self.common_root_processes.len().min(10);
+            for process in self.common_root_processes.iter().take(display_count) {
+                println!("    • {}", process);
+            }
+            if self.common_root_processes.len() > display_count {
+                println!("    ... and {} more", self.common_root_processes.len() - display_count);
+            }
+        }
     }
 }
 
@@ -1871,7 +1913,7 @@ pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Ve
     println!("\n🔨 Building profiles from {} raw entries", entries.len());
     
     // Debug: Show PPID resolution statistics if enabled
-    if config.debug_ppid_resolution {
+    if config.debug_display {
         println!("🔍 PPID Resolution Debug Info:");
         println!("   Total entries to process: {}", entries.len());
         
@@ -1885,7 +1927,7 @@ pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Ve
     // Resolve parent names
     let pid_to_name = resolve_parent_names(&entries);
     
-    if config.debug_ppid_resolution {
+    if config.debug_display {
         println!("   Resolved {} PID-to-name mappings", pid_to_name.len());
         println!("   Sample mappings:");
         for ((machine, pid), name) in pid_to_name.iter().take(5) {
@@ -1902,7 +1944,7 @@ pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Ve
             .collect();
         let after_count = filtered.len();
         
-        if config.debug_ppid_resolution {
+        if config.debug_display {
             println!("   Kernel thread filtering:");
             println!("     Before: {} entries", before_count);
             println!("     After: {} entries", after_count);
@@ -1923,11 +1965,32 @@ pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Ve
             .collect();
         let after_count = filtered.len();
         
-        if config.debug_ppid_resolution {
+        if config.debug_display {
             println!("   Init children filtering:");
             println!("     Before: {} entries", before_count);
             println!("     After: {} entries", after_count);
             println!("     Filtered out: {} init children (PPID=1)", before_count - after_count);
+            println!();
+        }
+        
+        filtered
+    } else {
+        entries
+    };
+    
+    // Filter out whitelisted paths if configured
+    let entries: Vec<RawLogEntry> = if !config.whitelisted_path_patterns.is_empty() {
+        let before_count = entries.len();
+        let filtered: Vec<_> = entries.into_iter()
+            .filter(|e| !is_path_whitelisted(&e.path, &config.whitelisted_path_patterns))
+            .collect();
+        let after_count = filtered.len();
+        
+        if config.debug_display {
+            println!("   Whitelisted path filtering:");
+            println!("     Before: {} entries", before_count);
+            println!("     After: {} entries", after_count);
+            println!("     Filtered out: {} whitelisted paths", before_count - after_count);
             println!();
         }
         
@@ -1944,7 +2007,7 @@ pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Ve
             .push(entry);
     }
     
-    if config.debug_ppid_resolution {
+    if config.debug_display {
         println!("   Grouped into {} machines", machine_entries.len());
         println!();
     }
@@ -1953,6 +2016,7 @@ pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Ve
     let profiles: Vec<MachineProfile> = machine_entries.par_iter()
         .map(|(machine_id, logs)| {
             let mut profile = MachineProfile::new(machine_id);
+            let mut process_counts: HashMap<String, u32> = HashMap::new(); // Track unique processes for logging
             
             for entry in logs {
                 // Resolve parent name
@@ -1960,7 +2024,7 @@ pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Ve
                     .get(&(entry.machine_id.clone(), entry.ppid))
                     .cloned()
                     .unwrap_or_else(|| {
-                        if config.debug_ppid_resolution && entry.ppid != 0 {
+                        if config.debug_display && entry.ppid != 0 {
                             eprintln!("⚠️  Unresolved PPID for {}:{} (PPID: {})", 
                                 entry.machine_id, entry.name, entry.ppid);
                         }
@@ -1971,13 +2035,8 @@ pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Ve
                 let entropy = calculate_shannon_entropy(&entry.args);
                 let is_high_entropy = entropy > config.entropy_threshold;
                 
-                // Check if path is whitelisted first, then check if suspicious
-                let is_whitelisted = is_path_whitelisted(&entry.path, &config.whitelisted_path_patterns);
-                let is_suspicious_path = if is_whitelisted {
-                    false  // Whitelisted paths are never suspicious
-                } else {
-                    is_path_suspicious(&entry.path, &config.suspicious_path_patterns)
-                };
+                // Check if path is suspicious (whitelisted paths are already filtered out above)
+                let is_suspicious_path = is_path_suspicious(&entry.path, &config.suspicious_path_patterns);
                 
                 let timestamp = entry.timestamp.as_ref()
                     .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
@@ -1985,13 +2044,36 @@ pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Ve
                 
                 let sig = ProcessSignature {
                     name: entry.name.clone(),
-                    parent_name,
+                    parent_name: parent_name.clone(),
            //         ppid: entry.ppid,  // ⭐ PRESERVE PPID!
                     uid: entry.uid,
                     path: entry.path.clone(),
                     is_high_entropy,
                     is_suspicious_path,
                 };
+                
+                // Track if this is a new unique process signature
+                let process_key = format!("{}:{}:{}:{}", sig.name, sig.path, sig.parent_name, sig.uid);
+                let is_new_process = !process_counts.contains_key(&process_key);
+                process_counts.entry(process_key).and_modify(|c| *c += 1).or_insert(1);
+                
+                // Log new process additions when debug is enabled
+                if config.debug_display && is_new_process {
+                    let risk_flags = vec![
+                        if is_high_entropy { "HIGH_ENTROPY" } else { "" },
+                        if is_suspicious_path { "SUSPICIOUS_PATH" } else { "" },
+                        if entry.uid == 0 && !config.common_root_processes.iter().any(|p| entry.name.contains(p)) { "UNEXPECTED_ROOT" } else { "" },
+                    ].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>();
+                    
+                    let risk_str = if risk_flags.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{}]", risk_flags.join(", "))
+                    };
+                    
+                    println!("  ➕ New process in {}: {} (path: {}, parent: {}, uid: {}){}",
+                        machine_id, entry.name, entry.path, parent_name, entry.uid, risk_str);
+                }
                 
                 profile.add_process(sig, timestamp);
             }
@@ -2001,7 +2083,7 @@ pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Ve
         .collect();
     
     println!("\n✅ Built {} machine profiles", profiles.len());
-    if config.debug_ppid_resolution {
+    if config.debug_display {
         println!("   Profiles ready for analysis");
     }
     

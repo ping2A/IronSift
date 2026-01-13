@@ -39,7 +39,7 @@
     "avahi-daemon"
   ],
   "flag_unexpected_root": true,
-  "debug_ppid_resolution": false,
+  "debug_display": true,
   "exclude_init_children": false,
   "whitelisted_path_patterns": [
     "/opt/conda/*",
