@@ -2823,3 +2823,438 @@ fn test_ppid_zero_handling() {
     
     println!("✅ PPID=0 handling test passed!");
 }
+
+// --- FILE-BASED ANALYSIS TESTS ---
+
+#[test]
+fn test_build_file_profiles() {
+    println!("\n🧪 Testing file profile building");
+    
+    let config = DetectionConfig::default();
+    let entries = vec![
+        RawFileEntry {
+            machine_id: "server1".to_string(),
+            path: "/etc/passwd".to_string(),
+            uid: 1000,
+            timestamp: None,
+        },
+        RawFileEntry {
+            machine_id: "server1".to_string(),
+            path: "/var/log/syslog".to_string(),
+            uid: 1000,
+            timestamp: None,
+        },
+        RawFileEntry {
+            machine_id: "server2".to_string(),
+            path: "/etc/passwd".to_string(),
+            uid: 1000,
+            timestamp: None,
+        },
+    ];
+    
+    let profiles = build_file_profiles(entries, &config);
+    assert_eq!(profiles.len(), 2);
+    
+    let profile1 = profiles.iter().find(|p| p.id == "server1").unwrap();
+    assert_eq!(profile1.total_logs, 2);
+    assert_eq!(profile1.counts.len(), 2);
+    
+    let profile2 = profiles.iter().find(|p| p.id == "server2").unwrap();
+    assert_eq!(profile2.total_logs, 1);
+    
+    println!("✅ File profile building test passed!");
+}
+
+#[test]
+fn test_file_signature_uniqueness() {
+    println!("\n🧪 Testing file signature uniqueness");
+    
+    let config = DetectionConfig::default();
+    let entries = vec![
+        // Same file, different UIDs should create different signatures
+        RawFileEntry {
+            machine_id: "server1".to_string(),
+            path: "/etc/passwd".to_string(),
+            uid: 1000,
+            timestamp: None,
+        },
+        RawFileEntry {
+            machine_id: "server1".to_string(),
+            path: "/etc/passwd".to_string(),
+            uid: 0,  // Root user
+            timestamp: None,
+        },
+        // Same file, same UID should be counted together
+        RawFileEntry {
+            machine_id: "server1".to_string(),
+            path: "/etc/passwd".to_string(),
+            uid: 1000,
+            timestamp: None,
+        },
+    ];
+    
+    let profiles = build_file_profiles(entries, &config);
+    let profile = &profiles[0];
+    
+    // Should have 2 unique signatures (same path, different UIDs)
+    assert_eq!(profile.counts.len(), 2);
+    
+    // Total logs should be 3 (all entries counted)
+    assert_eq!(profile.total_logs, 3);
+    
+    // Check that uid=1000 has count=2
+    for (sig, count) in &profile.counts {
+        if sig.uid == 1000 && sig.path == "/etc/passwd" {
+            assert_eq!(*count, 2);
+        }
+        if sig.uid == 0 && sig.path == "/etc/passwd" {
+            assert_eq!(*count, 1);
+        }
+    }
+    
+    println!("✅ File signature uniqueness test passed!");
+}
+
+#[test]
+fn test_file_suspicious_path_detection() {
+    println!("\n🧪 Testing suspicious file path detection");
+    
+    let mut config = DetectionConfig::default();
+    config.suspicious_path_patterns = vec![
+        r"/tmp/".to_string(),
+        r"/dev/shm/".to_string(),
+    ];
+    
+    let entries = vec![
+        RawFileEntry {
+            machine_id: "server1".to_string(),
+            path: "/tmp/suspicious_file".to_string(),
+            uid: 1000,
+            timestamp: None,
+        },
+        RawFileEntry {
+            machine_id: "server1".to_string(),
+            path: "/home/user/normal_file".to_string(),
+            uid: 1000,
+            timestamp: None,
+        },
+    ];
+    
+    let profiles = build_file_profiles(entries, &config);
+    let profile = &profiles[0];
+    
+    for (sig, _) in &profile.counts {
+        if sig.path == "/tmp/suspicious_file" {
+            assert!(sig.is_suspicious_path, "Suspicious path should be flagged");
+        }
+        if sig.path == "/home/user/normal_file" {
+            assert!(!sig.is_suspicious_path, "Normal path should not be flagged");
+        }
+    }
+    
+    println!("✅ Suspicious file path detection test passed!");
+}
+
+#[test]
+fn test_file_whitelisting() {
+    println!("\n🧪 Testing file path whitelisting");
+    
+    let mut config = DetectionConfig::default();
+    config.suspicious_path_patterns = vec![
+        r"/tmp/".to_string(),
+    ];
+    config.whitelisted_path_patterns = vec![
+        "/tmp/legitimate/*".to_string(),
+    ];
+    
+    let entries = vec![
+        RawFileEntry {
+            machine_id: "server1".to_string(),
+            path: "/tmp/suspicious".to_string(),
+            uid: 1000,
+            timestamp: None,
+        },
+        RawFileEntry {
+            machine_id: "server1".to_string(),
+            path: "/tmp/legitimate/file".to_string(),
+            uid: 1000,
+            timestamp: None,
+        },
+    ];
+    
+    let profiles = build_file_profiles(entries, &config);
+    let profile = &profiles[0];
+    
+    // Whitelisted path should be filtered out entirely
+    assert_eq!(profile.counts.len(), 1);
+    assert!(profile.counts.keys().any(|sig| sig.path == "/tmp/suspicious"));
+    assert!(!profile.counts.keys().any(|sig| sig.path == "/tmp/legitimate/file"));
+    
+    println!("✅ File whitelisting test passed!");
+}
+
+#[test]
+fn test_analyze_files_fleet() {
+    println!("\n🧪 Testing file fleet analysis");
+    
+    let mut config = DetectionConfig::default();
+    config.dbscan_tolerance = 0.5;  // Relaxed for small fleet
+    config.suspicious_path_patterns = vec![
+        r"/tmp/".to_string(),
+    ];
+    
+    // Create 5 normal machines with similar file access patterns
+    let mut entries = Vec::new();
+    for i in 0..5 {
+        let machine_id = format!("normal_{}", i);
+        entries.push(RawFileEntry {
+            machine_id: machine_id.clone(),
+            path: "/etc/passwd".to_string(),
+            uid: 1000,
+            timestamp: None,
+        });
+        entries.push(RawFileEntry {
+            machine_id: machine_id.clone(),
+            path: "/var/log/syslog".to_string(),
+            uid: 1000,
+            timestamp: None,
+        });
+        entries.push(RawFileEntry {
+            machine_id: machine_id.clone(),
+            path: "/home/user/docs".to_string(),
+            uid: 1000,
+            timestamp: None,
+        });
+    }
+    
+    // 1 compromised machine with suspicious files
+    entries.push(RawFileEntry {
+        machine_id: "compromised".to_string(),
+        path: "/tmp/malware".to_string(),
+        uid: 0,
+        timestamp: None,
+    });
+    entries.push(RawFileEntry {
+        machine_id: "compromised".to_string(),
+        path: "/etc/shadow".to_string(),
+        uid: 0,  // Root accessing shadow
+        timestamp: None,
+    });
+    
+    let profiles = build_file_profiles(entries, &config);
+    let report = analyze_files_fleet(&profiles, &config).unwrap();
+    
+    // Should detect the compromised machine
+    assert!(!report.anomalies.is_empty());
+    assert!(report.anomalies.iter().any(|a| a.machine_id == "compromised"));
+    
+    println!("✅ File fleet analysis test passed!");
+}
+
+#[test]
+fn test_file_risk_factors() {
+    println!("\n🧪 Testing file risk factor detection");
+    
+    let mut config = DetectionConfig::default();
+    config.suspicious_path_patterns = vec![
+        r"/tmp/".to_string(),
+    ];
+    
+    let entries = vec![
+        // Suspicious path
+        RawFileEntry {
+            machine_id: "server1".to_string(),
+            path: "/tmp/suspicious".to_string(),
+            uid: 1000,
+            timestamp: None,
+        },
+        // System directory access
+        RawFileEntry {
+            machine_id: "server1".to_string(),
+            path: "/etc/shadow".to_string(),
+            uid: 1000,
+            timestamp: None,
+        },
+        // Root access
+        RawFileEntry {
+            machine_id: "server1".to_string(),
+            path: "/home/user/file".to_string(),
+            uid: 0,
+            timestamp: None,
+        },
+    ];
+    
+    let profiles = build_file_profiles(entries, &config);
+    let profile = &profiles[0];
+    
+    for (sig, _) in &profile.counts {
+        let risks = sig.risk_factors(&config);
+        
+        if sig.path == "/tmp/suspicious" {
+            assert!(!risks.is_empty(), "Suspicious path should have risk factors");
+            assert!(risks.iter().any(|r| r.contains("Suspicious file path")));
+        }
+        
+        if sig.path == "/etc/shadow" {
+            assert!(risks.iter().any(|r| r.contains("System directory")));
+        }
+        
+        if sig.uid == 0 && sig.path == "/home/user/file" {
+            assert!(risks.iter().any(|r| r.contains("Root user accessed")));
+        }
+    }
+    
+    println!("✅ File risk factors test passed!");
+}
+
+#[test]
+fn test_file_system_directory_detection() {
+    println!("\n🧪 Testing system directory file access detection");
+    
+    let config = DetectionConfig::default();
+    
+    let entries = vec![
+        RawFileEntry {
+            machine_id: "server1".to_string(),
+            path: "/etc/passwd".to_string(),
+            uid: 1000,
+            timestamp: None,
+        },
+        RawFileEntry {
+            machine_id: "server1".to_string(),
+            path: "/bin/ls".to_string(),
+            uid: 1000,
+            timestamp: None,
+        },
+        RawFileEntry {
+            machine_id: "server1".to_string(),
+            path: "/sbin/ifconfig".to_string(),
+            uid: 1000,
+            timestamp: None,
+        },
+        RawFileEntry {
+            machine_id: "server1".to_string(),
+            path: "/home/user/file".to_string(),
+            uid: 1000,
+            timestamp: None,
+        },
+    ];
+    
+    let profiles = build_file_profiles(entries, &config);
+    let profile = &profiles[0];
+    
+    for (sig, _) in &profile.counts {
+        let risks = sig.risk_factors(&config);
+        
+        if sig.path.contains("/etc") || sig.path.contains("/bin") || sig.path.contains("/sbin") {
+            assert!(risks.iter().any(|r| r.contains("System directory")), 
+                "System directory access should be flagged: {}", sig.path);
+        } else {
+            assert!(!risks.iter().any(|r| r.contains("System directory")), 
+                "Non-system directory should not be flagged: {}", sig.path);
+        }
+    }
+    
+    println!("✅ System directory detection test passed!");
+}
+
+#[test]
+fn test_file_root_access_detection() {
+    println!("\n🧪 Testing root file access detection");
+    
+    let config = DetectionConfig::default();
+    
+    let entries = vec![
+        RawFileEntry {
+            machine_id: "server1".to_string(),
+            path: "/home/user/file".to_string(),
+            uid: 0,  // Root
+            timestamp: None,
+        },
+        RawFileEntry {
+            machine_id: "server1".to_string(),
+            path: "/proc/cpuinfo".to_string(),
+            uid: 0,  // Root accessing /proc (should not be flagged)
+            timestamp: None,
+        },
+        RawFileEntry {
+            machine_id: "server1".to_string(),
+            path: "/sys/kernel".to_string(),
+            uid: 0,  // Root accessing /sys (should not be flagged)
+            timestamp: None,
+        },
+        RawFileEntry {
+            machine_id: "server1".to_string(),
+            path: "/home/user/file".to_string(),
+            uid: 1000,  // Normal user
+            timestamp: None,
+        },
+    ];
+    
+    let profiles = build_file_profiles(entries, &config);
+    let profile = &profiles[0];
+    
+    for (sig, _) in &profile.counts {
+        let risks = sig.risk_factors(&config);
+        
+        if sig.uid == 0 && !sig.path.starts_with("/proc") && !sig.path.starts_with("/sys") {
+            assert!(risks.iter().any(|r| r.contains("Root user accessed")), 
+                "Root access should be flagged: {}", sig.path);
+        }
+        
+        if sig.path.starts_with("/proc") || sig.path.starts_with("/sys") {
+            assert!(!risks.iter().any(|r| r.contains("Root user accessed")), 
+                "/proc and /sys root access should not be flagged: {}", sig.path);
+        }
+    }
+    
+    println!("✅ Root access detection test passed!");
+}
+
+#[test]
+fn test_file_rare_file_detection() {
+    println!("\n🧪 Testing rare file access detection");
+    
+    let config = DetectionConfig::default();
+    
+    // Create 5 machines with common files
+    let mut entries = Vec::new();
+    for i in 0..5 {
+        let machine_id = format!("normal_{}", i);
+        entries.push(RawFileEntry {
+            machine_id: machine_id.clone(),
+            path: "/etc/passwd".to_string(),
+            uid: 1000,
+            timestamp: None,
+        });
+        entries.push(RawFileEntry {
+            machine_id: machine_id.clone(),
+            path: "/var/log/syslog".to_string(),
+            uid: 1000,
+            timestamp: None,
+        });
+    }
+    
+    // One machine with a unique file
+    entries.push(RawFileEntry {
+        machine_id: "outlier".to_string(),
+        path: "/unusual/path/file".to_string(),
+        uid: 1000,
+        timestamp: None,
+    });
+    
+    let profiles = build_file_profiles(entries, &config);
+    let report = analyze_files_fleet(&profiles, &config).unwrap();
+    
+    // Should detect outlier due to rare file access
+    assert!(!report.anomalies.is_empty());
+    let outlier_anomaly = report.anomalies.iter().find(|a| a.machine_id == "outlier");
+    assert!(outlier_anomaly.is_some());
+    
+    // Should mention rare file access
+    if let Some(anomaly) = outlier_anomaly {
+        assert!(anomaly.anomalous_features.iter().any(|f| f.contains("Rare file access")));
+    }
+    
+    println!("✅ Rare file detection test passed!");
+}

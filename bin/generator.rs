@@ -5,11 +5,12 @@ use std::env;
 use rand::Rng;
 use chrono::{Utc, Duration};
 
-use ironsift::RawLogEntry;
+use ironsift::{RawLogEntry, RawFileEntry};
 
 const NUM_MACHINES: u32 = 20;
 const LOGS_PER_MACHINE: u32 = 100;
 
+#[derive(Clone, Copy)]
 enum OutputFormat {
     Csv,
     Json,
@@ -21,12 +22,15 @@ fn print_usage() {
     println!("Options:");
     println!("  --json    Generate JSON output (test_dataset.json)");
     println!("  --csv     Generate CSV output (test_dataset.csv) [default]");
+    println!("  --files   Generate file access logs instead of process logs");
     println!("  --help    Show this help message");
     println!();
     println!("Examples:");
-    println!("  generator           # Generate CSV (default)");
-    println!("  generator --json    # Generate JSON");
-    println!("  generator --csv     # Generate CSV (explicit)");
+    println!("  generator           # Generate process CSV (default)");
+    println!("  generator --json    # Generate process JSON");
+    println!("  generator --files   # Generate file CSV");
+    println!("  generator --files --json  # Generate file JSON");
+    println!("  generator --csv     # Generate process CSV (explicit)");
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -34,11 +38,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     
     // Parse arguments
     let mut format = OutputFormat::Csv;
+    let mut generate_files = false;
     
     for arg in args.iter().skip(1) {
         match arg.as_str() {
             "--json" => format = OutputFormat::Json,
             "--csv" => format = OutputFormat::Csv,
+            "--files" => generate_files = true,
             "--help" => {
                 print_usage();
                 return Ok(());
@@ -51,38 +57,55 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     
-    let output_file = match format {
-        OutputFormat::Csv => "test_dataset.csv",
-        OutputFormat::Json => "test_dataset.json",
+    let (output_file, format_name) = match (format, generate_files) {
+        (OutputFormat::Csv, false) => ("test_dataset.csv", "CSV"),
+        (OutputFormat::Json, false) => ("test_dataset.json", "JSON"),
+        (OutputFormat::Csv, true) => ("test_files_dataset.csv", "CSV"),
+        (OutputFormat::Json, true) => ("test_files_dataset.json", "JSON"),
     };
     
-    let format_name = match format {
-        OutputFormat::Csv => "CSV",
-        OutputFormat::Json => "JSON",
-    };
+    let data_type = if generate_files { "file access" } else { "process" };
     
     println!("{:=^60}", " IRONSIFT DATA GENERATOR ");
     println!();
     println!("Format: {}", format_name);
+    println!("Type: {}", data_type);
     println!("Generating {} logs for {} machines...", 
         NUM_MACHINES * LOGS_PER_MACHINE, NUM_MACHINES);
     println!("Output: {}", output_file);
     println!();
     
-    // Generate all log entries
-    let entries = generate_log_entries()?;
-    
-    // Write in the requested format
-    match format {
-        OutputFormat::Csv => write_csv(&entries, output_file)?,
-        OutputFormat::Json => write_json(&entries, output_file)?,
+    if generate_files {
+        // Generate file access log entries
+        let file_entries = generate_file_entries()?;
+        
+        // Write in the requested format
+        match format {
+            OutputFormat::Csv => write_files_csv(&file_entries, output_file)?,
+            OutputFormat::Json => write_files_json(&file_entries, output_file)?,
+        }
+        
+        println!();
+        println!("✅ Done! Dataset written to '{}'", output_file);
+        println!("   {} machines, {} total file access logs", NUM_MACHINES, file_entries.len());
+        println!();
+        print_file_detection_instructions(output_file);
+    } else {
+        // Generate process log entries (original code)
+        let entries = generate_log_entries()?;
+        
+        // Write in the requested format
+        match format {
+            OutputFormat::Csv => write_csv(&entries, output_file)?,
+            OutputFormat::Json => write_json(&entries, output_file)?,
+        }
+        
+        println!();
+        println!("✅ Done! Dataset written to '{}'", output_file);
+        println!("   {} machines, {} total process logs", NUM_MACHINES, entries.len());
+        println!();
+        print_detection_instructions(output_file);
     }
-    
-    println!();
-    println!("✅ Done! Dataset written to '{}'", output_file);
-    println!("   {} machines, {} total process logs", NUM_MACHINES, entries.len());
-    println!();
-    print_detection_instructions(output_file);
     
     Ok(())
 }
@@ -420,5 +443,234 @@ fn print_detection_instructions(output_file: &str) {
     println!("   • Export JSON for detailed forensic analysis");
     println!("   • All malicious processes have PPID correctly tracked");
     println!("   • Edit ironsift_config.json to customize detection");
+    println!();
+}
+
+// --- FILE GENERATION FUNCTIONS ---
+
+fn generate_file_entries() -> Result<Vec<RawFileEntry>, Box<dyn Error>> {
+    let mut rng = rand::thread_rng();
+    let mut entries = Vec::new();
+    
+    // Start time: 7 days ago
+    let mut current_time = Utc::now() - Duration::days(7);
+
+    // Define normal file paths
+    let normal_files = vec![
+        "/etc/passwd",
+        "/etc/group",
+        "/var/log/syslog",
+        "/var/log/auth.log",
+        "/home/user/.bashrc",
+        "/home/user/.profile",
+        "/usr/bin/python3",
+        "/usr/bin/node",
+        "/var/www/html/index.html",
+        "/etc/nginx/nginx.conf",
+        "/etc/mysql/my.cnf",
+        "/var/lib/postgresql/data",
+        "/tmp/temp_data.txt",
+        "/var/cache/apt/archives",
+        "/opt/application/config.json",
+    ];
+
+    // Suspicious file paths for attack scenarios
+    let suspicious_files = vec![
+        "/tmp/malware",
+        "/tmp/.hidden/file",
+        "/dev/shm/secret",
+        "/var/tmp/backdoor",
+        "/etc/shadow",  // Root access to shadow file
+        "/etc/sudoers",
+        "/root/.ssh/authorized_keys",
+        "/usr/bin/suspicious",
+        "/opt/custom/payload",
+    ];
+
+    println!("File Generation Scenario Overview:");
+    println!("  🔹 14 clean machines (normal file access)");
+    println!("  🔸 2 machines with suspicious file access (machine_003, machine_017)");
+    println!("  🔸 1 machine accessing system directories (machine_009)");
+    println!("  🔸 1 machine with root file access (machine_006)");
+    println!("  🔸 2 machines with rare file patterns (machine_012, machine_015)");
+    println!();
+    println!("Anomalous Machines Summary:");
+    println!("  • machine_003: Suspicious files in /tmp and /dev/shm");
+    println!("  • machine_006: Root access to sensitive files");
+    println!("  • machine_009: Access to system configuration files");
+    println!("  • machine_012: Rare file access patterns");
+    println!("  • machine_015: Access to unusual file locations");
+    println!("  • machine_017: Suspicious files in /tmp and /var/tmp");
+    println!();
+
+    for i in 0..NUM_MACHINES {
+        let machine_id = format!("machine_{:03}", i);
+        
+        if i % 10 == 0 {
+            println!("📊 Processing batch: {}...", machine_id);
+        }
+
+        for _log_idx in 0..LOGS_PER_MACHINE {
+            current_time = current_time + Duration::seconds(rng.gen_range(60..300));
+            let timestamp = current_time.to_rfc3339();
+            
+            let mut path = normal_files[rng.gen_range(0..normal_files.len())].to_string();
+            let mut uid = rng.gen_range(1000..10000);  // Normal user UIDs
+            
+            // Inject attack scenarios for specific machines
+            
+            // Suspicious files (Machines 3, 17)
+            if (i == 3 || i == 17) && rng.gen_bool(0.20) {
+                path = suspicious_files[rng.gen_range(0..suspicious_files.len())].to_string();
+                if rng.gen_bool(0.30) {
+                    uid = 0;  // Some accessed as root
+                }
+            }
+            
+            // System directory access (Machine 9)
+            if i == 9 && rng.gen_bool(0.25) {
+                let system_files = vec![
+                    "/etc/shadow",
+                    "/etc/sudoers",
+                    "/etc/passwd",
+                    "/etc/group",
+                    "/bin/ls",
+                    "/bin/cat",
+                    "/sbin/ifconfig",
+                ];
+                path = system_files[rng.gen_range(0..system_files.len())].to_string();
+            }
+            
+            // Root file access (Machine 6)
+            if i == 6 && rng.gen_bool(0.30) {
+                uid = 0;  // Root user accessing files
+                let root_files = vec![
+                    "/etc/shadow",
+                    "/etc/sudoers",
+                    "/root/.bashrc",
+                    "/root/.ssh/config",
+                    "/var/log/secure",
+                ];
+                if rng.gen_bool(0.50) {
+                    path = root_files[rng.gen_range(0..root_files.len())].to_string();
+                }
+            }
+            
+            // Rare file patterns (Machines 12, 15)
+            if (i == 12 || i == 15) && rng.gen_bool(0.15) {
+                let rare_files = vec![
+                    "/opt/unusual/application",
+                    "/home/rare_user/.config",
+                    "/var/custom/data",
+                    "/usr/local/special/bin",
+                ];
+                path = rare_files[rng.gen_range(0..rare_files.len())].to_string();
+            }
+
+            entries.push(RawFileEntry {
+                machine_id: machine_id.clone(),
+                path,
+                uid,
+                timestamp: Some(timestamp),
+            });
+        }
+    }
+
+    Ok(entries)
+}
+
+fn write_files_csv(entries: &[RawFileEntry], path: &str) -> Result<(), Box<dyn Error>> {
+    let file = File::create(path)?;
+    let mut wtr = csv::Writer::from_writer(file);
+    
+    for entry in entries {
+        wtr.serialize(entry)?;
+    }
+    
+    wtr.flush()?;
+    Ok(())
+}
+
+fn write_files_json(entries: &[RawFileEntry], path: &str) -> Result<(), Box<dyn Error>> {
+    let mut file = File::create(path)?;
+    
+    writeln!(file, "[")?;
+    
+    for (i, entry) in entries.iter().enumerate() {
+        if i > 0 {
+            writeln!(file, ",")?;
+        }
+        
+        write!(file, r#"  {{"machine_id": "{}", "path": "{}", "uid": {}, "timestamp": "{}"}}"#,
+            entry.machine_id,
+            entry.path.replace('"', "\\\""),
+            entry.uid,
+            entry.timestamp.as_ref().unwrap_or(&"".to_string())
+        )?;
+    }
+    
+    writeln!(file)?;
+    writeln!(file, "]")?;
+    
+    Ok(())
+}
+
+fn print_file_detection_instructions(output_file: &str) {
+    println!("{:=^80}", " FILE DETECTION INSTRUCTIONS ");
+    println!();
+    println!("📄 This dataset contains file access logs for anomaly detection.");
+    println!();
+    println!("🎯 RECOMMENDED PARAMETERS FOR FILE DETECTION:");
+    println!();
+    println!("1. Load and analyze file data:");
+    println!("   // In your Rust code:");
+    println!("   use ironsift::{{build_file_profiles, analyze_files_fleet, DetectionConfig}};");
+    println!("   use std::fs::File;");
+    println!("   use csv::Reader;");
+    println!("   use ironsift::RawFileEntry;");
+    println!();
+    println!("   let config = DetectionConfig::default();");
+    println!("   let mut rdr = Reader::from_path(\"{}\")?;", output_file);
+    println!("   let entries: Vec<RawFileEntry> = rdr.deserialize().collect::<Result<Vec<_>, _>>()?;");
+    println!("   let profiles = build_file_profiles(entries, &config);");
+    println!("   let report = analyze_files_fleet(&profiles, &config)?;");
+    println!("   report.print_detailed(None);");
+    println!();
+    println!("{:-^80}", "");
+    println!();
+    println!("📊 EXPECTED RESULTS:");
+    println!("   The file analysis should detect:");
+    println!();
+    println!("   ⚠️  machine_003 (SUSPICIOUS FILES)");
+    println!("       • Files: /tmp/malware, /dev/shm/secret, /tmp/.hidden/file");
+    println!("       • Risk: Suspicious paths, some root access");
+    println!();
+    println!("   ⚠️  machine_006 (ROOT FILE ACCESS)");
+    println!("       • Files: /etc/shadow, /etc/sudoers, /root/.bashrc");
+    println!("       • Risk: Root user accessing sensitive files");
+    println!();
+    println!("   ⚠️  machine_009 (SYSTEM DIRECTORY ACCESS)");
+    println!("       • Files: /etc/shadow, /etc/sudoers, /bin/ls, /sbin/ifconfig");
+    println!("       • Risk: Access to system configuration and binaries");
+    println!();
+    println!("   ⚠️  machine_012 (RARE FILE PATTERNS)");
+    println!("       • Files: /opt/unusual/application, /var/custom/data");
+    println!("       • Risk: Statistical rarity (unique file access patterns)");
+    println!();
+    println!("   ⚠️  machine_015 (RARE FILE PATTERNS)");
+    println!("       • Files: /home/rare_user/.config, /usr/local/special/bin");
+    println!("       • Risk: Statistical rarity (unique file access patterns)");
+    println!();
+    println!("   ⚠️  machine_017 (SUSPICIOUS FILES)");
+    println!("       • Files: /tmp/malware, /var/tmp/backdoor, /etc/shadow");
+    println!("       • Risk: Suspicious paths, some root access");
+    println!();
+    println!("💡 TIPS:");
+    println!("   • File analysis focuses on which files are accessed, not how");
+    println!("   • Configure suspicious_path_patterns in config to flag specific paths");
+    println!("   • Use whitelisted_path_patterns to exclude known-good paths");
+    println!("   • Root access (UID 0) to non-/proc,/sys files is flagged as risk");
+    println!("   • System directories (/etc, /bin, /sbin) are flagged as risk indicators");
+    println!("   • Statistical rarity detects files accessed by only one machine");
     println!();
 }

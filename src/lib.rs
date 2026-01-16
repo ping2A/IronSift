@@ -180,6 +180,15 @@ pub struct RawLogEntry {
     pub timestamp: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct RawFileEntry {
+    pub machine_id: String,
+    pub path: String,
+    pub uid: u32,
+    #[serde(default)]
+    pub timestamp: Option<String>,
+}
+
 /// Flexible process entry that doesn't require PIDs upfront
 #[derive(Debug, Clone)]
 pub struct ProcessEntry {
@@ -346,6 +355,38 @@ impl ProcessSignature {
     }
 }
 
+#[derive(Debug, Hash, Eq, PartialEq, Clone, Serialize, Deserialize)]
+pub struct FileSignature {
+    pub path: String,
+    pub uid: u32,
+    pub is_suspicious_path: bool,
+}
+
+impl FileSignature {
+    /// Create a human-readable description of why this file access is suspicious
+    pub fn risk_factors(&self, config: &DetectionConfig) -> Vec<String> {
+        let mut factors = Vec::new();
+        
+        if self.is_suspicious_path {
+            factors.push(format!("Suspicious file path: {}", self.path));
+        }
+        
+        if self.path.contains("/etc") || self.path.contains("/bin") || self.path.contains("/sbin") {
+            factors.push(format!("System directory access: {}", self.path));
+        }
+        
+        if self.path.contains("/tmp") {
+            factors.push("Temporary directory access".to_string());
+        }
+        
+        if self.uid == 0 && !self.path.starts_with("/proc") && !self.path.starts_with("/sys") {
+            factors.push(format!("Root user accessed: {}", self.path));
+        }
+        
+        factors
+    }
+}
+
 #[derive(Debug)]
 pub struct MachineProfile {
     pub id: String,
@@ -386,6 +427,42 @@ impl MachineProfile {
         self.counts.keys()
             .filter(|sig| !baseline.counts.contains_key(sig))
             .collect()
+    }
+}
+
+#[derive(Debug)]
+pub struct MachineFileProfile {
+    pub id: String,
+    pub counts: HashMap<FileSignature, u32>,
+    pub total_logs: u32,
+    pub first_seen: Option<DateTime<Utc>>,
+    pub last_seen: Option<DateTime<Utc>>,
+}
+
+impl MachineFileProfile {
+    pub fn new(id: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            counts: HashMap::new(),
+            total_logs: 0,
+            first_seen: None,
+            last_seen: None,
+        }
+    }
+
+    pub fn add_file(&mut self, sig: FileSignature, timestamp: Option<DateTime<Utc>>) {
+        *self.counts.entry(sig).or_insert(0) += 1;
+        self.total_logs += 1;
+        
+        // Track time range
+        if let Some(ts) = timestamp {
+            if self.first_seen.is_none() || ts < self.first_seen.unwrap() {
+                self.first_seen = Some(ts);
+            }
+            if self.last_seen.is_none() || ts > self.last_seen.unwrap() {
+                self.last_seen = Some(ts);
+            }
+        }
     }
 }
 
@@ -1173,6 +1250,228 @@ pub fn analyze_fleet2(profiles: &[MachineProfile], config: &DetectionConfig) -> 
         cluster_stats: cluster_counts,
         total_analyzed: n_samples,
         config_used: config.clone(),
+    })
+}
+
+// --- FILE-BASED ANALYSIS ---
+
+/// Build machine file profiles from raw file access entries
+pub fn build_file_profiles(entries: Vec<RawFileEntry>, config: &DetectionConfig) -> Vec<MachineFileProfile> {
+    println!("\n🔨 Building file profiles from {} raw file entries", entries.len());
+    
+    // Filter out whitelisted paths if configured
+    let entries: Vec<RawFileEntry> = if !config.whitelisted_path_patterns.is_empty() {
+        let before_count = entries.len();
+        let filtered: Vec<_> = entries.into_iter()
+            .filter(|e| !is_path_whitelisted(&e.path, &config.whitelisted_path_patterns))
+            .collect();
+        let after_count = filtered.len();
+        
+        if config.debug_display {
+            println!("   Whitelisted file path filtering:");
+            println!("     Before: {} entries", before_count);
+            println!("     After: {} entries", after_count);
+            println!("     Filtered out: {} whitelisted file paths", before_count - after_count);
+            println!();
+        }
+        
+        filtered
+    } else {
+        entries
+    };
+    
+    // Group by machine
+    let mut machine_entries: HashMap<String, Vec<RawFileEntry>> = HashMap::new();
+    for entry in entries {
+        machine_entries.entry(entry.machine_id.clone())
+            .or_insert_with(Vec::new)
+            .push(entry);
+    }
+    
+    if config.debug_display {
+        println!("   Grouped into {} machines", machine_entries.len());
+        println!();
+    }
+    
+    // Build profiles in parallel
+    let profiles: Vec<MachineFileProfile> = machine_entries.par_iter()
+        .map(|(machine_id, logs)| {
+            let mut profile = MachineFileProfile::new(machine_id);
+            let mut file_counts: HashMap<String, u32> = HashMap::new(); // Track unique files for logging
+            
+            for entry in logs {
+                // Check if path is suspicious
+                let path_is_suspicious = is_path_suspicious(&entry.path, &config.suspicious_path_patterns);
+                
+                let timestamp = entry.timestamp.as_ref()
+                    .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+                    .map(|dt| dt.with_timezone(&Utc));
+                
+                let sig = FileSignature {
+                    path: entry.path.clone(),
+                    uid: entry.uid,
+                    is_suspicious_path: path_is_suspicious,
+                };
+                
+                // Track if this is a new unique file signature
+                let file_key = format!("{}:{}", sig.path, sig.uid);
+                let is_new_file = !file_counts.contains_key(&file_key);
+                file_counts.entry(file_key).and_modify(|c| *c += 1).or_insert(1);
+                
+                // Log new file additions when debug is enabled
+                if config.debug_display && is_new_file {
+                    let risk_flags = vec![
+                        if path_is_suspicious { "SUSPICIOUS_PATH" } else { "" },
+                        if entry.path.contains("/etc") || entry.path.contains("/bin") || entry.path.contains("/sbin") { 
+                            "SYSTEM_DIRECTORY" 
+                        } else { "" },
+                        if entry.uid == 0 { "ROOT_ACCESS" } else { "" },
+                    ].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>();
+                    
+                    let risk_str = if risk_flags.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{}]", risk_flags.join(", "))
+                    };
+                    
+                    println!("  📄 New file access in {}: {} (uid: {}){}",
+                        machine_id, entry.path, entry.uid, risk_str);
+                }
+                
+                profile.add_file(sig, timestamp);
+            }
+            
+            profile
+        })
+        .collect();
+    
+    println!("\n✅ Built {} machine file profiles", profiles.len());
+    if config.debug_display {
+        println!("   File profiles ready for analysis");
+    }
+    
+    profiles
+}
+
+/// Analyze file access patterns across a fleet using DBSCAN clustering
+pub fn analyze_files_fleet(profiles: &[MachineFileProfile], config: &DetectionConfig) -> Result<AnalysisReport, Box<dyn Error>> {
+    if profiles.is_empty() {
+        return Ok(AnalysisReport {
+            anomalies: vec![], cluster_stats: HashMap::new(), total_analyzed: 0, config_used: config.clone(),
+        });
+    }
+
+    // 1. Feature Extraction
+    let mut unique_features: HashSet<&FileSignature> = HashSet::new();
+    for p in profiles {
+        for key in p.counts.keys() { unique_features.insert(key); }
+    }
+    
+    let mut feature_list: Vec<&FileSignature> = unique_features.into_iter().collect();
+    let n_samples = profiles.len();
+    let n_features = feature_list.len();
+
+    // 2. Build Matrix
+    let mut data = Array2::<f64>::zeros((n_samples, n_features));
+    for (row_idx, profile) in profiles.iter().enumerate() {
+        if profile.total_logs == 0 { continue; }
+        for (col_idx, feature) in feature_list.iter().enumerate() {
+            if let Some(&count) = profile.counts.get(feature) {
+                let tf = count as f64 / profile.total_logs as f64;
+                let doc_count = profiles.iter().filter(|p| p.counts.contains_key(feature)).count();
+                // Standard IDF
+                let idf = ((n_samples as f64) / (doc_count as f64 + 1.0)).ln() + 1.0;
+                data[[row_idx, col_idx]] = tf * idf;
+            }
+        }
+    }
+
+    // 3. Normalize
+    if config.normalize_features {
+        for mut row in data.rows_mut() {
+            let norm = row.mapv(|x| x * x).sum().sqrt();
+            if norm > 0.0 { row.mapv_inplace(|x| x / norm); }
+        }
+    }
+
+    // 4. DBSCAN
+    let clusters = Dbscan::params(config.dbscan_min_samples)
+        .tolerance(config.dbscan_tolerance)
+        .transform(&data)?;
+
+    let mut cluster_counts: HashMap<Option<usize>, usize> = HashMap::new();
+    for cluster_id in clusters.iter() {
+        *cluster_counts.entry(*cluster_id).or_insert(0) += 1;
+    }
+
+    let largest_cluster = cluster_counts.iter()
+        .filter(|(k, _)| k.is_some())
+        .max_by_key(|(_, v)| *v)
+        .map(|(k, _)| k.unwrap());
+
+    let mut anomalies = Vec::new();
+    
+    for (i, cluster_id) in clusters.iter().enumerate() {
+        let profile = &profiles[i];
+        let mut suspicious_count = 0;
+        let mut anomalous_features = Vec::new();
+        let mut has_genuine_risk = false;
+
+        for (sig, count) in &profile.counts {
+            // RISK CHECK: Is this file access dangerous?
+            let is_behavioral_risk = sig.is_suspicious_path;
+            let is_system_directory = sig.path.contains("/etc") || sig.path.contains("/bin") || sig.path.contains("/sbin");
+            let is_root_access = sig.uid == 0 && !sig.path.starts_with("/proc") && !sig.path.starts_with("/sys");
+            
+            if is_behavioral_risk || is_system_directory || is_root_access {
+                suspicious_count += *count;
+                has_genuine_risk = true;
+                
+                if is_system_directory {
+                    anomalous_features.push(format!("RISK DETECTED: system directory access {}", sig.path));
+                } else if sig.is_suspicious_path {
+                    anomalous_features.push(format!("RISK DETECTED: suspicious file access {}", sig.path));
+                } else if is_root_access {
+                    anomalous_features.push(format!("RISK DETECTED: root access to {}", sig.path));
+                }
+            }
+            
+            // Still check for statistical rarity
+            let doc_count = profiles.iter().filter(|p| p.counts.contains_key(sig)).count();
+            if doc_count == 1 { 
+                anomalous_features.push(format!("Rare file access: {}", sig.path));
+            }
+        }
+
+        // --- DETECTION LOGIC (same as process detection) ---
+        let is_noise = cluster_id.is_none();
+        let is_minority = cluster_id.is_some() && cluster_id.unwrap() != largest_cluster.unwrap_or(999);
+        
+        // Flag if (Statistical Outlier) OR (Behavioral Risk)
+        if is_noise || is_minority || has_genuine_risk {
+            // Determine severity based on WHY it was flagged
+            let severity = if has_genuine_risk {
+                // If it has risky file access, it's Critical/High regardless of clustering
+                if suspicious_count > 5 { AnomalyLevel::Critical } else { AnomalyLevel::High }
+            } else {
+                // If just a statistical outlier (Noise), it's Medium
+                AnomalyLevel::Medium 
+            };
+
+            anomalies.push(AnomalyDetails {
+                machine_id: profile.id.clone(),
+                severity,
+                distance_score: if is_noise { 1.5 } else { 0.8 }, // Manual score override
+                cluster_assignment: *cluster_id,
+                anomalous_features, // Now includes "RISK DETECTED" tags
+                process_count: profile.total_logs, // Reuse field name for file count
+                suspicious_process_count: suspicious_count, // Reuse field name for suspicious file count
+            });
+        }
+    }
+
+    Ok(AnalysisReport {
+        anomalies, cluster_stats: cluster_counts, total_analyzed: n_samples, config_used: config.clone(),
     })
 }
 
@@ -2161,6 +2460,92 @@ pub fn load_json_data(path: &str, config: &DetectionConfig) -> Result<Vec<Machin
 
     println!("• Loaded {} process entries from JSON", entries.len());
     Ok(build_profiles(entries, config))
+}
+
+/// Load file access data from CSV file
+pub fn load_files_csv_data(path: &str, config: &DetectionConfig) -> Result<Vec<MachineFileProfile>, Box<dyn Error>> {
+    if !Path::new(path).exists() {
+        return Err(format!("Input file not found: '{}'", path).into());
+    }
+    
+    let metadata = fs::metadata(path)?;
+    if metadata.len() == 0 {
+        return Err(format!("Input file is empty: '{}'", path).into());
+    }
+
+    let mut rdr = csv::Reader::from_path(path)?;
+    let entries: Vec<RawFileEntry> = rdr.deserialize()
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if entries.is_empty() {
+        return Err(format!("No valid file access logs found in '{}'.", path).into());
+    }
+
+    Ok(build_file_profiles(entries, config))
+}
+
+/// Load file access data from JSON file
+/// Supports JSON arrays, NDJSON (newline-delimited JSON), and single JSON objects
+pub fn load_files_json_data(path: &str, config: &DetectionConfig) -> Result<Vec<MachineFileProfile>, Box<dyn Error>> {
+    if !Path::new(path).exists() {
+        return Err(format!("Input file not found: '{}'", path).into());
+    }
+    
+    let metadata = fs::metadata(path)?;
+    if metadata.len() == 0 {
+        return Err(format!("Input file is empty: '{}'", path).into());
+    }
+
+    // Read the entire file content
+    let content = fs::read_to_string(path)?;
+    
+    // Parse JSON logs (supports arrays, NDJSON, and single objects)
+    let entries = parse_files_json_logs(&content)?;
+
+    if entries.is_empty() {
+        return Err(format!("No valid file access logs found in '{}'.", path).into());
+    }
+
+    println!("• Loaded {} file access entries from JSON", entries.len());
+    Ok(build_file_profiles(entries, config))
+}
+
+/// Parse file access logs from JSON string
+/// Supports JSON arrays, NDJSON (newline-delimited JSON), and single JSON objects
+fn parse_files_json_logs(content: &str) -> Result<Vec<RawFileEntry>, Box<dyn Error>> {
+    let trimmed = content.trim();
+    
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    
+    // Try parsing as JSON array first
+    if let Ok(entries) = serde_json::from_str::<Vec<RawFileEntry>>(trimmed) {
+        return Ok(entries);
+    }
+    
+    // Try parsing as single object
+    if let Ok(entry) = serde_json::from_str::<RawFileEntry>(trimmed) {
+        return Ok(vec![entry]);
+    }
+    
+    // Try parsing as NDJSON (newline-delimited JSON)
+    let mut entries = Vec::new();
+    for line in trimmed.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        
+        match serde_json::from_str::<RawFileEntry>(line) {
+            Ok(entry) => entries.push(entry),
+            Err(e) => {
+                eprintln!("Warning: Failed to parse JSON line: {} - {}", line, e);
+            }
+        }
+    }
+    
+    Ok(entries)
 }
 
 pub fn generate_mock_data(config: &DetectionConfig) -> Vec<MachineProfile> {
