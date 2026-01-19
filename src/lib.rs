@@ -547,11 +547,18 @@ impl AnomalyDetails {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AnalysisType {
+    Process,
+    File,
+}
+
 pub struct AnalysisReport {
     pub anomalies: Vec<AnomalyDetails>,
     pub cluster_stats: HashMap<Option<usize>, usize>,
     pub total_analyzed: usize,
     pub config_used: DetectionConfig,
+    pub analysis_type: AnalysisType,
 }
 
 impl AnalysisReport {
@@ -592,12 +599,14 @@ impl AnalysisReport {
             println!("  Noise (Outliers): {} machines ({:.1}%)", noise_count, pct);
         }
 
+        let entity_name = if self.analysis_type == AnalysisType::File { "file accesses" } else { "processes" };
+        
         if self.anomalies.is_empty() {
             println!("\n{:=^80}", "");
             println!("Status: ✅ CLEAN (No anomalies detected)");
             println!("{:=^80}", "");
             println!("\nAll machines appear to be operating normally.");
-            println!("No suspicious processes or unusual behavior patterns detected.");
+            println!("No suspicious {} or unusual behavior patterns detected.", entity_name);
         } else {
             println!("\n{:=^80}", "");
             println!("Status: 🚨 ANOMALIES DETECTED");
@@ -670,10 +679,17 @@ impl AnalysisReport {
             
             println!("\n{:=^80}", "");
             println!("Recommended Actions:");
-            println!("  1. Review flagged machines and investigate anomalous processes");
-            println!("  2. Check process execution paths and command arguments");
-            println!("  3. Verify parent-child process relationships");
-            println!("  4. Cross-reference with network logs and file access logs");
+            if self.analysis_type == AnalysisType::File {
+                println!("  1. Review flagged machines and investigate anomalous file accesses");
+                println!("  2. Check file access paths and user permissions");
+                println!("  3. Verify file access patterns and system directory access");
+                println!("  4. Cross-reference with process logs and network logs");
+            } else {
+                println!("  1. Review flagged machines and investigate anomalous processes");
+                println!("  2. Check process execution paths and command arguments");
+                println!("  3. Verify parent-child process relationships");
+                println!("  4. Cross-reference with network logs and file access logs");
+            }
             println!("  5. Export detailed report: cargo run --bin ironsift -- --export-json");
             println!("{:=^80}", "");
         }
@@ -694,15 +710,21 @@ impl AnalysisReport {
             println!("     ├─ Cluster: Noise (isolated outlier)");
         }
         
-        // Process counts
-        println!("     ├─ Total processes: {}", anomaly.process_count);
+        // Entity counts (processes or file accesses)
+        let entity_label = if self.analysis_type == AnalysisType::File { "file accesses" } else { "processes" };
+        println!("     ├─ Total {}: {}", entity_label, anomaly.process_count);
         if anomaly.suspicious_process_count > 0 {
-            println!("     ├─ Suspicious processes: {} ⚠️", anomaly.suspicious_process_count);
+            println!("     ├─ Suspicious {}: {} ⚠️", entity_label, anomaly.suspicious_process_count);
         }
         
         // Anomalous features
         if !anomaly.anomalous_features.is_empty() {
-            println!("     ├─ Rare processes (< 5% of fleet):");
+            let rare_label = if self.analysis_type == AnalysisType::File { 
+                "Rare file accesses (< 5% of fleet):" 
+            } else { 
+                "Rare processes (< 5% of fleet):" 
+            };
+            println!("     ├─ {}", rare_label);
             let display_count = anomaly.anomalous_features.len().min(5);
             for feature in &anomaly.anomalous_features[..display_count] {
                 println!("     │  • {}", feature);
@@ -726,7 +748,12 @@ impl AnalysisReport {
                 }
             }
         } else {
-            println!("     └─ Run with profiles for detailed process information");
+            let info_label = if self.analysis_type == AnalysisType::File {
+                "file access information"
+            } else {
+                "process information"
+            };
+            println!("     └─ Run with profiles for detailed {}", info_label);
         }
     }
     
@@ -988,6 +1015,7 @@ pub fn analyze_fleet(profiles: &[MachineProfile], config: &DetectionConfig) -> R
     if profiles.is_empty() {
         return Ok(AnalysisReport {
             anomalies: vec![], cluster_stats: HashMap::new(), total_analyzed: 0, config_used: config.clone(),
+            analysis_type: AnalysisType::Process,
         });
     }
 
@@ -1095,6 +1123,7 @@ pub fn analyze_fleet(profiles: &[MachineProfile], config: &DetectionConfig) -> R
 
     Ok(AnalysisReport {
         anomalies, cluster_stats: cluster_counts, total_analyzed: n_samples, config_used: config.clone(),
+        analysis_type: AnalysisType::Process,
     })
 }
 
@@ -1105,6 +1134,7 @@ pub fn analyze_fleet2(profiles: &[MachineProfile], config: &DetectionConfig) -> 
             cluster_stats: HashMap::new(),
             total_analyzed: 0,
             config_used: config.clone(),
+            analysis_type: AnalysisType::Process,
         });
     }
 
@@ -1250,6 +1280,7 @@ pub fn analyze_fleet2(profiles: &[MachineProfile], config: &DetectionConfig) -> 
         cluster_stats: cluster_counts,
         total_analyzed: n_samples,
         config_used: config.clone(),
+        analysis_type: AnalysisType::Process,
     })
 }
 
@@ -1358,6 +1389,7 @@ pub fn analyze_files_fleet(profiles: &[MachineFileProfile], config: &DetectionCo
     if profiles.is_empty() {
         return Ok(AnalysisReport {
             anomalies: vec![], cluster_stats: HashMap::new(), total_analyzed: 0, config_used: config.clone(),
+            analysis_type: AnalysisType::Process,
         });
     }
 
@@ -1472,6 +1504,7 @@ pub fn analyze_files_fleet(profiles: &[MachineFileProfile], config: &DetectionCo
 
     Ok(AnalysisReport {
         anomalies, cluster_stats: cluster_counts, total_analyzed: n_samples, config_used: config.clone(),
+        analysis_type: AnalysisType::File,
     })
 }
 
