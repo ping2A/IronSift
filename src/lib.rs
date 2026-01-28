@@ -187,6 +187,9 @@ pub struct RawFileEntry {
     pub uid: u32,
     #[serde(default)]
     pub timestamp: Option<String>,
+    /// File modification time - used to detect recently modified files or mtime anomalies
+    #[serde(default)]
+    pub mtime: Option<String>,
 }
 
 /// Flexible process entry that doesn't require PIDs upfront
@@ -360,11 +363,17 @@ pub struct FileSignature {
     pub path: String,
     pub uid: u32,
     pub is_suspicious_path: bool,
+    /// Flag indicating if this file has an anomalous modification time
+    #[serde(default)]
+    pub has_mtime_anomaly: bool,
+    /// Flag indicating if this file was recently modified (within 24h of access)
+    #[serde(default)]
+    pub recently_modified: bool,
 }
 
 impl FileSignature {
     /// Create a human-readable description of why this file access is suspicious
-    pub fn risk_factors(&self, config: &DetectionConfig) -> Vec<String> {
+    pub fn risk_factors(&self, _config: &DetectionConfig) -> Vec<String> {
         let mut factors = Vec::new();
         
         if self.is_suspicious_path {
@@ -381,6 +390,14 @@ impl FileSignature {
         
         if self.uid == 0 && !self.path.starts_with("/proc") && !self.path.starts_with("/sys") {
             factors.push(format!("Root user accessed: {}", self.path));
+        }
+        
+        if self.has_mtime_anomaly {
+            factors.push(format!("MTIME ANOMALY: file modification time differs from fleet baseline"));
+        }
+        
+        if self.recently_modified {
+            factors.push(format!("RECENTLY MODIFIED: file was modified shortly before access"));
         }
         
         factors
@@ -437,6 +454,8 @@ pub struct MachineFileProfile {
     pub total_logs: u32,
     pub first_seen: Option<DateTime<Utc>>,
     pub last_seen: Option<DateTime<Utc>>,
+    /// Track modification times per file path for cross-fleet comparison
+    pub file_mtimes: HashMap<String, DateTime<Utc>>,
 }
 
 impl MachineFileProfile {
@@ -447,12 +466,18 @@ impl MachineFileProfile {
             total_logs: 0,
             first_seen: None,
             last_seen: None,
+            file_mtimes: HashMap::new(),
         }
     }
 
-    pub fn add_file(&mut self, sig: FileSignature, timestamp: Option<DateTime<Utc>>) {
-        *self.counts.entry(sig).or_insert(0) += 1;
+    pub fn add_file(&mut self, sig: FileSignature, timestamp: Option<DateTime<Utc>>, mtime: Option<DateTime<Utc>>) {
+        *self.counts.entry(sig.clone()).or_insert(0) += 1;
         self.total_logs += 1;
+        
+        // Track modification time for this file path
+        if let Some(mt) = mtime {
+            self.file_mtimes.insert(sig.path.clone(), mt);
+        }
         
         // Track time range
         if let Some(ts) = timestamp {
@@ -1338,10 +1363,25 @@ pub fn build_file_profiles(entries: Vec<RawFileEntry>, config: &DetectionConfig)
                     .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
                     .map(|dt| dt.with_timezone(&Utc));
                 
+                // Parse modification time
+                let mtime = entry.mtime.as_ref()
+                    .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+                    .map(|dt| dt.with_timezone(&Utc));
+                
+                // Check if file was recently modified (within 24h of access time)
+                let recently_modified = if let (Some(ts), Some(mt)) = (timestamp, mtime) {
+                    let diff = ts.signed_duration_since(mt);
+                    diff.num_hours().abs() < 24
+                } else {
+                    false
+                };
+                
                 let sig = FileSignature {
                     path: entry.path.clone(),
                     uid: entry.uid,
                     is_suspicious_path: path_is_suspicious,
+                    has_mtime_anomaly: false,  // Will be set later in analyze_files_fleet
+                    recently_modified,
                 };
                 
                 // Track if this is a new unique file signature
@@ -1357,6 +1397,7 @@ pub fn build_file_profiles(entries: Vec<RawFileEntry>, config: &DetectionConfig)
                             "SYSTEM_DIRECTORY" 
                         } else { "" },
                         if entry.uid == 0 { "ROOT_ACCESS" } else { "" },
+                        if recently_modified { "RECENTLY_MODIFIED" } else { "" },
                     ].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>();
                     
                     let risk_str = if risk_flags.is_empty() {
@@ -1369,7 +1410,7 @@ pub fn build_file_profiles(entries: Vec<RawFileEntry>, config: &DetectionConfig)
                         machine_id, entry.path, entry.uid, risk_str);
                 }
                 
-                profile.add_file(sig, timestamp);
+                profile.add_file(sig, timestamp, mtime);
             }
             
             profile
@@ -1389,8 +1430,73 @@ pub fn analyze_files_fleet(profiles: &[MachineFileProfile], config: &DetectionCo
     if profiles.is_empty() {
         return Ok(AnalysisReport {
             anomalies: vec![], cluster_stats: HashMap::new(), total_analyzed: 0, config_used: config.clone(),
-            analysis_type: AnalysisType::Process,
+            analysis_type: AnalysisType::File,
         });
+    }
+
+    // --- MTIME ANOMALY DETECTION ---
+    // Build fleet-wide mtime baseline for each file path
+    // Files present on multiple machines should have consistent modification times
+    // A machine with a significantly different mtime is suspicious
+    
+    let mut file_mtimes_fleet: HashMap<String, Vec<(usize, DateTime<Utc>)>> = HashMap::new();
+    for (i, profile) in profiles.iter().enumerate() {
+        for (path, mtime) in &profile.file_mtimes {
+            file_mtimes_fleet.entry(path.clone())
+                .or_insert_with(Vec::new)
+                .push((i, *mtime));
+        }
+    }
+    
+    // For files present on multiple machines, find mtime anomalies
+    // Anomaly: mtime differs by more than 1 day from the majority
+    let mut mtime_anomaly_machines: HashSet<usize> = HashSet::new();
+    let mut mtime_anomaly_details: HashMap<usize, Vec<String>> = HashMap::new();
+    
+    for (path, machine_mtimes) in &file_mtimes_fleet {
+        // Only check files present on multiple machines (at least 3)
+        if machine_mtimes.len() < 3 {
+            continue;
+        }
+        
+        // Find the median mtime
+        let mut sorted_mtimes: Vec<DateTime<Utc>> = machine_mtimes.iter().map(|(_, mt)| *mt).collect();
+        sorted_mtimes.sort();
+        let median_mtime = sorted_mtimes[sorted_mtimes.len() / 2];
+        
+        // Check each machine against the median
+        for (machine_idx, mtime) in machine_mtimes {
+            let diff = mtime.signed_duration_since(median_mtime);
+            let diff_hours = diff.num_hours().abs();
+            
+            // If mtime differs by more than 24 hours from median, it's suspicious
+            if diff_hours > 24 {
+                mtime_anomaly_machines.insert(*machine_idx);
+                let detail = if diff.num_hours() > 0 {
+                    format!("MTIME ANOMALY: {} modified {}h NEWER than fleet baseline", path, diff_hours)
+                } else {
+                    format!("MTIME ANOMALY: {} modified {}h OLDER than fleet baseline", path, diff_hours)
+                };
+                mtime_anomaly_details.entry(*machine_idx)
+                    .or_insert_with(Vec::new)
+                    .push(detail);
+            }
+        }
+    }
+    
+    // --- RECENTLY MODIFIED FILE DETECTION ---
+    let mut recently_modified_machines: HashSet<usize> = HashSet::new();
+    let mut recently_modified_details: HashMap<usize, Vec<String>> = HashMap::new();
+    
+    for (i, profile) in profiles.iter().enumerate() {
+        for sig in profile.counts.keys() {
+            if sig.recently_modified {
+                recently_modified_machines.insert(i);
+                recently_modified_details.entry(i)
+                    .or_insert_with(Vec::new)
+                    .push(format!("RECENTLY MODIFIED: {} was modified within 24h of access", sig.path));
+            }
+        }
     }
 
     // 1. Feature Extraction
@@ -1399,7 +1505,7 @@ pub fn analyze_files_fleet(profiles: &[MachineFileProfile], config: &DetectionCo
         for key in p.counts.keys() { unique_features.insert(key); }
     }
     
-    let mut feature_list: Vec<&FileSignature> = unique_features.into_iter().collect();
+    let feature_list: Vec<&FileSignature> = unique_features.into_iter().collect();
     let n_samples = profiles.len();
     let n_features = feature_list.len();
 
@@ -1445,9 +1551,27 @@ pub fn analyze_files_fleet(profiles: &[MachineFileProfile], config: &DetectionCo
     
     for (i, cluster_id) in clusters.iter().enumerate() {
         let profile = &profiles[i];
-        let mut suspicious_count = 0;
+        let mut suspicious_count = 0u32;
         let mut anomalous_features = Vec::new();
         let mut has_genuine_risk = false;
+
+        // Add mtime anomaly details for this machine
+        if let Some(mtime_details) = mtime_anomaly_details.get(&i) {
+            for detail in mtime_details {
+                anomalous_features.push(detail.clone());
+            }
+            has_genuine_risk = true;
+            suspicious_count += mtime_details.len() as u32;
+        }
+        
+        // Add recently modified file details
+        if let Some(recent_details) = recently_modified_details.get(&i) {
+            for detail in recent_details {
+                anomalous_features.push(detail.clone());
+            }
+            has_genuine_risk = true;
+            suspicious_count += recent_details.len() as u32;
+        }
 
         for (sig, count) in &profile.counts {
             // RISK CHECK: Is this file access dangerous?
@@ -1475,16 +1599,27 @@ pub fn analyze_files_fleet(profiles: &[MachineFileProfile], config: &DetectionCo
             }
         }
 
-        // --- DETECTION LOGIC (same as process detection) ---
+        // --- DETECTION LOGIC ---
         let is_noise = cluster_id.is_none();
         let is_minority = cluster_id.is_some() && cluster_id.unwrap() != largest_cluster.unwrap_or(999);
+        let has_mtime_anomaly = mtime_anomaly_machines.contains(&i);
+        let has_recently_modified = recently_modified_machines.contains(&i);
         
-        // Flag if (Statistical Outlier) OR (Behavioral Risk)
-        if is_noise || is_minority || has_genuine_risk {
+        // Flag if (Statistical Outlier) OR (Behavioral Risk) OR (Mtime Anomaly)
+        if is_noise || is_minority || has_genuine_risk || has_mtime_anomaly || has_recently_modified {
             // Determine severity based on WHY it was flagged
-            let severity = if has_genuine_risk {
+            let severity = if has_mtime_anomaly {
+                // Mtime anomaly is highly suspicious - likely tampered file
+                AnomalyLevel::Critical
+            } else if has_recently_modified && has_genuine_risk {
+                // Recently modified + other risks = Critical
+                AnomalyLevel::Critical
+            } else if has_genuine_risk {
                 // If it has risky file access, it's Critical/High regardless of clustering
                 if suspicious_count > 5 { AnomalyLevel::Critical } else { AnomalyLevel::High }
+            } else if has_recently_modified {
+                // Recently modified alone is Medium-High
+                AnomalyLevel::High
             } else {
                 // If just a statistical outlier (Noise), it's Medium
                 AnomalyLevel::Medium 
@@ -1493,11 +1628,11 @@ pub fn analyze_files_fleet(profiles: &[MachineFileProfile], config: &DetectionCo
             anomalies.push(AnomalyDetails {
                 machine_id: profile.id.clone(),
                 severity,
-                distance_score: if is_noise { 1.5 } else { 0.8 }, // Manual score override
+                distance_score: if has_mtime_anomaly { 2.0 } else if is_noise { 1.5 } else { 0.8 },
                 cluster_assignment: *cluster_id,
-                anomalous_features, // Now includes "RISK DETECTED" tags
-                process_count: profile.total_logs, // Reuse field name for file count
-                suspicious_process_count: suspicious_count, // Reuse field name for suspicious file count
+                anomalous_features,
+                process_count: profile.total_logs,
+                suspicious_process_count: suspicious_count,
             });
         }
     }

@@ -2837,18 +2837,21 @@ fn test_build_file_profiles() {
             path: "/etc/passwd".to_string(),
             uid: 1000,
             timestamp: None,
+            mtime: None,
         },
         RawFileEntry {
             machine_id: "server1".to_string(),
             path: "/var/log/syslog".to_string(),
             uid: 1000,
             timestamp: None,
+            mtime: None,
         },
         RawFileEntry {
             machine_id: "server2".to_string(),
             path: "/etc/passwd".to_string(),
             uid: 1000,
             timestamp: None,
+            mtime: None,
         },
     ];
     
@@ -2877,12 +2880,14 @@ fn test_file_signature_uniqueness() {
             path: "/etc/passwd".to_string(),
             uid: 1000,
             timestamp: None,
+            mtime: None,
         },
         RawFileEntry {
             machine_id: "server1".to_string(),
             path: "/etc/passwd".to_string(),
             uid: 0,  // Root user
             timestamp: None,
+            mtime: None,
         },
         // Same file, same UID should be counted together
         RawFileEntry {
@@ -2890,6 +2895,7 @@ fn test_file_signature_uniqueness() {
             path: "/etc/passwd".to_string(),
             uid: 1000,
             timestamp: None,
+            mtime: None,
         },
     ];
     
@@ -2931,12 +2937,14 @@ fn test_file_suspicious_path_detection() {
             path: "/tmp/suspicious_file".to_string(),
             uid: 1000,
             timestamp: None,
+            mtime: None,
         },
         RawFileEntry {
             machine_id: "server1".to_string(),
             path: "/home/user/normal_file".to_string(),
             uid: 1000,
             timestamp: None,
+            mtime: None,
         },
     ];
     
@@ -2973,12 +2981,14 @@ fn test_file_whitelisting() {
             path: "/tmp/suspicious".to_string(),
             uid: 1000,
             timestamp: None,
+            mtime: None,
         },
         RawFileEntry {
             machine_id: "server1".to_string(),
             path: "/tmp/legitimate/file".to_string(),
             uid: 1000,
             timestamp: None,
+            mtime: None,
         },
     ];
     
@@ -3012,18 +3022,21 @@ fn test_analyze_files_fleet() {
             path: "/etc/passwd".to_string(),
             uid: 1000,
             timestamp: None,
+            mtime: None,
         });
         entries.push(RawFileEntry {
             machine_id: machine_id.clone(),
             path: "/var/log/syslog".to_string(),
             uid: 1000,
             timestamp: None,
+            mtime: None,
         });
         entries.push(RawFileEntry {
             machine_id: machine_id.clone(),
             path: "/home/user/docs".to_string(),
             uid: 1000,
             timestamp: None,
+            mtime: None,
         });
     }
     
@@ -3033,12 +3046,14 @@ fn test_analyze_files_fleet() {
         path: "/tmp/malware".to_string(),
         uid: 0,
         timestamp: None,
+        mtime: None,
     });
     entries.push(RawFileEntry {
         machine_id: "compromised".to_string(),
         path: "/etc/shadow".to_string(),
         uid: 0,  // Root accessing shadow
         timestamp: None,
+        mtime: None,
     });
     
     let profiles = build_file_profiles(entries, &config);
@@ -3067,6 +3082,7 @@ fn test_file_risk_factors() {
             path: "/tmp/suspicious".to_string(),
             uid: 1000,
             timestamp: None,
+            mtime: None,
         },
         // System directory access
         RawFileEntry {
@@ -3074,6 +3090,7 @@ fn test_file_risk_factors() {
             path: "/etc/shadow".to_string(),
             uid: 1000,
             timestamp: None,
+            mtime: None,
         },
         // Root access
         RawFileEntry {
@@ -3081,6 +3098,7 @@ fn test_file_risk_factors() {
             path: "/home/user/file".to_string(),
             uid: 0,
             timestamp: None,
+            mtime: None,
         },
     ];
     
@@ -3119,24 +3137,28 @@ fn test_file_system_directory_detection() {
             path: "/etc/passwd".to_string(),
             uid: 1000,
             timestamp: None,
+            mtime: None,
         },
         RawFileEntry {
             machine_id: "server1".to_string(),
             path: "/bin/ls".to_string(),
             uid: 1000,
             timestamp: None,
+            mtime: None,
         },
         RawFileEntry {
             machine_id: "server1".to_string(),
             path: "/sbin/ifconfig".to_string(),
             uid: 1000,
             timestamp: None,
+            mtime: None,
         },
         RawFileEntry {
             machine_id: "server1".to_string(),
             path: "/home/user/file".to_string(),
             uid: 1000,
             timestamp: None,
+            mtime: None,
         },
     ];
     
@@ -3170,24 +3192,28 @@ fn test_file_root_access_detection() {
             path: "/home/user/file".to_string(),
             uid: 0,  // Root
             timestamp: None,
+            mtime: None,
         },
         RawFileEntry {
             machine_id: "server1".to_string(),
             path: "/proc/cpuinfo".to_string(),
             uid: 0,  // Root accessing /proc (should not be flagged)
             timestamp: None,
+            mtime: None,
         },
         RawFileEntry {
             machine_id: "server1".to_string(),
             path: "/sys/kernel".to_string(),
             uid: 0,  // Root accessing /sys (should not be flagged)
             timestamp: None,
+            mtime: None,
         },
         RawFileEntry {
             machine_id: "server1".to_string(),
             path: "/home/user/file".to_string(),
             uid: 1000,  // Normal user
             timestamp: None,
+            mtime: None,
         },
     ];
     
@@ -3226,12 +3252,14 @@ fn test_file_rare_file_detection() {
             path: "/etc/passwd".to_string(),
             uid: 1000,
             timestamp: None,
+            mtime: None,
         });
         entries.push(RawFileEntry {
             machine_id: machine_id.clone(),
             path: "/var/log/syslog".to_string(),
             uid: 1000,
             timestamp: None,
+            mtime: None,
         });
     }
     
@@ -3241,6 +3269,7 @@ fn test_file_rare_file_detection() {
         path: "/unusual/path/file".to_string(),
         uid: 1000,
         timestamp: None,
+        mtime: None,
     });
     
     let profiles = build_file_profiles(entries, &config);
@@ -3257,4 +3286,131 @@ fn test_file_rare_file_detection() {
     }
     
     println!("✅ Rare file detection test passed!");
+}
+
+#[test]
+fn test_file_mtime_anomaly_detection() {
+    println!("\n🧪 Testing file modification time anomaly detection");
+    
+    let config = DetectionConfig::default();
+    
+    // Baseline mtime: 60 days ago
+    let baseline = Utc::now() - chrono::Duration::days(60);
+    let baseline_str = baseline.to_rfc3339();
+    
+    // Access time: now
+    let access_time = Utc::now();
+    let access_str = access_time.to_rfc3339();
+    
+    // Recent mtime: 2 hours ago (anomalous)
+    let recent = Utc::now() - chrono::Duration::hours(2);
+    let recent_str = recent.to_rfc3339();
+    
+    // Create 5 normal machines with consistent mtime
+    let mut entries = Vec::new();
+    for i in 0..5 {
+        let machine_id = format!("normal_{}", i);
+        entries.push(RawFileEntry {
+            machine_id: machine_id.clone(),
+            path: "/etc/passwd".to_string(),
+            uid: 1000,
+            timestamp: Some(access_str.clone()),
+            mtime: Some(baseline_str.clone()),  // Consistent mtime
+        });
+        entries.push(RawFileEntry {
+            machine_id: machine_id.clone(),
+            path: "/var/log/syslog".to_string(),
+            uid: 1000,
+            timestamp: Some(access_str.clone()),
+            mtime: Some(baseline_str.clone()),
+        });
+    }
+    
+    // One compromised machine with recently modified /etc/passwd
+    entries.push(RawFileEntry {
+        machine_id: "compromised".to_string(),
+        path: "/etc/passwd".to_string(),
+        uid: 1000,
+        timestamp: Some(access_str.clone()),
+        mtime: Some(recent_str.clone()),  // Anomalous: recently modified
+    });
+    entries.push(RawFileEntry {
+        machine_id: "compromised".to_string(),
+        path: "/var/log/syslog".to_string(),
+        uid: 1000,
+        timestamp: Some(access_str.clone()),
+        mtime: Some(baseline_str.clone()),  // Normal
+    });
+    
+    let profiles = build_file_profiles(entries, &config);
+    let report = analyze_files_fleet(&profiles, &config).unwrap();
+    
+    // Should detect the compromised machine due to mtime anomaly
+    assert!(!report.anomalies.is_empty(), "Should detect mtime anomaly");
+    let compromised = report.anomalies.iter().find(|a| a.machine_id == "compromised");
+    assert!(compromised.is_some(), "Compromised machine should be flagged");
+    
+    // Check that mtime anomaly is mentioned
+    if let Some(anomaly) = compromised {
+        let has_mtime_anomaly = anomaly.anomalous_features.iter()
+            .any(|f| f.contains("MTIME ANOMALY"));
+        assert!(has_mtime_anomaly, "Should mention MTIME ANOMALY: {:?}", anomaly.anomalous_features);
+    }
+    
+    println!("✅ MTIME anomaly detection test passed!");
+}
+
+#[test]
+fn test_file_recently_modified_detection() {
+    println!("\n🧪 Testing recently modified file detection");
+    
+    let config = DetectionConfig::default();
+    
+    // Access time: now
+    let access_time = Utc::now();
+    let access_str = access_time.to_rfc3339();
+    
+    // Old mtime: 30 days ago (normal)
+    let old_mtime = Utc::now() - chrono::Duration::days(30);
+    let old_mtime_str = old_mtime.to_rfc3339();
+    
+    // Recent mtime: 6 hours ago (recently modified - within 24h)
+    let recent_mtime = Utc::now() - chrono::Duration::hours(6);
+    let recent_mtime_str = recent_mtime.to_rfc3339();
+    
+    let entries = vec![
+        // Normal file - modified long ago
+        RawFileEntry {
+            machine_id: "server1".to_string(),
+            path: "/etc/passwd".to_string(),
+            uid: 1000,
+            timestamp: Some(access_str.clone()),
+            mtime: Some(old_mtime_str.clone()),
+        },
+        // Recently modified file - suspicious
+        RawFileEntry {
+            machine_id: "server1".to_string(),
+            path: "/etc/shadow".to_string(),
+            uid: 1000,
+            timestamp: Some(access_str.clone()),
+            mtime: Some(recent_mtime_str.clone()),
+        },
+    ];
+    
+    let profiles = build_file_profiles(entries, &config);
+    let profile = &profiles[0];
+    
+    // Check that recently_modified flag is set correctly
+    let old_file = profile.counts.keys().find(|s| s.path == "/etc/passwd");
+    let recent_file = profile.counts.keys().find(|s| s.path == "/etc/shadow");
+    
+    assert!(old_file.is_some());
+    assert!(recent_file.is_some());
+    
+    assert!(!old_file.unwrap().recently_modified, 
+        "Old file should not be flagged as recently modified");
+    assert!(recent_file.unwrap().recently_modified, 
+        "Recent file should be flagged as recently modified");
+    
+    println!("✅ Recently modified file detection test passed!");
 }

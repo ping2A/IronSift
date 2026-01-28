@@ -1,4 +1,5 @@
-# IronSift 🔍🛡️
+<p align="center"><img width="240" src="./.github/logo.png"></p>
+<h2 align="center">IronSift 🔍🛡️</h2>
 
 > **"Where's Waldo?" for Cybersecurity** — Fleet-wide anomaly detection powered by unsupervised machine learning.
 

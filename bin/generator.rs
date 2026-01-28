@@ -454,8 +454,12 @@ fn generate_file_entries() -> Result<Vec<RawFileEntry>, Box<dyn Error>> {
     
     // Start time: 7 days ago
     let mut current_time = Utc::now() - Duration::days(7);
+    
+    // Baseline modification times for common files (30-90 days ago)
+    // These represent the "expected" mtimes for files across the fleet
+    let baseline_mtime = Utc::now() - Duration::days(60);
 
-    // Define normal file paths
+    // Define normal file paths with their baseline mtimes
     let normal_files = vec![
         "/etc/passwd",
         "/etc/group",
@@ -488,19 +492,22 @@ fn generate_file_entries() -> Result<Vec<RawFileEntry>, Box<dyn Error>> {
     ];
 
     println!("File Generation Scenario Overview:");
-    println!("  🔹 14 clean machines (normal file access)");
+    println!("  🔹 12 clean machines (normal file access, consistent mtimes)");
     println!("  🔸 2 machines with suspicious file access (machine_003, machine_017)");
     println!("  🔸 1 machine accessing system directories (machine_009)");
     println!("  🔸 1 machine with root file access (machine_006)");
     println!("  🔸 2 machines with rare file patterns (machine_012, machine_015)");
+    println!("  🔸 2 machines with MTIME ANOMALIES (machine_005, machine_014)");
     println!();
     println!("Anomalous Machines Summary:");
     println!("  • machine_003: Suspicious files in /tmp and /dev/shm");
+    println!("  • machine_005: ⏰ MTIME ANOMALY - files modified recently (tampered)");
     println!("  • machine_006: Root access to sensitive files");
     println!("  • machine_009: Access to system configuration files");
     println!("  • machine_012: Rare file access patterns");
+    println!("  • machine_014: ⏰ MTIME ANOMALY - /etc/passwd modified recently");
     println!("  • machine_015: Access to unusual file locations");
-    println!("  • machine_017: Suspicious files in /tmp and /var/tmp");
+    println!("  • machine_017: Suspicious files + recently modified");
     println!();
 
     for i in 0..NUM_MACHINES {
@@ -517,13 +524,35 @@ fn generate_file_entries() -> Result<Vec<RawFileEntry>, Box<dyn Error>> {
             let mut path = normal_files[rng.gen_range(0..normal_files.len())].to_string();
             let mut uid = rng.gen_range(1000..10000);  // Normal user UIDs
             
+            // Default mtime: baseline + small random variation (within hours)
+            // This simulates consistent file mtimes across the fleet
+            let mut mtime = baseline_mtime + Duration::hours(rng.gen_range(-12..12));
+            
             // Inject attack scenarios for specific machines
             
-            // Suspicious files (Machines 3, 17)
+            // MTIME ANOMALY: Machine 5 has files with very recent modification times
+            // This simulates a compromised machine where system files were tampered
+            if i == 5 && rng.gen_bool(0.30) {
+                // Files modified within last 2 days (suspicious!)
+                mtime = current_time - Duration::hours(rng.gen_range(1..48));
+            }
+            
+            // MTIME ANOMALY: Machine 14 has /etc/passwd with recent mtime
+            // This is a classic sign of user tampering
+            if i == 14 && path == "/etc/passwd" {
+                // /etc/passwd modified 6 hours ago on this machine only
+                mtime = current_time - Duration::hours(6);
+            }
+            
+            // Suspicious files (Machines 3, 17) - with recent mtimes
             if (i == 3 || i == 17) && rng.gen_bool(0.20) {
                 path = suspicious_files[rng.gen_range(0..suspicious_files.len())].to_string();
                 if rng.gen_bool(0.30) {
                     uid = 0;  // Some accessed as root
+                }
+                // Suspicious files are recently created
+                if i == 17 {
+                    mtime = current_time - Duration::hours(rng.gen_range(1..24));
                 }
             }
             
@@ -567,11 +596,20 @@ fn generate_file_entries() -> Result<Vec<RawFileEntry>, Box<dyn Error>> {
                 path = rare_files[rng.gen_range(0..rare_files.len())].to_string();
             }
 
+            // Only include mtime for files that would normally have it tracked
+            // (skip /tmp files which are expected to be transient)
+            let mtime_str = if !path.starts_with("/tmp") {
+                Some(mtime.to_rfc3339())
+            } else {
+                None
+            };
+
             entries.push(RawFileEntry {
                 machine_id: machine_id.clone(),
                 path,
                 uid,
                 timestamp: Some(timestamp),
+                mtime: mtime_str,
             });
         }
     }
@@ -601,11 +639,19 @@ fn write_files_json(entries: &[RawFileEntry], path: &str) -> Result<(), Box<dyn 
             writeln!(file, ",")?;
         }
         
-        write!(file, r#"  {{"machine_id": "{}", "path": "{}", "uid": {}, "timestamp": "{}"}}"#,
+        // Include mtime field if present
+        let mtime_str = if let Some(mt) = &entry.mtime {
+            format!(r#", "mtime": "{}""#, mt)
+        } else {
+            String::new()
+        };
+        
+        write!(file, r#"  {{"machine_id": "{}", "path": "{}", "uid": {}, "timestamp": "{}"{}}}"#,
             entry.machine_id,
             entry.path.replace('"', "\\\""),
             entry.uid,
-            entry.timestamp.as_ref().unwrap_or(&"".to_string())
+            entry.timestamp.as_ref().unwrap_or(&"".to_string()),
+            mtime_str
         )?;
     }
     
@@ -645,6 +691,11 @@ fn print_file_detection_instructions(output_file: &str) {
     println!("       • Files: /tmp/malware, /dev/shm/secret, /tmp/.hidden/file");
     println!("       • Risk: Suspicious paths, some root access");
     println!();
+    println!("   💀 machine_005 (MTIME ANOMALY - CRITICAL)");
+    println!("       • Files: System files with recent modification times");
+    println!("       • Risk: Files modified much more recently than fleet baseline");
+    println!("       • Indicates: Possible file tampering or malicious modification");
+    println!();
     println!("   ⚠️  machine_006 (ROOT FILE ACCESS)");
     println!("       • Files: /etc/shadow, /etc/sudoers, /root/.bashrc");
     println!("       • Risk: Root user accessing sensitive files");
@@ -657,16 +708,27 @@ fn print_file_detection_instructions(output_file: &str) {
     println!("       • Files: /opt/unusual/application, /var/custom/data");
     println!("       • Risk: Statistical rarity (unique file access patterns)");
     println!();
+    println!("   💀 machine_014 (MTIME ANOMALY - CRITICAL)");
+    println!("       • Files: /etc/passwd with recent modification time");
+    println!("       • Risk: Critical system file modified recently");
+    println!("       • Indicates: User account tampering or backdoor creation");
+    println!();
     println!("   ⚠️  machine_015 (RARE FILE PATTERNS)");
     println!("       • Files: /home/rare_user/.config, /usr/local/special/bin");
     println!("       • Risk: Statistical rarity (unique file access patterns)");
     println!();
-    println!("   ⚠️  machine_017 (SUSPICIOUS FILES)");
-    println!("       • Files: /tmp/malware, /var/tmp/backdoor, /etc/shadow");
-    println!("       • Risk: Suspicious paths, some root access");
+    println!("   💀 machine_017 (SUSPICIOUS + RECENTLY MODIFIED)");
+    println!("       • Files: /tmp/malware, /var/tmp/backdoor with recent mtime");
+    println!("       • Risk: Suspicious paths + files modified within 24h of access");
+    println!("       • Indicates: Active malware deployment");
     println!();
     println!("💡 TIPS:");
-    println!("   • File analysis focuses on which files are accessed, not how");
+    println!("   • File analysis focuses on which files are accessed and WHEN modified");
+    println!("   • MTIME ANOMALY: Compares file modification times across fleet");
+    println!("       - Same file should have consistent mtime across machines");
+    println!("       - A machine with different mtime indicates tampering");
+    println!("   • RECENTLY MODIFIED: File modified within 24h of access");
+    println!("       - System files shouldn't change frequently");
     println!("   • Configure suspicious_path_patterns in config to flag specific paths");
     println!("   • Use whitelisted_path_patterns to exclude known-good paths");
     println!("   • Root access (UID 0) to non-/proc,/sys files is flagged as risk");
