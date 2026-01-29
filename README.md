@@ -432,13 +432,69 @@ cargo test
 ### Data Flow
 
 ```
-CSV Logs → PID/PPID Resolution → Feature Extraction
-    ↓
-TF-IDF Vectorization → L2 Normalization
-    ↓
-DBSCAN Clustering → Anomaly Scoring
-    ↓
-Report Generation → JSON Export
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                           IRONSIFT PIPELINE                                       │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+  Raw Input                    Profile Building              Analysis
+  ─────────                    ────────────────              ───────
+
+  ┌──────────────┐             ┌─────────────────┐           ┌─────────────────┐
+  │ CSV / JSON   │             │ Group by        │           │ TF-IDF          │
+  │ Process Logs │────────────►│ machine_id      │──────────►│ Vectorization   │
+  │ or File      │   parse     │                 │  build    │ (rare = signal) │
+  │ Access Logs  │             │ Resolve PPID →  │  profiles │                 │
+  └──────────────┘             │ parent names    │           └────────┬────────┘
+         │                     │                 │                    │
+         │                     │ Whitelist /     │                    ▼
+         │                     │ filter paths    │           ┌─────────────────┐
+         └────────────────────►│                 │           │ L2 Normalize    │
+                               └─────────────────┘           │ DBSCAN Cluster  │
+                                                             └────────┬────────┘
+                                                                      │
+                                                                      ▼
+  Output                     ┌─────────────────┐             ┌─────────────────┐
+  ──────                     │ Anomaly Scoring │◄────────────│ Noise = outlier │
+                             │ & Severity      │  cluster    │ Small cluster   │
+  ┌──────────────┐           │ (Critical→Low)  │   ids       │ = minority      │
+  │ Console      │◄──────────┤                 │             │ Large cluster   │
+  │ Report       │  print    └────────┬────────┘             │ = baseline      │
+  └──────────────┘                    │                      └─────────────────┘
+         ▲                            │
+         │                            ▼
+  ┌──────────────┐             ┌─────────────────┐
+  │ forensic_    │◄────────────│ Risk factors    │
+  │ report.json  │  export     │ (entropy, path, │
+  └──────────────┘             │  root, mtime)   │
+                               └─────────────────┘
+```
+
+### Process vs File Analysis
+
+```
+  PROCESS MODE (default)              FILE MODE (--files)
+  ─────────────────────              ───────────────────
+
+  RawLogEntry                         RawFileEntry
+  • machine_id, pid, ppid             • machine_id, path, uid
+  • name, path, args, uid             • timestamp, mtime
+  • timestamp                         
+         │                                    │
+         ▼                                    ▼
+  ProcessSignature                    FileSignature
+  • name + parent + uid + path        • path + uid
+  • is_suspicious_path, entropy       • is_suspicious_path
+         │                            • has_mtime_anomaly
+         ▼                                    │
+  MachineProfile                      MachineFileProfile
+  (counts per process)                (counts per file + mtimes)
+         │                                    │
+         └──────────────┬─────────────────────┘
+                        ▼
+              analyze_fleet / analyze_files_fleet
+                        │
+                        ▼
+              AnalysisReport (anomalies, severity)
 ```
 
 ### Key Algorithms
@@ -465,6 +521,31 @@ IronSift treats each machine as a vector in N-dimensional feature space:
   - Privilege escalation patterns
   - Abnormal parent-child relationships
 
+### Clustering (Conceptual)
+
+```
+    Feature space (simplified 2D view)
+    ─────────────────────────────────
+
+         • • •  • •
+       •   • • •   •          ← Normal machines (tight cluster)
+        • •   • • •
+          • • • •
+              ★                 ← Isolated outlier (NOISE)
+                                → 💀 CRITICAL: likely compromised
+
+                    ◄ ─ ─ ─ ─ ►
+                 small cluster
+                 (minority)        ← 🔴 HIGH: botnet / APT pattern
+                    △ △
+                     △
+
+    DBSCAN: density-based clustering
+    • Points in dense regions → same cluster (baseline).
+    • Points in sparse regions → "noise" = anomaly.
+    • Small clusters → minority = coordinated deviance.
+```
+
 ### Example Detection
 
 **Fleet**: 100 web servers running nginx, postgres, node
@@ -475,10 +556,24 @@ php-fpm (PID 5432, PPID 108 [apache2]) → eval(base64_decode('aGVsbG8gd29ybGQ='
 ```
 
 **IronSift Analysis**:
-1. Resolves parent: PPID 108 → apache2
-2. Computes TF-IDF: This exact process appears on 1/100 machines
-3. IDF boost: 100x signal amplification for this rare event
-4. DBSCAN: Machine #42 is 1.2 units away from main cluster
+
+```
+  Raw log                    Resolution              TF-IDF              DBSCAN
+  ───────                    ──────────              ──────              ──────
+
+  machine_42                 PPID 108    rare        Machine #42         Main cluster
+  pid 5432, ppid 108   ───►  → apache2   process  ──► vector differs  ──► • • • • •
+  name php-fpm               parent      (1/100)     from baseline         •
+  args eval(base64…)         resolved    ▼            ▼                    ★  ← #42
+                                │        IDF boost   distance ≈ 1.2        (outlier)
+                                │        100×        ▼
+                                │                    🔴 HIGH severity
+                                └─────────────────── anomaly
+```
+1. Resolves parent: PPID 108 → apache2  
+2. Computes TF-IDF: This exact process appears on 1/100 machines  
+3. IDF boost: 100× signal amplification for this rare event  
+4. DBSCAN: Machine #42 is 1.2 units away from main cluster  
 5. **Result**: 🔴 HIGH severity anomaly detected
 
 ---
@@ -522,18 +617,6 @@ cargo run --release --bin ironsift -- --tolerance 0.03 --export-json
 # Test detection against custom malware
 ./inject_attack.sh && cargo run --bin ironsift
 ```
-
----
-
-## 🤝 Contributing
-
-We welcome contributions! Areas of interest:
-
-- Additional ML algorithms (Isolation Forest, Autoencoders)
-- Real-time streaming analysis
-- Integration with SIEM platforms
-- Custom feature extractors
-- Enhanced PID tracking and process tree visualization
 
 ---
 
