@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs::{self, File};
 use std::path::Path;
+use log;
 use serde::{Deserialize, Serialize};
 use ndarray::Array2;
 use linfa::traits::Transformer;
@@ -55,6 +56,9 @@ pub struct DetectionConfig {
     /// Processes with paths matching these patterns will not be flagged as suspicious
     /// Examples: "/opt/conda/*", "/usr/local/bin/*", "/home/*/venv/*"
     pub whitelisted_path_patterns: Vec<String>,
+    /// When true, suppress progress and verbose output (for use by scripts/pipelines)
+    #[serde(default)]
+    pub quiet: bool,
 }
 
 impl Default for DetectionConfig {
@@ -103,6 +107,7 @@ impl Default for DetectionConfig {
             debug_display: false,
             exclude_init_children: false,  // Off by default to avoid over-filtering
             whitelisted_path_patterns: vec![],  // Empty by default
+            quiet: false,
         }
     }
 }
@@ -122,45 +127,24 @@ impl DetectionConfig {
         Ok(())
     }
     
-    /// Print comprehensive configuration display
+    /// Print comprehensive configuration display (no-op when quiet)
     pub fn print(&self) {
-        println!("Configuration:");
-        println!("  Core Detection Parameters:");
-        println!("    Entropy Threshold: {:.2}", self.entropy_threshold);
-        println!("    DBSCAN Tolerance: {:.3}", self.dbscan_tolerance);
-        println!("    DBSCAN Min Samples: {}", self.dbscan_min_samples);
-        println!("    Minority Cluster Ratio: {:.1}%", self.minority_cluster_ratio * 100.0);
-        println!("    Normalize Features: {}", self.normalize_features);
-        
-        println!("  Filtering Options:");
-        println!("    Exclude Kernel Threads: {}", self.exclude_kernel_threads);
-        println!("    Exclude Init Children (PPID=1): {}", self.exclude_init_children);
-        println!("    Flag Unexpected Root: {}", self.flag_unexpected_root);
-        println!("    Debug Display: {}", self.debug_display);
-        
+        if self.quiet {
+            return;
+        }
+        log::info!("Configuration: entropy_threshold={:.2}, dbscan_tolerance={:.3}, min_samples={}, minority_ratio={:.1}%, normalize={}",
+            self.entropy_threshold, self.dbscan_tolerance, self.dbscan_min_samples,
+            self.minority_cluster_ratio * 100.0, self.normalize_features);
+        log::info!("Filtering: exclude_kernel_threads={}, exclude_init_children={}, flag_unexpected_root={}, debug_display={}",
+            self.exclude_kernel_threads, self.exclude_init_children, self.flag_unexpected_root, self.debug_display);
         if !self.suspicious_path_patterns.is_empty() {
-            println!("  Suspicious Path Patterns ({}):", self.suspicious_path_patterns.len());
-            for pattern in &self.suspicious_path_patterns {
-                println!("    • {}", pattern);
-            }
+            log::info!("Suspicious path patterns: {} configured", self.suspicious_path_patterns.len());
         }
-        
         if !self.whitelisted_path_patterns.is_empty() {
-            println!("  Whitelisted Path Patterns ({}):", self.whitelisted_path_patterns.len());
-            for pattern in &self.whitelisted_path_patterns {
-                println!("    • {}", pattern);
-            }
+            log::info!("Whitelisted path patterns: {} configured", self.whitelisted_path_patterns.len());
         }
-        
         if !self.common_root_processes.is_empty() {
-            println!("  Common Root Processes ({}):", self.common_root_processes.len());
-            let display_count = self.common_root_processes.len().min(10);
-            for process in self.common_root_processes.iter().take(display_count) {
-                println!("    • {}", process);
-            }
-            if self.common_root_processes.len() > display_count {
-                println!("    ... and {} more", self.common_root_processes.len() - display_count);
-            }
+            log::info!("Common root processes: {} listed", self.common_root_processes.len());
         }
     }
 }
@@ -207,7 +191,7 @@ pub struct ProcessEntry {
 
 impl ProcessEntry {
     pub fn new(machine_id: String, name: String) -> Self {
-        println!("🔧 Creating ProcessEntry: machine={}, name={}", machine_id, name);
+        log::debug!("Creating ProcessEntry: machine={}, name={}", machine_id, name);
         Self {
             machine_id,
             name,
@@ -242,7 +226,7 @@ impl ProcessEntry {
     pub fn from_command_line(machine_id: String, command: &str, parent: Option<&str>) -> Self {
         let (name, path, args) = crate::parse_command_line(command);
         
-        println!("🔧 Creating ProcessEntry from command: machine={}, command={}", machine_id, command);
+        log::debug!("Creating ProcessEntry from command: machine={}, command={}", machine_id, command);
         
         Self {
             machine_id,
@@ -257,27 +241,27 @@ impl ProcessEntry {
     }
     
     pub fn parent(mut self, parent: &str) -> Self {
-        println!("  ├─ Setting parent: {}", parent);
+        log::debug!("  Setting parent: {}", parent);
         self.parent_name = Some(parent.to_string());
         self
     }
     
     /// Set PPID - this value will be preserved
     pub fn ppid(mut self, ppid: u32) -> Self {
-        println!("  ├─ Setting PPID: {} ⭐", ppid);
+        log::debug!("  Setting PPID: {}", ppid);
         self.ppid = Some(ppid);
         self
     }
     
     pub fn uid(mut self, uid: u32) -> Self {
-        println!("  ├─ Setting UID: {}", uid);
+        log::debug!("  Setting UID: {}", uid);
         self.uid = uid;
         self
     }
     
     pub fn path(mut self, path: &str) -> Self {
         if !path.is_empty() {
-            println!("  ├─ Setting path: {}", path);
+            log::debug!("  Setting path: {}", path);
         }
         self.path = path.to_string();
         self
@@ -290,14 +274,14 @@ impl ProcessEntry {
             } else { 
                 args.to_string() 
             };
-            println!("  ├─ Setting args: {}", display);
+            log::debug!("  Setting args: {}", display);
         }
         self.args = args.to_string();
         self
     }
     
     pub fn timestamp(mut self, timestamp: String) -> Self {
-        println!("  └─ Setting timestamp: {}", timestamp);
+        log::debug!("  Setting timestamp: {}", timestamp);
         self.timestamp = Some(timestamp);
         self
     }
@@ -591,8 +575,28 @@ impl AnalysisReport {
         self.print_detailed(None);
     }
     
+    /// One-line summary for quiet/script mode (e.g. "CLEAN" or "ANOMALIES: 5 (Critical: 2, High: 1)")
+    pub fn print_summary(&self) {
+        if self.anomalies.is_empty() {
+            println!("CLEAN");
+        } else {
+            let c = self.anomalies.iter().filter(|a| matches!(a.severity, AnomalyLevel::Critical)).count();
+            let h = self.anomalies.iter().filter(|a| matches!(a.severity, AnomalyLevel::High)).count();
+            let m = self.anomalies.iter().filter(|a| matches!(a.severity, AnomalyLevel::Medium)).count();
+            let l = self.anomalies.iter().filter(|a| matches!(a.severity, AnomalyLevel::Low)).count();
+            println!(
+                "ANOMALIES: {} (Critical: {}, High: {}, Medium: {}, Low: {})",
+                self.anomalies.len(), c, h, m, l
+            );
+        }
+    }
+
     /// Print detailed analysis report with optional profile access
     pub fn print_detailed(&self, profiles: Option<&[MachineProfile]>) {
+        if self.config_used.quiet {
+            self.print_summary();
+            return;
+        }
         println!("\n{:=^80}", " IRONSIFT ANALYSIS REPORT ");
         println!("Fleet Size: {} machines", self.total_analyzed);
         println!("Detection Sensitivity: {}", 
@@ -1027,9 +1031,15 @@ impl AnalysisReport {
             "investigation_targets": investigation_data,
         });
         
-        let file = File::create(path)?;
-        serde_json::to_writer_pretty(file, &report)?;
-        println!("\n✅ Forensic report exported to: {}", path);
+        if path == "-" {
+            let out = std::io::stdout();
+            serde_json::to_writer_pretty(out, &report)?;
+            log::info!("Forensic report written to stdout");
+        } else {
+            let file = File::create(path)?;
+            serde_json::to_writer_pretty(file, &report)?;
+            log::info!("Forensic report exported to: {}", path);
+        }
         
         Ok(())
     }
@@ -1049,8 +1059,8 @@ pub fn analyze_fleet(profiles: &[MachineProfile], config: &DetectionConfig) -> R
     for p in profiles {
         for key in p.counts.keys() { unique_features.insert(key); }
     }
-    
-    let mut feature_list: Vec<&ProcessSignature> = unique_features.into_iter().collect();
+
+    let feature_list: Vec<&ProcessSignature> = unique_features.into_iter().collect();
     let n_samples = profiles.len();
     let n_features = feature_list.len();
 
@@ -1313,8 +1323,7 @@ pub fn analyze_fleet2(profiles: &[MachineProfile], config: &DetectionConfig) -> 
 
 /// Build machine file profiles from raw file access entries
 pub fn build_file_profiles(entries: Vec<RawFileEntry>, config: &DetectionConfig) -> Vec<MachineFileProfile> {
-    println!("\n🔨 Building file profiles from {} raw file entries", entries.len());
-    
+    log::info!("Building file profiles from {} raw file entries", entries.len());
     // Filter out whitelisted paths if configured
     let entries: Vec<RawFileEntry> = if !config.whitelisted_path_patterns.is_empty() {
         let before_count = entries.len();
@@ -1324,11 +1333,7 @@ pub fn build_file_profiles(entries: Vec<RawFileEntry>, config: &DetectionConfig)
         let after_count = filtered.len();
         
         if config.debug_display {
-            println!("   Whitelisted file path filtering:");
-            println!("     Before: {} entries", before_count);
-            println!("     After: {} entries", after_count);
-            println!("     Filtered out: {} whitelisted file paths", before_count - after_count);
-            println!();
+            log::debug!("Whitelisted file path filtering: before={}, after={}, filtered={}", before_count, after_count, before_count - after_count);
         }
         
         filtered
@@ -1345,8 +1350,7 @@ pub fn build_file_profiles(entries: Vec<RawFileEntry>, config: &DetectionConfig)
     }
     
     if config.debug_display {
-        println!("   Grouped into {} machines", machine_entries.len());
-        println!();
+        log::debug!("Grouped into {} machines", machine_entries.len());
     }
     
     // Build profiles in parallel
@@ -1391,23 +1395,14 @@ pub fn build_file_profiles(entries: Vec<RawFileEntry>, config: &DetectionConfig)
                 
                 // Log new file additions when debug is enabled
                 if config.debug_display && is_new_file {
-                    let risk_flags = vec![
-                        if path_is_suspicious { "SUSPICIOUS_PATH" } else { "" },
-                        if entry.path.contains("/etc") || entry.path.contains("/bin") || entry.path.contains("/sbin") { 
-                            "SYSTEM_DIRECTORY" 
-                        } else { "" },
-                        if entry.uid == 0 { "ROOT_ACCESS" } else { "" },
-                        if recently_modified { "RECENTLY_MODIFIED" } else { "" },
-                    ].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>();
-                    
-                    let risk_str = if risk_flags.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" [{}]", risk_flags.join(", "))
-                    };
-                    
-                    println!("  📄 New file access in {}: {} (uid: {}){}",
-                        machine_id, entry.path, entry.uid, risk_str);
+                    let risk_flags: Vec<&str> = [
+                        if path_is_suspicious { Some("SUSPICIOUS_PATH") } else { None },
+                        if entry.path.contains("/etc") || entry.path.contains("/bin") || entry.path.contains("/sbin") { Some("SYSTEM_DIRECTORY") } else { None },
+                        if entry.uid == 0 { Some("ROOT_ACCESS") } else { None },
+                        if recently_modified { Some("RECENTLY_MODIFIED") } else { None },
+                    ].into_iter().flatten().collect();
+                    let risk_str = if risk_flags.is_empty() { String::new() } else { format!(" [{}]", risk_flags.join(", ")) };
+                    log::debug!("New file access in {}: {} (uid: {}){}", machine_id, entry.path, entry.uid, risk_str);
                 }
                 
                 profile.add_file(sig, timestamp, mtime);
@@ -1417,11 +1412,7 @@ pub fn build_file_profiles(entries: Vec<RawFileEntry>, config: &DetectionConfig)
         })
         .collect();
     
-    println!("\n✅ Built {} machine file profiles", profiles.len());
-    if config.debug_display {
-        println!("   File profiles ready for analysis");
-    }
-    
+    log::info!("Built {} machine file profiles", profiles.len());
     profiles
 }
 
@@ -2051,7 +2042,7 @@ pub fn parse_json_logs(json: &str) -> Result<Vec<RawLogEntry>, Box<dyn Error>> {
             let json_str = serde_json::to_string(&value)?;
             match parse_json_log(&json_str) {
                 Ok(entry) => entries.push(entry),
-                Err(e) => eprintln!("Warning: Failed to parse JSON entry: {}", e),
+                Err(e) => log::warn!("Failed to parse JSON entry: {}", e),
             }
         }
         return Ok(entries);
@@ -2066,7 +2057,7 @@ pub fn parse_json_logs(json: &str) -> Result<Vec<RawLogEntry>, Box<dyn Error>> {
         }
         match parse_json_log(line) {
             Ok(entry) => entries.push(entry),
-            Err(e) => eprintln!("Warning: Failed to parse JSON line: {}", e),
+            Err(e) => log::warn!("Failed to parse JSON line: {}", e),
         }
     }
     
@@ -2110,7 +2101,7 @@ pub struct ProcessBuilder {
 
 impl ProcessBuilder {
     pub fn new() -> Self {
-        println!("\n📦 Initializing ProcessBuilder");
+        log::debug!("Initializing ProcessBuilder");
         Self {
             entries: Vec::new(),
         }
@@ -2118,15 +2109,14 @@ impl ProcessBuilder {
     
     /// Add a process entry without needing PIDs
     pub fn add(&mut self, entry: ProcessEntry) -> &mut Self {
-        println!("\n➕ Adding ProcessEntry: machine={}, name={}, ppid={:?}", 
-            entry.machine_id, entry.name, entry.ppid);
+        log::debug!("Adding ProcessEntry: machine={}, name={}, ppid={:?}", entry.machine_id, entry.name, entry.ppid);
         self.entries.push(entry);
         self
     }
     
     /// Add a simple process with just name and parent
     pub fn add_process(&mut self, machine_id: &str, name: &str, parent: &str) -> &mut Self {
-        println!("\n➕ Adding simple process: machine={}, name={}, parent={}", machine_id, name, parent);
+        log::debug!("Adding simple process: machine={}, name={}, parent={}", machine_id, name, parent);
         self.entries.push(ProcessEntry {
             machine_id: machine_id.to_string(),
             name: name.to_string(),
@@ -2192,9 +2182,9 @@ impl ProcessBuilder {
     pub fn add_json(&mut self, json: &str) -> &mut Self {
         match crate::parse_json_log(json) {
             Ok(raw_entry) => {
-                println!("\n➕ Processing JSON entry for machine: {}", raw_entry.machine_id);
+                log::debug!("Processing JSON entry for machine: {}", raw_entry.machine_id);
                 if raw_entry.ppid > 0 {
-                    println!("  ├─ ⭐ PPID found in JSON: {}", raw_entry.ppid);
+                    log::debug!("  PPID found in JSON: {}", raw_entry.ppid);
                 }
                 
                 let (name, path, args) = if raw_entry.name.is_empty() {
@@ -2377,30 +2367,17 @@ pub fn resolve_parent_names(entries: &[RawLogEntry]) -> HashMap<(String, u32), S
 
 /// Build machine profiles from raw log entries with automatic parent resolution
 pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Vec<MachineProfile> {
-    println!("\n🔨 Building profiles from {} raw entries", entries.len());
-    
-    // Debug: Show PPID resolution statistics if enabled
+    log::info!("Building profiles from {} raw entries", entries.len());
     if config.debug_display {
-        println!("🔍 PPID Resolution Debug Info:");
-        println!("   Total entries to process: {}", entries.len());
-        
-        // Show some sample entries with PPIDs
-        println!("   Sample entries with PPIDs:");
-        for entry in entries.iter().take(5) {
-            println!("     {}:{} (PPID: {})", entry.machine_id, entry.name, entry.ppid);
-        }
+        log::debug!("PPID resolution: {} entries, sample PPIDs: {:?}", entries.len(),
+            entries.iter().take(5).map(|e| (e.machine_id.as_str(), e.name.as_str(), e.ppid)).collect::<Vec<_>>());
     }
     
     // Resolve parent names
     let pid_to_name = resolve_parent_names(&entries);
     
     if config.debug_display {
-        println!("   Resolved {} PID-to-name mappings", pid_to_name.len());
-        println!("   Sample mappings:");
-        for ((machine, pid), name) in pid_to_name.iter().take(5) {
-            println!("     {}:{} -> {}", machine, pid, name);
-        }
-        println!();
+        log::debug!("Resolved {} PID-to-name mappings", pid_to_name.len());
     }
     
     // Filter out kernel threads if configured
@@ -2412,11 +2389,7 @@ pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Ve
         let after_count = filtered.len();
         
         if config.debug_display {
-            println!("   Kernel thread filtering:");
-            println!("     Before: {} entries", before_count);
-            println!("     After: {} entries", after_count);
-            println!("     Filtered out: {} kernel threads", before_count - after_count);
-            println!();
+            log::debug!("Kernel thread filtering: before={}, after={}, filtered={}", before_count, after_count, before_count - after_count);
         }
         
         filtered
@@ -2433,11 +2406,7 @@ pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Ve
         let after_count = filtered.len();
         
         if config.debug_display {
-            println!("   Init children filtering:");
-            println!("     Before: {} entries", before_count);
-            println!("     After: {} entries", after_count);
-            println!("     Filtered out: {} init children (PPID=1)", before_count - after_count);
-            println!();
+            log::debug!("Init children filtering: before={}, after={}, filtered={}", before_count, after_count, before_count - after_count);
         }
         
         filtered
@@ -2454,11 +2423,7 @@ pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Ve
         let after_count = filtered.len();
         
         if config.debug_display {
-            println!("   Whitelisted path filtering:");
-            println!("     Before: {} entries", before_count);
-            println!("     After: {} entries", after_count);
-            println!("     Filtered out: {} whitelisted paths", before_count - after_count);
-            println!();
+            log::debug!("Whitelisted path filtering: before={}, after={}, filtered={}", before_count, after_count, before_count - after_count);
         }
         
         filtered
@@ -2475,8 +2440,7 @@ pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Ve
     }
     
     if config.debug_display {
-        println!("   Grouped into {} machines", machine_entries.len());
-        println!();
+        log::debug!("Grouped into {} machines", machine_entries.len());
     }
     
     // Build profiles in parallel
@@ -2492,8 +2456,7 @@ pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Ve
                     .cloned()
                     .unwrap_or_else(|| {
                         if config.debug_display && entry.ppid != 0 {
-                            eprintln!("⚠️  Unresolved PPID for {}:{} (PPID: {})", 
-                                entry.machine_id, entry.name, entry.ppid);
+                            log::warn!("Unresolved PPID for {}:{} (PPID: {})", entry.machine_id, entry.name, entry.ppid);
                         }
                         format!("[unknown:{}]", entry.ppid)
                     });
@@ -2524,22 +2487,14 @@ pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Ve
                 let is_new_process = !process_counts.contains_key(&process_key);
                 process_counts.entry(process_key).and_modify(|c| *c += 1).or_insert(1);
                 
-                // Log new process additions when debug is enabled
                 if config.debug_display && is_new_process {
-                    let risk_flags = vec![
-                        if is_high_entropy { "HIGH_ENTROPY" } else { "" },
-                        if is_suspicious_path { "SUSPICIOUS_PATH" } else { "" },
-                        if entry.uid == 0 && !config.common_root_processes.iter().any(|p| entry.name.contains(p)) { "UNEXPECTED_ROOT" } else { "" },
-                    ].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>();
-                    
-                    let risk_str = if risk_flags.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" [{}]", risk_flags.join(", "))
-                    };
-                    
-                    println!("  ➕ New process in {}: {} (path: {}, parent: {}, uid: {}){}",
-                        machine_id, entry.name, entry.path, parent_name, entry.uid, risk_str);
+                    let risk_flags: Vec<&str> = [
+                        if is_high_entropy { Some("HIGH_ENTROPY") } else { None },
+                        if is_suspicious_path { Some("SUSPICIOUS_PATH") } else { None },
+                        if entry.uid == 0 && !config.common_root_processes.iter().any(|p| entry.name.contains(p)) { Some("UNEXPECTED_ROOT") } else { None },
+                    ].into_iter().flatten().collect();
+                    let risk_str = if risk_flags.is_empty() { String::new() } else { format!(" [{}]", risk_flags.join(", ")) };
+                    log::debug!("New process in {}: {} (path: {}, parent: {}, uid: {}){}", machine_id, entry.name, entry.path, parent_name, entry.uid, risk_str);
                 }
                 
                 profile.add_process(sig, timestamp);
@@ -2549,11 +2504,7 @@ pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Ve
         })
         .collect();
     
-    println!("\n✅ Built {} machine profiles", profiles.len());
-    if config.debug_display {
-        println!("   Profiles ready for analysis");
-    }
-    
+    log::info!("Built {} machine profiles", profiles.len());
     profiles
 }
 

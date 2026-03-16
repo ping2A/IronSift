@@ -35,3 +35,6 @@ jobs:
 
       - name: Run tests
         run: cargo test --all-targets --verbose
+
+      - name: Generator + ironsift regression
+        run: ./scripts/test_generator_ironsift.sh

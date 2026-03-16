@@ -3,6 +3,9 @@ use std::path::Path;
 use std::env;
 use std::fs;
 
+use env_logger::Env;
+use log;
+
 use ironsift::{
     load_csv_data, load_json_data, generate_mock_data, analyze_fleet,
     load_files_csv_data, load_files_json_data, analyze_files_fleet,
@@ -23,7 +26,9 @@ fn print_usage() {
     println!("  --input <file>        Specify input file (CSV or JSON)");
     println!("  --files               Analyze file access logs (instead of process logs)");
     println!("  --config <file>       Load configuration from JSON file");
-    println!("  --export-json         Export detailed forensic report as JSON");
+    println!("  --export-json [path]  Export forensic report as JSON (default: forensic_report.json)");
+    println!("                        Use '-' to write JSON to stdout (script-friendly)");
+    println!("  -q, --quiet           Minimal output: one-line summary only (for pipelines)");
     println!("  --tolerance <value>   Override DBSCAN tolerance (default: 0.05)");
     println!("  --help                Show this help message");
     println!();
@@ -34,9 +39,10 @@ fn print_usage() {
     println!("Examples:");
     println!("  ironsift                           # Run with defaults (auto-detect input)");
     println!("  ironsift --input logs.json         # Process JSON log file");
-    println!("  ironsift --input data.csv          # Process CSV log file");
     println!("  ironsift --files --input files.csv # Analyze file access logs");
-    println!("  ironsift --export-json             # Run and export JSON report");
+    println!("  ironsift -q                        # Quiet: one-line summary only (script-friendly)");
+    println!("  ironsift --export-json -           # Write JSON report to stdout (for piping)");
+    println!("  ironsift --export-json report.json # Write JSON report to file");
     println!("  ironsift --tolerance 0.08          # Run with custom tolerance");
     println!("  ironsift --config custom.json      # Run with custom config");
 }
@@ -44,8 +50,24 @@ fn print_usage() {
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().collect();
     
+    // Set log level to ERROR when quiet so progress is suppressed (must be before init)
+    let quiet = args.iter().any(|a| a == "-q" || a == "--quiet")
+        || args.windows(2).any(|w| {
+            let a0 = w.get(0).and_then(|s| Some(s.as_str()));
+            let a1 = w.get(1).and_then(|s| Some(s.as_str()));
+            a0 == Some("--export-json") && a1 == Some("-")
+        });
+    if quiet {
+        env::set_var("RUST_LOG", "error");
+    }
+    env_logger::Builder::from_env(Env::default().filter_or("RUST_LOG", if quiet { "error" } else { "info" }))
+        .format_timestamp_secs()
+        .format_target(false)
+        .try_init()
+        .ok();
+    
     // Parse arguments
-    let mut export_json = false;
+    let mut export_json_path: Option<String> = None; // None = don't export, Some(path) = export to path
     let mut analyze_files = false;
     let mut config = DetectionConfig::default();
     let mut config_path: Option<String> = None;
@@ -58,8 +80,19 @@ fn main() -> Result<(), Box<dyn Error>> {
                 print_usage();
                 return Ok(());
             }
+            "-q" | "--quiet" => {
+                config.quiet = true;
+            }
             "--export-json" => {
-                export_json = true;
+                i += 1;
+                if i < args.len() && (args[i] == "-" || !args[i].starts_with('-')) {
+                    export_json_path = Some(args[i].clone());
+                } else {
+                    if i < args.len() {
+                        i -= 1;
+                    }
+                    export_json_path = Some(REPORT_OUTPUT.to_string());
+                }
             }
             "--files" => {
                 analyze_files = true;
@@ -67,7 +100,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "--input" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("Error: --input requires a file path");
+                    log::error!("--input requires a file path");
                     return Err("Missing input file path".into());
                 }
                 input_file = Some(args[i].clone());
@@ -75,7 +108,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             "--tolerance" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("Error: --tolerance requires a value");
+                    log::error!("--tolerance requires a value");
                     return Err("Missing tolerance value".into());
                 }
                 config.dbscan_tolerance = args[i].parse()
@@ -84,13 +117,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             "--config" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("Error: --config requires a file path");
+                    log::error!("--config requires a file path");
                     return Err("Missing config file path".into());
                 }
                 config_path = Some(args[i].clone());
             }
             other => {
-                eprintln!("Unknown option: {}", other);
+                log::error!("Unknown option: {}", other);
                 print_usage();
                 return Err("Invalid argument".into());
             }
@@ -98,23 +131,30 @@ fn main() -> Result<(), Box<dyn Error>> {
         i += 1;
     }
     
+    // When writing JSON to stdout, suppress all other stdout so pipes get only JSON
+    if export_json_path.as_deref() == Some("-") {
+        config.quiet = true;
+    }
+    
     // Load config from file if specified
     if let Some(path) = config_path {
-        println!("• Loading configuration from: {}", path);
+        log::info!("Loading configuration from: {}", path);
         config = DetectionConfig::from_file(&path)?;
     }
     
-    println!("{:=^60}", " IRONSIFT SECURITY ANALYZER ");
-    println!();
-    
-    // Display comprehensive config
-    config.print();
-    println!();
+    if !config.quiet {
+        println!("{:=^60}", " IRONSIFT SECURITY ANALYZER ");
+        println!();
+        config.print();
+        println!();
+    }
 
     if analyze_files {
         // FILE-BASED ANALYSIS
-        println!("📄 Analyzing FILE ACCESS logs");
-        println!();
+        if !config.quiet {
+            println!("📄 Analyzing FILE ACCESS logs");
+            println!();
+        }
         
         // 1. Ingest File Data - Support CSV and JSON with auto-detection
         let file_profiles = if let Some(input) = input_file {
@@ -123,7 +163,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 return Err(format!("Input file not found: {}", input).into());
             }
             
-            println!("• Loading file data from: {}", input);
+            log::info!("Loading file data from: {}", input);
             
             // Auto-detect format based on extension
             if input.ends_with(".json") {
@@ -136,36 +176,36 @@ fn main() -> Result<(), Box<dyn Error>> {
         } else {
             // Auto-detect default files
             if Path::new(DEFAULT_INPUT_FILES_JSON).exists() {
-                println!("• Loading file data from: {}", DEFAULT_INPUT_FILES_JSON);
+                log::info!("Loading file data from: {}", DEFAULT_INPUT_FILES_JSON);
                 load_files_json_data(DEFAULT_INPUT_FILES_JSON, &config)?
             } else if Path::new(DEFAULT_INPUT_FILES_CSV).exists() {
-                println!("• Loading file data from: {}", DEFAULT_INPUT_FILES_CSV);
+                log::info!("Loading file data from: {}", DEFAULT_INPUT_FILES_CSV);
                 load_files_csv_data(DEFAULT_INPUT_FILES_CSV, &config)?
             } else {
                 return Err("No file dataset found. Use --input to specify a file, or generate one with: cargo run --bin generator -- --files".into());
             }
         };
 
-        println!("• Loaded {} machine file profiles", file_profiles.len());
-
-        // 2. Run File Analysis
-        println!("• Running DBSCAN clustering analysis on file access patterns...");
+        log::info!("Loaded {} machine file profiles", file_profiles.len());
+        log::info!("Running DBSCAN clustering analysis on file access patterns");
         let report = analyze_files_fleet(&file_profiles, &config)?;
         
-        // 3. Display Results with detailed information
-        report.print_detailed(None);
+        // 3. Display Results (skip when writing JSON to stdout so pipe gets only JSON)
+        if export_json_path.as_deref() != Some("-") {
+            report.print_detailed(None);
+        }
 
-        // 4. Export JSON if requested
-        if export_json {
-            // Note: export_json expects MachineProfile, but we have MachineFileProfile
-            // For now, we'll skip the detailed export for files
-            println!("\n⚠️  JSON export for file analysis is not yet fully supported");
+        // 4. Export JSON if requested (file analysis: not yet supported)
+        if export_json_path.is_some() {
+            log::warn!("JSON export for file analysis is not yet fully supported");
         }
     } else {
         // PROCESS-BASED ANALYSIS (original code)
         // Auto-detect file vs process data if CSV
-        println!("🔍 Analyzing PROCESS logs");
-        println!();
+        if !config.quiet {
+            println!("🔍 Analyzing PROCESS logs");
+            println!();
+        }
         
         // 1. Ingest Data - Support CSV and JSON with auto-detection
         let profiles = if let Some(input) = input_file {
@@ -174,23 +214,23 @@ fn main() -> Result<(), Box<dyn Error>> {
                 return Err(format!("Input file not found: {}", input).into());
             }
             
-            println!("• Loading data from: {}", input);
-            
+            log::info!("Loading data from: {}", input);
             // Auto-detect format based on extension
             if input.ends_with(".json") {
                 // JSON: try process first, fall back to files if it fails
                 match load_json_data(&input, &config) {
                     Ok(profiles) => profiles,
                     Err(_) => {
-                        // Try as file data
-                        println!("• Detected file access data in JSON");
+                        log::info!("Detected file access data in JSON");
                         let file_profiles = load_files_json_data(&input, &config)?;
-                        println!("• Loaded {} machine file profiles", file_profiles.len());
-                        println!("• Running DBSCAN clustering analysis on file access patterns...");
+                        log::info!("Loaded {} machine file profiles", file_profiles.len());
+                        log::info!("Running DBSCAN clustering analysis on file access patterns");
                         let report = analyze_files_fleet(&file_profiles, &config)?;
-                        report.print_detailed(None);
-                        if export_json {
-                            println!("\n⚠️  JSON export for file analysis is not yet fully supported");
+                        if export_json_path.as_deref() != Some("-") {
+                            report.print_detailed(None);
+                        }
+                        if export_json_path.is_some() {
+                            log::warn!("JSON export for file analysis is not yet fully supported");
                         }
                         return Ok(());
                     }
@@ -199,24 +239,22 @@ fn main() -> Result<(), Box<dyn Error>> {
                 // CSV: detect type from header
                 match detect_csv_type(&input) {
                     Ok(true) => {
-                        // File data detected
-                        println!("• Detected file access data in CSV");
+                        log::info!("Detected file access data in CSV");
                         let file_profiles = load_files_csv_data(&input, &config)?;
-                        println!("• Loaded {} machine file profiles", file_profiles.len());
-                        println!("• Running DBSCAN clustering analysis on file access patterns...");
+                        log::info!("Loaded {} machine file profiles", file_profiles.len());
+                        log::info!("Running DBSCAN clustering analysis on file access patterns");
                         let report = analyze_files_fleet(&file_profiles, &config)?;
-                        report.print_detailed(None);
-                        if export_json {
-                            println!("\n⚠️  JSON export for file analysis is not yet fully supported");
+                        if export_json_path.as_deref() != Some("-") {
+                            report.print_detailed(None);
+                        }
+                        if export_json_path.is_some() {
+                            log::warn!("JSON export for file analysis is not yet fully supported");
                         }
                         return Ok(());
                     }
-                    Ok(false) => {
-                        // Process data
-                        load_csv_data(&input, &config)?
-                    }
+                    Ok(false) => load_csv_data(&input, &config)?,
                     Err(e) => {
-                        eprintln!("Warning: Could not detect CSV type, assuming process data: {}", e);
+                        log::warn!("Could not detect CSV type, assuming process data: {}", e);
                         load_csv_data(&input, &config)?
                     }
                 }
@@ -225,78 +263,75 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         } else {
             // Auto-detect default files
-            // Check for file datasets first
             if Path::new(DEFAULT_INPUT_FILES_JSON).exists() {
-                println!("• Detected file access data: {}", DEFAULT_INPUT_FILES_JSON);
+                log::info!("Detected file access data: {}", DEFAULT_INPUT_FILES_JSON);
                 let file_profiles = load_files_json_data(DEFAULT_INPUT_FILES_JSON, &config)?;
-                println!("• Loaded {} machine file profiles", file_profiles.len());
-                println!("• Running DBSCAN clustering analysis on file access patterns...");
+                log::info!("Loaded {} machine file profiles", file_profiles.len());
+                log::info!("Running DBSCAN clustering analysis on file access patterns");
                 let report = analyze_files_fleet(&file_profiles, &config)?;
-                report.print_detailed(None);
-                if export_json {
-                    println!("\n⚠️  JSON export for file analysis is not yet fully supported");
+                if export_json_path.as_deref() != Some("-") {
+                    report.print_detailed(None);
+                }
+                if export_json_path.is_some() {
+                    log::warn!("JSON export for file analysis is not yet fully supported");
                 }
                 return Ok(());
             } else if Path::new(DEFAULT_INPUT_FILES_CSV).exists() {
-                println!("• Detected file access data: {}", DEFAULT_INPUT_FILES_CSV);
+                log::info!("Detected file access data: {}", DEFAULT_INPUT_FILES_CSV);
                 let file_profiles = load_files_csv_data(DEFAULT_INPUT_FILES_CSV, &config)?;
-                println!("• Loaded {} machine file profiles", file_profiles.len());
-                println!("• Running DBSCAN clustering analysis on file access patterns...");
+                log::info!("Loaded {} machine file profiles", file_profiles.len());
+                log::info!("Running DBSCAN clustering analysis on file access patterns");
                 let report = analyze_files_fleet(&file_profiles, &config)?;
-                report.print_detailed(None);
-                if export_json {
-                    println!("\n⚠️  JSON export for file analysis is not yet fully supported");
+                if export_json_path.as_deref() != Some("-") {
+                    report.print_detailed(None);
+                }
+                if export_json_path.is_some() {
+                    log::warn!("JSON export for file analysis is not yet fully supported");
                 }
                 return Ok(());
             } else if Path::new(DEFAULT_INPUT_JSON).exists() {
-                println!("• Loading data from: {}", DEFAULT_INPUT_JSON);
+                log::info!("Loading data from: {}", DEFAULT_INPUT_JSON);
                 load_json_data(DEFAULT_INPUT_JSON, &config)?
             } else if Path::new(DEFAULT_INPUT_CSV).exists() {
-                println!("• Loading data from: {}", DEFAULT_INPUT_CSV);
-                // Check if it's actually file data
+                log::info!("Loading data from: {}", DEFAULT_INPUT_CSV);
                 match detect_csv_type(DEFAULT_INPUT_CSV) {
                     Ok(true) => {
-                        println!("• Detected file access data in CSV");
+                        log::info!("Detected file access data in CSV");
                         let file_profiles = load_files_csv_data(DEFAULT_INPUT_CSV, &config)?;
-                        println!("• Loaded {} machine file profiles", file_profiles.len());
-                        println!("• Running DBSCAN clustering analysis on file access patterns...");
+                        log::info!("Loaded {} machine file profiles", file_profiles.len());
+                        log::info!("Running DBSCAN clustering analysis on file access patterns");
                         let report = analyze_files_fleet(&file_profiles, &config)?;
-                        report.print_detailed(None);
-                        if export_json {
-                            println!("\n⚠️  JSON export for file analysis is not yet fully supported");
+                        if export_json_path.as_deref() != Some("-") {
+                            report.print_detailed(None);
+                        }
+                        if export_json_path.is_some() {
+                            log::warn!("JSON export for file analysis is not yet fully supported");
                         }
                         return Ok(());
                     }
-                    _ => {
-                        load_csv_data(DEFAULT_INPUT_CSV, &config)?
-                    }
+                    _ => load_csv_data(DEFAULT_INPUT_CSV, &config)?,
                 }
             } else {
-                println!("• No dataset found, generating mock data...");
+                log::info!("No dataset found, generating mock data");
                 generate_mock_data(&config)
             }
         };
 
-        println!("• Loaded {} machine profiles", profiles.len());
-
-        // 2. Run Analysis
-        println!("• Running DBSCAN clustering analysis...");
+        log::info!("Loaded {} machine profiles", profiles.len());
+        log::info!("Running DBSCAN clustering analysis");
         let report = analyze_fleet(&profiles, &config)?;
         
-        // 3. Display Results with detailed information
-        report.print_detailed(Some(&profiles));
-
-        // 4. Export JSON if requested
-        if export_json {
-            report.export_json(&profiles, REPORT_OUTPUT)?;
+        if export_json_path.as_deref() != Some("-") {
+            report.print_detailed(Some(&profiles));
+        }
+        if let Some(path) = &export_json_path {
+            report.export_json(&profiles, path)?;
         }
     }
 
-    // 5. Save current config for future use
     if !Path::new(CONFIG_FILE).exists() {
         config.to_file(CONFIG_FILE)?;
-        println!("\n💾 Configuration saved to: {}", CONFIG_FILE);
-        println!("   Edit this file to customize detection parameters.");
+        log::info!("Configuration saved to: {} (edit to customize detection parameters)", CONFIG_FILE);
     }
 
     Ok(())

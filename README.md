@@ -309,6 +309,29 @@ cargo run --release --bin ironsift -- --export-json
 
 **Output**: `forensic_report.json`
 
+### 4. Output control (scripts and pipelines)
+
+For use by other tools or in scripts:
+
+| Option | Effect |
+|--------|--------|
+| `-q`, `--quiet` | Minimal output: one-line summary only (e.g. `CLEAN` or `ANOMALIES: 5 (Critical: 2, High: 1, …)`). Progress and config are suppressed. |
+| `--export-json -` | Write the JSON report to **stdout** (nothing else on stdout). Use `2>/dev/null` to hide progress on stderr. |
+| Progress messages | Loading/config/progress lines are sent to **stderr** so stdout can be piped or parsed. |
+
+**Examples:**
+
+```bash
+# One-line result for scripting
+ironsift -q --input data.csv
+
+# JSON only on stdout (e.g. pipe to jq or another tool)
+ironsift --export-json - --input data.csv 2>/dev/null | jq '.anomalies_detected'
+
+# Quiet + export to file
+ironsift -q --export-json report.json --input data.csv
+```
+
 ---
 
 ## ⚙️ Configuration
@@ -413,6 +436,16 @@ Run the comprehensive test suite:
 ```bash
 cargo test
 ```
+
+### Generator + CLI regression test
+
+To check that the generator output is correctly analyzed by the CLI (catches regressions in ingestion or reporting):
+
+```bash
+./scripts/test_generator_ironsift.sh
+```
+
+This script builds release, generates process and file datasets, runs `ironsift` (and `ironsift --files`) on them, and verifies that anomalies are reported. Run from the repo root.
 
 ### Test Coverage
 
