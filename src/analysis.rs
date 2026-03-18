@@ -1,0 +1,268 @@
+//! Process fleet analysis: DBSCAN clustering and anomaly detection.
+
+use std::collections::{HashMap, HashSet};
+use std::error::Error;
+use ndarray::Array2;
+use linfa::traits::Transformer;
+use linfa_clustering::Dbscan;
+use rayon::prelude::*;
+
+use crate::config::DetectionConfig;
+use crate::report::{AnalysisReport, AnalysisType, AnomalyDetails, AnomalyLevel};
+use crate::types::{MachineProfile, ProcessSignature};
+
+pub fn analyze_fleet(
+    profiles: &[MachineProfile],
+    config: &DetectionConfig,
+) -> Result<AnalysisReport, Box<dyn Error>> {
+    if profiles.is_empty() {
+        return Ok(AnalysisReport {
+            anomalies: vec![],
+            cluster_stats: HashMap::new(),
+            total_analyzed: 0,
+            config_used: config.clone(),
+            analysis_type: AnalysisType::Process,
+        });
+    }
+
+    let mut unique_features: HashSet<&ProcessSignature> = HashSet::new();
+    for p in profiles {
+        for key in p.counts.keys() {
+            unique_features.insert(key);
+        }
+    }
+
+    let feature_list: Vec<&ProcessSignature> = unique_features.into_iter().collect();
+    let n_samples = profiles.len();
+    let n_features = feature_list.len();
+
+    let mut data = Array2::<f64>::zeros((n_samples, n_features));
+    for (row_idx, profile) in profiles.iter().enumerate() {
+        if profile.total_logs == 0 {
+            continue;
+        }
+        for (col_idx, feature) in feature_list.iter().enumerate() {
+            if let Some(&count) = profile.counts.get(feature) {
+                let tf = count as f64 / profile.total_logs as f64;
+                let doc_count = profiles.iter().filter(|p| p.counts.contains_key(feature)).count();
+                let idf = ((n_samples as f64) / (doc_count as f64 + 1.0)).ln() + 1.0;
+                data[[row_idx, col_idx]] = tf * idf;
+            }
+        }
+    }
+
+    if config.normalize_features {
+        for mut row in data.rows_mut() {
+            let norm = row.mapv(|x| x * x).sum().sqrt();
+            if norm > 0.0 {
+                row.mapv_inplace(|x| x / norm);
+            }
+        }
+    }
+
+    let clusters = Dbscan::params(config.dbscan_min_samples)
+        .tolerance(config.dbscan_tolerance)
+        .transform(&data)?;
+
+    let mut cluster_counts: HashMap<Option<usize>, usize> = HashMap::new();
+    for cluster_id in clusters.iter() {
+        *cluster_counts.entry(*cluster_id).or_insert(0) += 1;
+    }
+
+    let largest_cluster = cluster_counts
+        .iter()
+        .filter(|(k, _)| k.is_some())
+        .max_by_key(|(_, v)| *v)
+        .map(|(k, _)| k.unwrap());
+
+    let mut anomalies = Vec::new();
+
+    for (i, cluster_id) in clusters.iter().enumerate() {
+        let profile = &profiles[i];
+        let mut suspicious_count = 0;
+        let mut anomalous_features = Vec::new();
+        let mut has_genuine_risk = false;
+
+        for (sig, count) in &profile.counts {
+            let is_common_root = config.common_root_processes.iter().any(|p| sig.name.contains(p));
+            let is_behavioral_risk = sig.is_high_entropy || sig.is_suspicious_path;
+            let is_unexpected_root = sig.uid == 0 && !is_common_root;
+
+            if is_behavioral_risk || is_unexpected_root {
+                suspicious_count += *count;
+                has_genuine_risk = true;
+                anomalous_features.push(format!("RISK DETECTED: {} (root/path/entropy)", sig.name));
+            }
+
+            let doc_count = profiles.iter().filter(|p| p.counts.contains_key(sig)).count();
+            if doc_count == 1 && !is_common_root {
+                anomalous_features.push(format!("Rare process: {}", sig.name));
+            }
+        }
+
+        let is_noise = cluster_id.is_none();
+        let is_minority = cluster_id.is_some()
+            && cluster_id.unwrap() != largest_cluster.unwrap_or(999);
+
+        if is_noise || is_minority || has_genuine_risk {
+            let severity = if has_genuine_risk {
+                if suspicious_count > 5 {
+                    AnomalyLevel::Critical
+                } else {
+                    AnomalyLevel::High
+                }
+            } else {
+                AnomalyLevel::Medium
+            };
+
+            anomalies.push(AnomalyDetails {
+                machine_id: profile.id.clone(),
+                severity,
+                distance_score: if is_noise { 1.5 } else { 0.8 },
+                cluster_assignment: *cluster_id,
+                anomalous_features,
+                process_count: profile.total_logs,
+                suspicious_process_count: suspicious_count,
+            });
+        }
+    }
+
+    Ok(AnalysisReport {
+        anomalies,
+        cluster_stats: cluster_counts,
+        total_analyzed: n_samples,
+        config_used: config.clone(),
+        analysis_type: AnalysisType::Process,
+    })
+}
+
+pub fn analyze_fleet2(
+    profiles: &[MachineProfile],
+    config: &DetectionConfig,
+) -> Result<AnalysisReport, Box<dyn Error>> {
+    if profiles.is_empty() {
+        return Ok(AnalysisReport {
+            anomalies: vec![],
+            cluster_stats: HashMap::new(),
+            total_analyzed: 0,
+            config_used: config.clone(),
+            analysis_type: AnalysisType::Process,
+        });
+    }
+
+    let mut unique_features: HashSet<&ProcessSignature> = HashSet::new();
+    for p in profiles {
+        for key in p.counts.keys() {
+            unique_features.insert(key);
+        }
+    }
+
+    let mut feature_list: Vec<&ProcessSignature> = unique_features.into_iter().collect();
+    feature_list.sort_by(|a, b| {
+        a.name.cmp(&b.name)
+            .then(a.path.cmp(&b.path))
+            .then(a.uid.cmp(&b.uid))
+    });
+
+    let n_samples = profiles.len();
+    let n_features = feature_list.len();
+
+    let feature_doc_freq: Vec<usize> = feature_list
+        .par_iter()
+        .map(|feature| profiles.iter().filter(|p| p.counts.contains_key(feature)).count())
+        .collect();
+
+    let mut data = Array2::<f64>::zeros((n_samples, n_features));
+    for (row_idx, profile) in profiles.iter().enumerate() {
+        if profile.total_logs == 0 {
+            continue;
+        }
+        for (col_idx, feature) in feature_list.iter().enumerate() {
+            if let Some(&count) = profile.counts.get(feature) {
+                let tf = count as f64 / profile.total_logs as f64;
+                let doc_count = feature_doc_freq[col_idx].max(1) as f64;
+                let idf = (n_samples as f64 / doc_count).ln() + 1.0;
+                data[[row_idx, col_idx]] = tf * idf;
+            }
+        }
+    }
+
+    if config.normalize_features {
+        for mut row in data.rows_mut() {
+            let norm = row.mapv(|x| x * x).sum().sqrt();
+            if norm > 0.0 {
+                row.mapv_inplace(|x| x / norm);
+            }
+        }
+    }
+
+    let clusters = Dbscan::params(config.dbscan_min_samples)
+        .tolerance(config.dbscan_tolerance)
+        .transform(&data)?;
+
+    let mut cluster_counts: HashMap<Option<usize>, usize> = HashMap::new();
+    for cluster_id in clusters.iter() {
+        *cluster_counts.entry(*cluster_id).or_insert(0) += 1;
+    }
+
+    let largest_cluster = cluster_counts
+        .iter()
+        .filter(|(k, _)| k.is_some())
+        .max_by_key(|(_, v)| *v)
+        .map(|(k, _)| *k);
+
+    let mut anomalies = Vec::new();
+    for (i, cluster_id) in clusters.iter().enumerate() {
+        let (is_anomaly, distance_score) = match cluster_id {
+            None => (true, 1.5),
+            Some(id) => {
+                let cluster_size = cluster_counts.get(&Some(*id)).unwrap_or(&0);
+                let is_minority =
+                    (*cluster_size as f64) < (n_samples as f64 * config.minority_cluster_ratio);
+                let is_not_main = Some(*id) != largest_cluster.unwrap();
+                if is_minority && is_not_main {
+                    (true, 0.7)
+                } else {
+                    (false, 0.0)
+                }
+            }
+        };
+
+        if is_anomaly {
+            let profile = &profiles[i];
+            let mut anomalous_features = Vec::new();
+            let mut suspicious_count = 0;
+            for (sig, count) in &profile.counts {
+                let doc_freq_idx = feature_list.iter().position(|&f| f == sig);
+                if let Some(idx) = doc_freq_idx {
+                    let doc_freq = feature_doc_freq[idx] as f64 / n_samples as f64;
+                    if doc_freq < 0.05 {
+                        anomalous_features.push(format!("{} (path: {})", sig.name, sig.path));
+                    }
+                }
+                if sig.is_high_entropy || sig.is_suspicious_path {
+                    suspicious_count += *count;
+                }
+            }
+            anomalies.push(AnomalyDetails {
+                machine_id: profile.id.clone(),
+                severity: AnomalyLevel::from_distance(distance_score),
+                distance_score,
+                cluster_assignment: *cluster_id,
+                anomalous_features,
+                process_count: profile.total_logs,
+                suspicious_process_count: suspicious_count,
+            });
+        }
+    }
+
+    anomalies.sort_by(|a, b| b.distance_score.partial_cmp(&a.distance_score).unwrap());
+
+    Ok(AnalysisReport {
+        anomalies,
+        cluster_stats: cluster_counts,
+        total_analyzed: n_samples,
+        config_used: config.clone(),
+        analysis_type: AnalysisType::Process,
+    })
+}

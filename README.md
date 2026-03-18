@@ -97,6 +97,39 @@ See `EXAMPLES.md` for complete usage examples.
 
 ---
 
+## ⏱️ Temporal comparison (same machine across time)
+
+Compare **multiple snapshots** of the same machine over time to spot **new processes**, **new or modified files**, and **new IP connections** — without fleet-wide clustering.
+
+| Concept | Description |
+|--------|-------------|
+| **MachineSnapshot** | One point-in-time view: processes + file accesses + connections for a single machine |
+| **TemporalDiff** | Diff between two snapshots: `new_processes`, `new_files`, `modified_files` (mtime), `new_connections` |
+| **RawConnectionEntry** | Connection log: `machine_id`, `remote_ip`, optional `local_ip`, `remote_port`, `process_name`, `timestamp` |
+
+**Example:** build a baseline snapshot (e.g. Monday 10:00), then a current snapshot (Monday 14:00); `compare_temporal(&baseline, &current)` yields new processes, files, and IPs.
+
+```rust
+use ironsift::{build_machine_snapshot, compare_temporal, compare_temporal_series,
+               DetectionConfig, RawLogEntry, RawFileEntry, RawConnectionEntry};
+
+let config = DetectionConfig::default();
+let baseline = build_machine_snapshot("server1", "2024-01-01T10:00Z",
+    process_entries_t1, file_entries_t1, connection_entries_t1, &config);
+let current  = build_machine_snapshot("server1", "2024-01-01T14:00Z",
+    process_entries_t2, file_entries_t2, connection_entries_t2, &config);
+
+let diff = compare_temporal(&baseline, &current);
+// diff.new_processes, diff.new_files, diff.modified_files, diff.new_connections
+
+// Or compare a series of snapshots (T1 vs T2, T2 vs T3, ...)
+let diffs = compare_temporal_series(&[snap1, snap2, snap3]);
+```
+
+**Run the demo:** `cargo run --example temporal`
+
+---
+
 ## 📜 Version History
 
 ### v0.3.0 (Current) - Enhanced Analysis & Input Flexibility

@@ -1,4 +1,5 @@
 use crate::*;
+use chrono::Utc;
 use std::fs;
 use tempfile::tempdir;
 
@@ -3420,4 +3421,236 @@ fn test_file_recently_modified_detection() {
         "Recent file should be flagged as recently modified");
     
     println!("✅ Recently modified file detection test passed!");
+}
+
+// --- TEMPORAL COMPARISON TESTS ---
+
+#[test]
+fn test_temporal_new_processes() {
+    use crate::{build_machine_snapshot, compare_temporal, DetectionConfig, RawLogEntry, RawFileEntry, RawConnectionEntry};
+    let config = DetectionConfig::default();
+    let machine_id = "server1";
+    let t1 = "2024-01-01T10:00:00Z";
+    let t2 = "2024-01-01T12:00:00Z";
+    let base_process = vec![
+        RawLogEntry {
+            machine_id: machine_id.to_string(),
+            pid: 1, ppid: 0,
+            name: "systemd".to_string(),
+            uid: 0,
+            path: "/usr/lib/systemd/systemd".to_string(),
+            args: "--system".to_string(),
+            timestamp: None,
+        },
+        RawLogEntry {
+            machine_id: machine_id.to_string(),
+            pid: 100, ppid: 1,
+            name: "nginx".to_string(),
+            uid: 33,
+            path: "/usr/sbin/nginx".to_string(),
+            args: "-c /etc/nginx.conf".to_string(),
+            timestamp: None,
+        },
+    ];
+    let current_process = vec![
+        RawLogEntry {
+            machine_id: machine_id.to_string(),
+            pid: 1, ppid: 0,
+            name: "systemd".to_string(),
+            uid: 0,
+            path: "/usr/lib/systemd/systemd".to_string(),
+            args: "--system".to_string(),
+            timestamp: None,
+        },
+        RawLogEntry {
+            machine_id: machine_id.to_string(),
+            pid: 100, ppid: 1,
+            name: "nginx".to_string(),
+            uid: 33,
+            path: "/usr/sbin/nginx".to_string(),
+            args: "-c /etc/nginx.conf".to_string(),
+            timestamp: None,
+        },
+        RawLogEntry {
+            machine_id: machine_id.to_string(),
+            pid: 200, ppid: 1,
+            name: "miner".to_string(),
+            uid: 0,
+            path: "/tmp/xmrig".to_string(),
+            args: "pool".to_string(),
+            timestamp: None,
+        },
+    ];
+    let empty_files: Vec<RawFileEntry> = vec![];
+    let empty_conn: Vec<RawConnectionEntry> = vec![];
+    let baseline = build_machine_snapshot(machine_id, t1, base_process, empty_files.clone(), empty_conn.clone(), &config);
+    let current = build_machine_snapshot(machine_id, t2, current_process, empty_files, empty_conn, &config);
+    let diff = compare_temporal(&baseline, &current);
+    assert!(diff.has_changes());
+    assert_eq!(diff.new_processes.len(), 1);
+    assert_eq!(diff.new_processes[0].name, "miner");
+    assert!(diff.new_files.is_empty());
+    assert!(diff.new_connections.is_empty());
+}
+
+#[test]
+fn test_temporal_new_files_and_modified() {
+    use crate::{build_machine_snapshot, compare_temporal, DetectionConfig, RawLogEntry, RawFileEntry, RawConnectionEntry};
+    let config = DetectionConfig::default();
+    let machine_id = "server1";
+    let t1 = "2024-01-01T10:00:00Z";
+    let t2 = "2024-01-01T12:00:00Z";
+    let base_files = vec![
+        RawFileEntry {
+            machine_id: machine_id.to_string(),
+            path: "/etc/passwd".to_string(),
+            uid: 0,
+            timestamp: Some("2024-01-01T09:00:00Z".to_string()),
+            mtime: Some("2024-01-01T08:00:00Z".to_string()),
+        },
+    ];
+    let current_files = vec![
+        RawFileEntry {
+            machine_id: machine_id.to_string(),
+            path: "/etc/passwd".to_string(),
+            uid: 0,
+            timestamp: Some("2024-01-01T11:00:00Z".to_string()),
+            mtime: Some("2024-01-01T11:30:00Z".to_string()), // modified
+        },
+        RawFileEntry {
+            machine_id: machine_id.to_string(),
+            path: "/etc/new_config".to_string(),
+            uid: 0,
+            timestamp: Some("2024-01-01T11:00:00Z".to_string()),
+            mtime: None,
+        },
+    ];
+    let empty_process: Vec<RawLogEntry> = vec![
+        RawLogEntry {
+            machine_id: machine_id.to_string(),
+            pid: 1, ppid: 0,
+            name: "systemd".to_string(),
+            uid: 0,
+            path: "/usr/lib/systemd/systemd".to_string(),
+            args: "--system".to_string(),
+            timestamp: None,
+        },
+    ];
+    let empty_conn: Vec<RawConnectionEntry> = vec![];
+    let baseline = build_machine_snapshot(machine_id, t1, empty_process.clone(), base_files, empty_conn.clone(), &config);
+    let current = build_machine_snapshot(machine_id, t2, empty_process, current_files, empty_conn, &config);
+    let diff = compare_temporal(&baseline, &current);
+    assert!(diff.has_changes());
+    assert_eq!(diff.new_files.len(), 1);
+    assert_eq!(diff.new_files[0].path, "/etc/new_config");
+    assert!(!diff.modified_files.is_empty());
+    assert_eq!(diff.modified_files[0].0, "/etc/passwd");
+}
+
+#[test]
+fn test_temporal_new_connections() {
+    use crate::{build_machine_snapshot, compare_temporal, DetectionConfig, RawLogEntry, RawFileEntry, RawConnectionEntry};
+    let config = DetectionConfig::default();
+    let machine_id = "server1";
+    let t1 = "2024-01-01T10:00:00Z";
+    let t2 = "2024-01-01T12:00:00Z";
+    let base_conn = vec![
+        RawConnectionEntry {
+            machine_id: machine_id.to_string(),
+            remote_ip: "10.0.0.1".to_string(),
+            local_ip: None,
+            remote_port: Some(443),
+            process_name: Some("nginx".to_string()),
+            timestamp: None,
+        },
+    ];
+    let current_conn = vec![
+        RawConnectionEntry {
+            machine_id: machine_id.to_string(),
+            remote_ip: "10.0.0.1".to_string(),
+            local_ip: None,
+            remote_port: Some(443),
+            process_name: None,
+            timestamp: None,
+        },
+        RawConnectionEntry {
+            machine_id: machine_id.to_string(),
+            remote_ip: "192.168.99.100".to_string(),
+            local_ip: None,
+            remote_port: Some(4444),
+            process_name: Some("curl".to_string()),
+            timestamp: None,
+        },
+    ];
+    let empty_process: Vec<RawLogEntry> = vec![
+        RawLogEntry {
+            machine_id: machine_id.to_string(),
+            pid: 1, ppid: 0,
+            name: "systemd".to_string(),
+            uid: 0,
+            path: "/usr/lib/systemd/systemd".to_string(),
+            args: "--system".to_string(),
+            timestamp: None,
+        },
+    ];
+    let empty_files: Vec<RawFileEntry> = vec![];
+    let baseline = build_machine_snapshot(machine_id, t1, empty_process.clone(), empty_files.clone(), base_conn, &config);
+    let current = build_machine_snapshot(machine_id, t2, empty_process, empty_files, current_conn, &config);
+    let diff = compare_temporal(&baseline, &current);
+    assert!(diff.has_changes());
+    assert_eq!(diff.new_connections.len(), 1);
+    assert_eq!(diff.new_connections[0], "192.168.99.100");
+}
+
+#[test]
+fn test_temporal_series() {
+    use crate::{build_machine_snapshot, compare_temporal_series, DetectionConfig, RawLogEntry, RawFileEntry, RawConnectionEntry};
+    let config = DetectionConfig::default();
+    let machine_id = "server1";
+    let empty_process: Vec<RawLogEntry> = vec![
+        RawLogEntry {
+            machine_id: machine_id.to_string(),
+            pid: 1, ppid: 0,
+            name: "systemd".to_string(),
+            uid: 0,
+            path: "/usr/lib/systemd/systemd".to_string(),
+            args: "--system".to_string(),
+            timestamp: None,
+        },
+    ];
+    let empty_files: Vec<RawFileEntry> = vec![];
+    let empty_conn: Vec<RawConnectionEntry> = vec![];
+    let s1 = build_machine_snapshot(machine_id, "T1", empty_process.clone(), empty_files.clone(), empty_conn.clone(), &config);
+    let s2 = build_machine_snapshot(machine_id, "T2", empty_process.clone(), empty_files.clone(), empty_conn.clone(), &config);
+    let s3 = build_machine_snapshot(machine_id, "T3", empty_process, empty_files, empty_conn, &config);
+    let snapshots = vec![s1, s2, s3];
+    let diffs = compare_temporal_series(&snapshots);
+    assert_eq!(diffs.len(), 2);
+    assert!(diffs[0].is_empty());
+    assert!(diffs[1].is_empty());
+}
+
+#[test]
+fn test_temporal_no_changes() {
+    use crate::{build_machine_snapshot, compare_temporal, DetectionConfig, RawLogEntry, RawFileEntry, RawConnectionEntry};
+    let config = DetectionConfig::default();
+    let machine_id = "server1";
+    let entries = vec![
+        RawLogEntry {
+            machine_id: machine_id.to_string(),
+            pid: 1, ppid: 0,
+            name: "systemd".to_string(),
+            uid: 0,
+            path: "/usr/lib/systemd/systemd".to_string(),
+            args: "--system".to_string(),
+            timestamp: None,
+        },
+    ];
+    let empty_files: Vec<RawFileEntry> = vec![];
+    let empty_conn: Vec<RawConnectionEntry> = vec![];
+    let baseline = build_machine_snapshot(machine_id, "T1", entries.clone(), empty_files.clone(), empty_conn.clone(), &config);
+    let current = build_machine_snapshot(machine_id, "T2", entries, empty_files, empty_conn, &config);
+    let diff = compare_temporal(&baseline, &current);
+    assert!(!diff.has_changes());
+    assert!(diff.is_empty());
 }
