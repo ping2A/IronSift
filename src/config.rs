@@ -63,6 +63,8 @@ impl Default for DetectionConfig {
                 r"/var/tmp/".to_string(),
                 r"/home/[^/]+/\.[^/]+".to_string(),
                 r"^\./".to_string(),
+                // Hidden files in system paths (e.g. /bin/.rootme, /usr/sbin/.hidden)
+                r"/(?:bin|sbin|usr/bin|usr/sbin)/\.[^/]+".to_string(),
             ],
             exclude_kernel_threads: true,
             common_root_processes: vec![

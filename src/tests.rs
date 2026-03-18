@@ -1391,6 +1391,56 @@ fn test_load_json_data_simplified_format() {
     println!("✅ load_json_data (flexible keys) test passed!");
 }
 
+#[test]
+fn test_parse_jsonl_process_line() {
+    use crate::parse_jsonl_process_line;
+
+    let line = r#"{"timestamp": "2026-03-16T00:10:05", "event_type": "process", "user": "0", "command": "/sbin/init auto A /dev/sda", "pid": 1, "ppid": 0}"#;
+    let entry = parse_jsonl_process_line(line, "myhost").unwrap();
+    assert_eq!(entry.machine_id, "myhost");
+    assert_eq!(entry.pid, 1);
+    assert_eq!(entry.ppid, 0);
+    assert_eq!(entry.uid, 0);
+    assert_eq!(entry.name, "init");
+    assert_eq!(entry.path, "/sbin/init");
+    assert_eq!(entry.args, "auto A /dev/sda");
+    assert_eq!(entry.timestamp.as_deref(), Some("2026-03-16T00:10:05"));
+
+    let kernel_line = r#"{"timestamp": "2026-03-16T00:10:05", "event_type": "process", "user": "0", "command": "[ksoftirqd/0]", "pid": 8, "ppid": 2}"#;
+    let e2 = parse_jsonl_process_line(kernel_line, "default").unwrap();
+    assert_eq!(e2.machine_id, "default");
+    assert_eq!(e2.pid, 8);
+    assert_eq!(e2.ppid, 2);
+    assert_eq!(e2.name, "[ksoftirqd/0]");
+}
+
+#[test]
+fn test_load_jsonl_data() {
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    let config = DetectionConfig::default();
+    let mut temp = NamedTempFile::new().unwrap();
+    writeln!(
+        temp,
+        r#"{{"timestamp": "2026-03-16T00:10:05", "event_type": "process", "user": "0", "command": "/sbin/init", "pid": 1, "ppid": 0}}"#
+    )
+    .unwrap();
+    writeln!(
+        temp,
+        r#"{{"timestamp": "2026-03-16T00:10:06", "user": "33", "command": "/usr/sbin/nginx -c /etc/nginx.conf", "pid": 100, "ppid": 1}}"#
+    )
+    .unwrap();
+    temp.flush().unwrap();
+
+    let path = temp.path().to_str().unwrap();
+    let stem = temp.path().file_stem().unwrap().to_str().unwrap();
+    let profiles = load_jsonl_data(path, &config).unwrap();
+    assert_eq!(profiles.len(), 1);
+    assert_eq!(profiles[0].id, stem);
+    assert!(profiles[0].total_logs >= 2);
+}
+
 // ============================================================================
 // GENERATOR DETECTION TESTS - Verify all malicious machines are detected
 // ============================================================================

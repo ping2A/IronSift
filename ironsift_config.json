@@ -9,7 +9,8 @@
     "/dev/shm/",
     "/var/tmp/",
     "/home/[^/]+/\\.[^/]+",
-    "^\\.\\/"
+    "^\\.\\/",
+    "/(?:bin|sbin|usr/bin|usr/sbin)/\\.[^/]+"
   ],
   "exclude_kernel_threads": true,
   "common_root_processes": [

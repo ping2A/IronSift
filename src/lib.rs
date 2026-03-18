@@ -24,7 +24,10 @@ pub use utils::{
     calculate_shannon_entropy, is_path_suspicious, is_path_whitelisted, matches_wildcard,
     parse_command_line,
 };
-pub use json_parse::{parse_files_json_logs, parse_json_log, parse_json_logs};
+pub use json_parse::{
+    parse_files_json_logs, parse_json_log, parse_json_logs, parse_jsonl_logs,
+    parse_jsonl_process_line,
+};
 pub use builder::{build_profiles, resolve_parent_names, ProcessBuilder};
 pub use analysis::{analyze_fleet, analyze_fleet2};
 pub use file_analysis::{analyze_files_fleet, build_file_profiles};
@@ -34,7 +37,7 @@ pub use temporal::{
 };
 pub use loaders::{
     build_profiles_simple, generate_mock_data, load_csv_data, load_files_csv_data,
-    load_files_json_data, load_json_data,
+    load_files_json_data, load_json_data, load_jsonl_data,
 };
 
 #[cfg(test)]

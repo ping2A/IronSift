@@ -370,7 +370,7 @@ impl AnalysisReport {
                         privilege_escalation.push(anomaly.machine_id.clone());
                         break;
                     }
-                    if sig.is_suspicious_path && sig.path.contains("/tmp") {
+                    if sig.is_suspicious_path {
                         suspicious_paths.push(anomaly.machine_id.clone());
                         break;
                     }

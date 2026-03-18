@@ -109,6 +109,62 @@ pub fn parse_json_logs(json: &str) -> Result<Vec<RawLogEntry>, Box<dyn Error>> {
     Ok(entries)
 }
 
+/// Parse one line of JSONL process format:
+/// `{"timestamp": "...", "event_type": "process", "user": "0", "command": "/sbin/init", "pid": 1, "ppid": 0}`
+/// Optional per-line: `machine_id`, `hostname`, `host` (overrides default_machine_id).
+pub fn parse_jsonl_process_line(
+    line: &str,
+    default_machine_id: &str,
+) -> Result<RawLogEntry, Box<dyn Error>> {
+    let data: serde_json::Value = serde_json::from_str(line.trim())?;
+    let machine_id = extract_string_field(
+        &data,
+        &["machine_id", "hostname", "host", "server", "node"],
+    )
+    .unwrap_or_else(|| default_machine_id.to_string());
+
+    let pid = extract_u32_field(&data, &["pid", "process_id"]).unwrap_or(0);
+    let ppid = extract_u32_field(&data, &["ppid", "parent_pid"]).unwrap_or(0);
+    let command = extract_string_field(&data, &["command", "cmd", "cmdline", "commandline"])
+        .ok_or("JSONL process line missing 'command' (or cmd/cmdline)")?;
+    let (name, path, args) = parse_command_line(&command);
+    let uid = extract_u32_field(&data, &["uid", "user_id", "userid", "user"])
+        .or_else(|| data.get("user").and_then(|v| v.as_str()).and_then(|s| s.parse::<u32>().ok()))
+        .unwrap_or(1000);
+    let timestamp = extract_string_field(&data, &["timestamp", "time", "datetime"]);
+
+    Ok(RawLogEntry {
+        machine_id,
+        pid,
+        ppid,
+        name,
+        uid,
+        path,
+        args,
+        timestamp,
+    })
+}
+
+/// Parse JSONL content (one JSON object per line, process format).
+/// Uses default_machine_id for lines that don't have machine_id/hostname/host.
+pub fn parse_jsonl_logs(
+    content: &str,
+    default_machine_id: &str,
+) -> Result<Vec<RawLogEntry>, Box<dyn Error>> {
+    let mut entries = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("//") || line.starts_with('#') {
+            continue;
+        }
+        match parse_jsonl_process_line(line, default_machine_id) {
+            Ok(entry) => entries.push(entry),
+            Err(e) => log::warn!("Failed to parse JSONL line: {} - {}", line, e),
+        }
+    }
+    Ok(entries)
+}
+
 /// Parse file access logs from JSON (array, single object, or NDJSON).
 pub fn parse_files_json_logs(content: &str) -> Result<Vec<RawFileEntry>, Box<dyn Error>> {
     let trimmed = content.trim();

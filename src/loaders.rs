@@ -8,7 +8,7 @@ use log;
 use crate::builder::{build_profiles, ProcessBuilder};
 use crate::config::DetectionConfig;
 use crate::file_analysis::build_file_profiles;
-use crate::json_parse::{parse_files_json_logs, parse_json_logs};
+use crate::json_parse::{parse_files_json_logs, parse_json_logs, parse_jsonl_logs};
 use crate::types::{MachineFileProfile, MachineProfile, RawFileEntry, RawLogEntry};
 
 pub fn load_csv_data(
@@ -47,6 +47,37 @@ pub fn load_json_data(
         return Err(format!("No valid machine logs found in '{}'.", path).into());
     }
     log::info!("Loaded {} process entries from JSON", entries.len());
+    Ok(build_profiles(entries, config))
+}
+
+/// Load process data from a JSONL file (one JSON object per line).
+/// Format: `{"timestamp": "...", "event_type": "process", "user": "0", "command": "...", "pid": 1, "ppid": 0}`
+/// Optional per-line: `machine_id`, `hostname`, `host`. If absent, the file stem is used as machine_id.
+pub fn load_jsonl_data(
+    path: &str,
+    config: &DetectionConfig,
+) -> Result<Vec<MachineProfile>, Box<dyn Error>> {
+    if !Path::new(path).exists() {
+        return Err(format!("Input file not found: '{}'", path).into());
+    }
+    let metadata = fs::metadata(path)?;
+    if metadata.len() == 0 {
+        return Err(format!("Input file is empty: '{}'", path).into());
+    }
+    let content = fs::read_to_string(path)?;
+    let default_machine_id = Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("default");
+    let entries = parse_jsonl_logs(&content, default_machine_id)?;
+    if entries.is_empty() {
+        return Err(format!("No valid process lines found in '{}'.", path).into());
+    }
+    log::info!(
+        "Loaded {} process entries from JSONL (machine_id: {})",
+        entries.len(),
+        default_machine_id
+    );
     Ok(build_profiles(entries, config))
 }
 

@@ -7,7 +7,7 @@ use env_logger::Env;
 use log;
 
 use ironsift::{
-    load_csv_data, load_json_data, generate_mock_data, analyze_fleet,
+    load_csv_data, load_json_data, load_jsonl_data, generate_mock_data, analyze_fleet,
     load_files_csv_data, load_files_json_data, analyze_files_fleet,
     DetectionConfig
 };
@@ -23,7 +23,7 @@ fn print_usage() {
     println!("Usage: ironsift [OPTIONS]");
     println!();
     println!("Options:");
-    println!("  --input <file>        Specify input file (CSV or JSON)");
+    println!("  --input <file>        Input file (can be repeated); each JSONL file = one machine");
     println!("  --files               Analyze file access logs (instead of process logs)");
     println!("  --config <file>       Load configuration from JSON file");
     println!("  --export-json [path]  Export forensic report as JSON (default: forensic_report.json)");
@@ -35,10 +35,13 @@ fn print_usage() {
     println!("Supported Input Formats:");
     println!("  • CSV files (.csv)    - Process logs (RawLogEntry) or file logs (RawFileEntry)");
     println!("  • JSON files (.json)  - JSON array, NDJSON, or single object");
+    println!("  • JSONL files (.jsonl) - One JSON object per line (timestamp, user, command, pid, ppid)");
     println!();
     println!("Examples:");
     println!("  ironsift                           # Run with defaults (auto-detect input)");
     println!("  ironsift --input logs.json         # Process JSON log file");
+    println!("  ironsift --input events.jsonl      # Process JSONL (one machine = one file)");
+    println!("  ironsift --input a.jsonl --input b.jsonl  # Multiple JSONL = multiple machines");
     println!("  ironsift --files --input files.csv # Analyze file access logs");
     println!("  ironsift -q                        # Quiet: one-line summary only (script-friendly)");
     println!("  ironsift --export-json -           # Write JSON report to stdout (for piping)");
@@ -71,7 +74,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut analyze_files = false;
     let mut config = DetectionConfig::default();
     let mut config_path: Option<String> = None;
-    let mut input_file: Option<String> = None;
+    let mut input_files: Vec<String> = Vec::new();
     
     let mut i = 1;
     while i < args.len() {
@@ -103,7 +106,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     log::error!("--input requires a file path");
                     return Err("Missing input file path".into());
                 }
-                input_file = Some(args[i].clone());
+                input_files.push(args[i].clone());
             }
             "--tolerance" => {
                 i += 1;
@@ -156,23 +159,23 @@ fn main() -> Result<(), Box<dyn Error>> {
             println!();
         }
         
-        // 1. Ingest File Data - Support CSV and JSON with auto-detection
-        let file_profiles = if let Some(input) = input_file {
-            // User specified input file
-            if !Path::new(&input).exists() {
-                return Err(format!("Input file not found: {}", input).into());
+        // 1. Ingest File Data - Support single/multiple CSV and JSON
+        let file_profiles = if !input_files.is_empty() {
+            let mut all: Vec<ironsift::MachineFileProfile> = Vec::new();
+            for input in &input_files {
+                if !Path::new(input).exists() {
+                    return Err(format!("Input file not found: {}", input).into());
+                }
+                log::info!("Loading file data from: {}", input);
+                if input.ends_with(".json") {
+                    all.extend(load_files_json_data(input, &config)?);
+                } else if input.ends_with(".csv") {
+                    all.extend(load_files_csv_data(input, &config)?);
+                } else {
+                    return Err(format!("Unsupported file format for file analysis: {}. Use .csv or .json", input).into());
+                }
             }
-            
-            log::info!("Loading file data from: {}", input);
-            
-            // Auto-detect format based on extension
-            if input.ends_with(".json") {
-                load_files_json_data(&input, &config)?
-            } else if input.ends_with(".csv") {
-                load_files_csv_data(&input, &config)?
-            } else {
-                return Err(format!("Unsupported file format: {}. Use .csv or .json", input).into());
-            }
+            all
         } else {
             // Auto-detect default files
             if Path::new(DEFAULT_INPUT_FILES_JSON).exists() {
@@ -207,60 +210,66 @@ fn main() -> Result<(), Box<dyn Error>> {
             println!();
         }
         
-        // 1. Ingest Data - Support CSV and JSON with auto-detection
-        let profiles = if let Some(input) = input_file {
-            // User specified input file
-            if !Path::new(&input).exists() {
-                return Err(format!("Input file not found: {}", input).into());
-            }
-            
-            log::info!("Loading data from: {}", input);
-            // Auto-detect format based on extension
-            if input.ends_with(".json") {
-                // JSON: try process first, fall back to files if it fails
-                match load_json_data(&input, &config) {
-                    Ok(profiles) => profiles,
-                    Err(_) => {
-                        log::info!("Detected file access data in JSON");
-                        let file_profiles = load_files_json_data(&input, &config)?;
-                        log::info!("Loaded {} machine file profiles", file_profiles.len());
-                        log::info!("Running DBSCAN clustering analysis on file access patterns");
-                        let report = analyze_files_fleet(&file_profiles, &config)?;
-                        if export_json_path.as_deref() != Some("-") {
-                            report.print_detailed(None);
-                        }
-                        if export_json_path.is_some() {
-                            log::warn!("JSON export for file analysis is not yet fully supported");
-                        }
-                        return Ok(());
-                    }
+        // 1. Ingest Data - Support single/multiple CSV, JSON, JSONL
+        let profiles = if !input_files.is_empty() {
+            // User specified input file(s) — each JSONL file = one machine when multiple files
+            let mut all_profiles: Vec<ironsift::MachineProfile> = Vec::new();
+            for input in &input_files {
+                if !Path::new(input).exists() {
+                    return Err(format!("Input file not found: {}", input).into());
                 }
-            } else if input.ends_with(".csv") {
-                // CSV: detect type from header
-                match detect_csv_type(&input) {
-                    Ok(true) => {
-                        log::info!("Detected file access data in CSV");
-                        let file_profiles = load_files_csv_data(&input, &config)?;
-                        log::info!("Loaded {} machine file profiles", file_profiles.len());
-                        log::info!("Running DBSCAN clustering analysis on file access patterns");
-                        let report = analyze_files_fleet(&file_profiles, &config)?;
-                        if export_json_path.as_deref() != Some("-") {
-                            report.print_detailed(None);
+                log::info!("Loading data from: {}", input);
+                if input.ends_with(".jsonl") {
+                    let file_profiles = load_jsonl_data(input, &config)?;
+                    all_profiles.extend(file_profiles);
+                } else if input.ends_with(".json") {
+                    match load_json_data(input, &config) {
+                        Ok(file_profiles) => all_profiles.extend(file_profiles),
+                        Err(_) => {
+                            log::info!("Detected file access data in JSON");
+                            let file_profiles = load_files_json_data(input, &config)?;
+                            log::info!("Loaded {} machine file profiles", file_profiles.len());
+                            log::info!("Running DBSCAN clustering analysis on file access patterns");
+                            let report = analyze_files_fleet(&file_profiles, &config)?;
+                            if export_json_path.as_deref() != Some("-") {
+                                report.print_detailed(None);
+                            }
+                            if export_json_path.is_some() {
+                                log::warn!("JSON export for file analysis is not yet fully supported");
+                            }
+                            return Ok(());
                         }
-                        if export_json_path.is_some() {
-                            log::warn!("JSON export for file analysis is not yet fully supported");
+                    }
+                } else if input.ends_with(".csv") {
+                    match detect_csv_type(input) {
+                        Ok(true) => {
+                            log::info!("Detected file access data in CSV");
+                            let file_profiles = load_files_csv_data(input, &config)?;
+                            log::info!("Loaded {} machine file profiles", file_profiles.len());
+                            log::info!("Running DBSCAN clustering analysis on file access patterns");
+                            let report = analyze_files_fleet(&file_profiles, &config)?;
+                            if export_json_path.as_deref() != Some("-") {
+                                report.print_detailed(None);
+                            }
+                            if export_json_path.is_some() {
+                                log::warn!("JSON export for file analysis is not yet fully supported");
+                            }
+                            return Ok(());
                         }
-                        return Ok(());
+                        Ok(false) => all_profiles.extend(load_csv_data(input, &config)?),
+                        Err(e) => {
+                            log::warn!("Could not detect CSV type, assuming process data: {}", e);
+                            all_profiles.extend(load_csv_data(input, &config)?)
+                        }
                     }
-                    Ok(false) => load_csv_data(&input, &config)?,
-                    Err(e) => {
-                        log::warn!("Could not detect CSV type, assuming process data: {}", e);
-                        load_csv_data(&input, &config)?
-                    }
+                } else {
+                    return Err(format!("Unsupported file format: {}. Use .csv, .json, or .jsonl", input).into());
                 }
-            } else {
-                return Err(format!("Unsupported file format: {}. Use .csv or .json", input).into());
             }
+            if all_profiles.is_empty() {
+                return Err("No valid machine profiles loaded from any input file".into());
+            }
+            all_profiles
         } else {
             // Auto-detect default files
             if Path::new(DEFAULT_INPUT_FILES_JSON).exists() {
