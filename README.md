@@ -5,7 +5,67 @@
 
 Created with [Claude.ai](https://claude.ai) but supervised by a human (me apparently).
 
-IronSift is a high-performance Rust-based cybersecurity tool that analyzes massive process logs to identify compromised machines in server fleets. Using DBSCAN clustering and TF-IDF feature engineering, it detects threats without requiring known attack signatures.s
+---
+
+## What is IronSift?
+
+**IronSift** is a Rust-based security analyzer that finds **anomalous machines** in a fleet by comparing their **process** (and optionally **file access**) behavior. It does not rely on attack signatures or threat feeds: it learns what is “normal” from your own data and flags machines that stand out.
+
+- **Fleet mode (default):** You feed process logs from many machines (CSV, JSON, or JSONL). IronSift builds a behavioral profile per machine, turns them into vectors (TF-IDF), and runs **DBSCAN clustering**. Machines that end up alone (noise) or in a small minority cluster are reported as anomalies, with severity and risk factors (entropy, suspicious paths, unexpected root, etc.).
+- **Temporal mode:** For a **single machine**, you can compare two or more snapshots over time. IronSift reports **new processes**, **new or modified files**, and **new IP connections** between snapshots — no clustering involved.
+- **File mode (`--files`):** Same idea as fleet mode, but using file access logs instead of process logs; supports mtime-based anomaly detection across the fleet.
+
+Input can come from CSV, JSON, or **JSONL** (one JSON object per line; each file can be one machine). Output is a console report and an optional JSON forensic report for integration with other tools.
+
+---
+
+## How it works (high-level)
+
+```
+  ┌─────────────────────────────────────────────────────────────────────────────────┐
+  │  INPUTS                                                                          │
+  │  Process logs (CSV / JSON / JSONL)  or  File access logs  or  Temporal snapshots │
+  └───────────────────────────────────────┬─────────────────────────────────────────┘
+                                          │
+          ┌───────────────────────────────┼───────────────────────────────┐
+          │                               │                               │
+          ▼                               ▼                               ▼
+  ┌───────────────────┐         ┌───────────────────┐         ┌───────────────────┐
+  │  FLEET ANALYSIS    │         │  FILE ANALYSIS    │         │  TEMPORAL         │
+  │  (process logs)   │         │  (--files)        │         │  (same machine    │
+  │                   │         │                   │         │   over time)       │
+  └─────────┬─────────┘         └─────────┬─────────┘         └─────────┬─────────┘
+            │                             │                             │
+            │  Group by machine_id        │  Group by machine_id        │  Build snapshot
+            │  Resolve parents,           │  Per-file mtime/risk        │  per time point
+            │  compute entropy & paths    │                             │
+            ▼                             ▼                             ▼
+  ┌───────────────────┐         ┌───────────────────┐         ┌───────────────────┐
+  │  One profile per  │         │  One file profile  │         │  Diff snapshots:   │
+  │  machine          │         │  per machine       │         │  new processes,    │
+  │  (process counts) │         │  (file + mtime)    │         │  new/modified      │
+  │                   │         │                    │         │  files, new IPs     │
+  └─────────┬─────────┘         └─────────┬─────────┘         └───────────────────┘
+            │                             │
+            │  TF-IDF matrix              │  TF-IDF + mtime
+            │  (machines × features)      │  anomaly checks
+            ▼                             ▼
+  ┌───────────────────┐         ┌───────────────────┐
+  │  DBSCAN           │         │  DBSCAN +          │
+  │  Noise = outlier  │         │  mtime/recent      │
+  │  Small cluster =  │         │  file rules        │
+  │  minority         │         │                    │
+  └─────────┬─────────┘         └─────────┬─────────┘
+            │                             │
+            └──────────────┬──────────────┘
+                           ▼
+  ┌─────────────────────────────────────────────────────────────────────────────────┐
+  │  OUTPUTS                                                                         │
+  │  Console report (anomalies, severity, suspicious processes) + optional JSON export│
+  └─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**In short:** Fleet and file modes turn many machines into profiles, then use **TF-IDF + DBSCAN** to find machines that don’t match the majority. Temporal mode skips clustering and just **diffs** consecutive snapshots of one machine.
 
 ## 🎯 Quick Start (3 Ways)
 
