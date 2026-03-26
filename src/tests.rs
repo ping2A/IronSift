@@ -191,8 +191,15 @@ fn test_large_fleet_performance() {
     
     println!("Analyzed {} machines in {:?}", profiles.len(), elapsed);
     
-    // CI runners (e.g. GitHub Actions) are slower; use relaxed threshold
-    let limit_secs = if std::env::var("CI").is_ok() { 120 } else { 10 };
+    // `cargo test` is unoptimized by default and can be ~10× slower than `--release`;
+    // CI runners are variable too. Tight bound only applies to release tests.
+    let limit_secs = if std::env::var("CI").is_ok() {
+        120
+    } else if cfg!(debug_assertions) {
+        120
+    } else {
+        10
+    };
     assert!(
         elapsed.as_secs() < limit_secs,
         "Performance regression: took {:?} (limit {}s)",
@@ -2896,6 +2903,7 @@ fn test_build_file_profiles() {
             uid: 1000,
             timestamp: None,
             mtime: None,
+            ..Default::default()
         },
         RawFileEntry {
             machine_id: "server1".to_string(),
@@ -2903,6 +2911,7 @@ fn test_build_file_profiles() {
             uid: 1000,
             timestamp: None,
             mtime: None,
+            ..Default::default()
         },
         RawFileEntry {
             machine_id: "server2".to_string(),
@@ -2910,6 +2919,7 @@ fn test_build_file_profiles() {
             uid: 1000,
             timestamp: None,
             mtime: None,
+            ..Default::default()
         },
     ];
     
@@ -2939,6 +2949,7 @@ fn test_file_signature_uniqueness() {
             uid: 1000,
             timestamp: None,
             mtime: None,
+            ..Default::default()
         },
         RawFileEntry {
             machine_id: "server1".to_string(),
@@ -2946,6 +2957,7 @@ fn test_file_signature_uniqueness() {
             uid: 0,  // Root user
             timestamp: None,
             mtime: None,
+            ..Default::default()
         },
         // Same file, same UID should be counted together
         RawFileEntry {
@@ -2954,6 +2966,7 @@ fn test_file_signature_uniqueness() {
             uid: 1000,
             timestamp: None,
             mtime: None,
+            ..Default::default()
         },
     ];
     
@@ -2996,6 +3009,7 @@ fn test_file_suspicious_path_detection() {
             uid: 1000,
             timestamp: None,
             mtime: None,
+            ..Default::default()
         },
         RawFileEntry {
             machine_id: "server1".to_string(),
@@ -3003,6 +3017,7 @@ fn test_file_suspicious_path_detection() {
             uid: 1000,
             timestamp: None,
             mtime: None,
+            ..Default::default()
         },
     ];
     
@@ -3040,6 +3055,7 @@ fn test_file_whitelisting() {
             uid: 1000,
             timestamp: None,
             mtime: None,
+            ..Default::default()
         },
         RawFileEntry {
             machine_id: "server1".to_string(),
@@ -3047,6 +3063,7 @@ fn test_file_whitelisting() {
             uid: 1000,
             timestamp: None,
             mtime: None,
+            ..Default::default()
         },
     ];
     
@@ -3081,6 +3098,7 @@ fn test_analyze_files_fleet() {
             uid: 1000,
             timestamp: None,
             mtime: None,
+            ..Default::default()
         });
         entries.push(RawFileEntry {
             machine_id: machine_id.clone(),
@@ -3088,6 +3106,7 @@ fn test_analyze_files_fleet() {
             uid: 1000,
             timestamp: None,
             mtime: None,
+            ..Default::default()
         });
         entries.push(RawFileEntry {
             machine_id: machine_id.clone(),
@@ -3095,6 +3114,7 @@ fn test_analyze_files_fleet() {
             uid: 1000,
             timestamp: None,
             mtime: None,
+            ..Default::default()
         });
     }
     
@@ -3105,6 +3125,7 @@ fn test_analyze_files_fleet() {
         uid: 0,
         timestamp: None,
         mtime: None,
+        ..Default::default()
     });
     entries.push(RawFileEntry {
         machine_id: "compromised".to_string(),
@@ -3112,6 +3133,7 @@ fn test_analyze_files_fleet() {
         uid: 0,  // Root accessing shadow
         timestamp: None,
         mtime: None,
+        ..Default::default()
     });
     
     let profiles = build_file_profiles(entries, &config);
@@ -3141,6 +3163,7 @@ fn test_file_risk_factors() {
             uid: 1000,
             timestamp: None,
             mtime: None,
+            ..Default::default()
         },
         // System directory access
         RawFileEntry {
@@ -3149,6 +3172,7 @@ fn test_file_risk_factors() {
             uid: 1000,
             timestamp: None,
             mtime: None,
+            ..Default::default()
         },
         // Root access
         RawFileEntry {
@@ -3157,6 +3181,7 @@ fn test_file_risk_factors() {
             uid: 0,
             timestamp: None,
             mtime: None,
+            ..Default::default()
         },
     ];
     
@@ -3196,6 +3221,7 @@ fn test_file_system_directory_detection() {
             uid: 1000,
             timestamp: None,
             mtime: None,
+            ..Default::default()
         },
         RawFileEntry {
             machine_id: "server1".to_string(),
@@ -3203,6 +3229,7 @@ fn test_file_system_directory_detection() {
             uid: 1000,
             timestamp: None,
             mtime: None,
+            ..Default::default()
         },
         RawFileEntry {
             machine_id: "server1".to_string(),
@@ -3210,6 +3237,7 @@ fn test_file_system_directory_detection() {
             uid: 1000,
             timestamp: None,
             mtime: None,
+            ..Default::default()
         },
         RawFileEntry {
             machine_id: "server1".to_string(),
@@ -3217,6 +3245,7 @@ fn test_file_system_directory_detection() {
             uid: 1000,
             timestamp: None,
             mtime: None,
+            ..Default::default()
         },
     ];
     
@@ -3251,6 +3280,7 @@ fn test_file_root_access_detection() {
             uid: 0,  // Root
             timestamp: None,
             mtime: None,
+            ..Default::default()
         },
         RawFileEntry {
             machine_id: "server1".to_string(),
@@ -3258,6 +3288,7 @@ fn test_file_root_access_detection() {
             uid: 0,  // Root accessing /proc (should not be flagged)
             timestamp: None,
             mtime: None,
+            ..Default::default()
         },
         RawFileEntry {
             machine_id: "server1".to_string(),
@@ -3265,6 +3296,7 @@ fn test_file_root_access_detection() {
             uid: 0,  // Root accessing /sys (should not be flagged)
             timestamp: None,
             mtime: None,
+            ..Default::default()
         },
         RawFileEntry {
             machine_id: "server1".to_string(),
@@ -3272,6 +3304,7 @@ fn test_file_root_access_detection() {
             uid: 1000,  // Normal user
             timestamp: None,
             mtime: None,
+            ..Default::default()
         },
     ];
     
@@ -3311,6 +3344,7 @@ fn test_file_rare_file_detection() {
             uid: 1000,
             timestamp: None,
             mtime: None,
+            ..Default::default()
         });
         entries.push(RawFileEntry {
             machine_id: machine_id.clone(),
@@ -3318,6 +3352,7 @@ fn test_file_rare_file_detection() {
             uid: 1000,
             timestamp: None,
             mtime: None,
+            ..Default::default()
         });
     }
     
@@ -3328,6 +3363,7 @@ fn test_file_rare_file_detection() {
         uid: 1000,
         timestamp: None,
         mtime: None,
+        ..Default::default()
     });
     
     let profiles = build_file_profiles(entries, &config);
@@ -3374,6 +3410,7 @@ fn test_file_mtime_anomaly_detection() {
             uid: 1000,
             timestamp: Some(access_str.clone()),
             mtime: Some(baseline_str.clone()),  // Consistent mtime
+            ..Default::default()
         });
         entries.push(RawFileEntry {
             machine_id: machine_id.clone(),
@@ -3381,6 +3418,7 @@ fn test_file_mtime_anomaly_detection() {
             uid: 1000,
             timestamp: Some(access_str.clone()),
             mtime: Some(baseline_str.clone()),
+            ..Default::default()
         });
     }
     
@@ -3391,6 +3429,7 @@ fn test_file_mtime_anomaly_detection() {
         uid: 1000,
         timestamp: Some(access_str.clone()),
         mtime: Some(recent_str.clone()),  // Anomalous: recently modified
+        ..Default::default()
     });
     entries.push(RawFileEntry {
         machine_id: "compromised".to_string(),
@@ -3398,6 +3437,7 @@ fn test_file_mtime_anomaly_detection() {
         uid: 1000,
         timestamp: Some(access_str.clone()),
         mtime: Some(baseline_str.clone()),  // Normal
+        ..Default::default()
     });
     
     let profiles = build_file_profiles(entries, &config);
@@ -3444,6 +3484,7 @@ fn test_file_recently_modified_detection() {
             uid: 1000,
             timestamp: Some(access_str.clone()),
             mtime: Some(old_mtime_str.clone()),
+            ..Default::default()
         },
         // Recently modified file - suspicious
         RawFileEntry {
@@ -3452,6 +3493,7 @@ fn test_file_recently_modified_detection() {
             uid: 1000,
             timestamp: Some(access_str.clone()),
             mtime: Some(recent_mtime_str.clone()),
+            ..Default::default()
         },
     ];
     
@@ -3471,6 +3513,32 @@ fn test_file_recently_modified_detection() {
         "Recent file should be flagged as recently modified");
     
     println!("✅ Recently modified file detection test passed!");
+}
+
+#[test]
+fn test_jsonl_file_entry_metadata_keys() {
+    let line = r#"{"timestamp": "2026-03-22T15:49:54", "date": "2026-02-19T14:14:00", "event_type": "file_information", "permissions": "-rw-------.", "owner": "root", "group": "root", "size": 0, "file_path": "/data/var/runtime/tmp/connector.urs.24aOcF"}"#;
+    let entries = parse_files_json_logs(line, "host-71").expect("parse");
+    assert_eq!(entries.len(), 1);
+    let e = &entries[0];
+    assert_eq!(e.machine_id, "host-71");
+    assert_eq!(e.path, "/data/var/runtime/tmp/connector.urs.24aOcF");
+    assert_eq!(e.owner.as_deref(), Some("root"));
+    assert_eq!(e.group.as_deref(), Some("root"));
+    assert_eq!(e.permissions.as_deref(), Some("-rw-------."));
+    assert_eq!(e.size, Some(0));
+    assert_eq!(e.mtime.as_deref(), Some("2026-02-19T14:14:00"));
+    assert!(parse_log_datetime(e.mtime.as_ref().unwrap()).is_some());
+
+    let config = DetectionConfig::default();
+    let profiles = build_file_profiles(entries, &config);
+    assert_eq!(profiles.len(), 1);
+    let sig = profiles[0].counts.keys().next().expect("signature");
+    assert_eq!(sig.uid, 0);
+    assert_eq!(sig.owner.as_deref(), Some("root"));
+    assert_eq!(sig.group.as_deref(), Some("root"));
+    assert_eq!(sig.size, Some(0));
+    assert!(!sig.is_world_writable);
 }
 
 // --- TEMPORAL COMPARISON TESTS ---
@@ -3557,6 +3625,7 @@ fn test_temporal_new_files_and_modified() {
             uid: 0,
             timestamp: Some("2024-01-01T09:00:00Z".to_string()),
             mtime: Some("2024-01-01T08:00:00Z".to_string()),
+            ..Default::default()
         },
     ];
     let current_files = vec![
@@ -3566,6 +3635,7 @@ fn test_temporal_new_files_and_modified() {
             uid: 0,
             timestamp: Some("2024-01-01T11:00:00Z".to_string()),
             mtime: Some("2024-01-01T11:30:00Z".to_string()), // modified
+            ..Default::default()
         },
         RawFileEntry {
             machine_id: machine_id.to_string(),
@@ -3573,6 +3643,7 @@ fn test_temporal_new_files_and_modified() {
             uid: 0,
             timestamp: Some("2024-01-01T11:00:00Z".to_string()),
             mtime: None,
+            ..Default::default()
         },
     ];
     let empty_process: Vec<RawLogEntry> = vec![

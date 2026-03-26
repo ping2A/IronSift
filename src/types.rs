@@ -20,15 +20,29 @@ pub struct RawLogEntry {
     pub timestamp: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct RawFileEntry {
+    /// Host identifier; optional in JSONL lines — filled from the input file stem by the loader when absent.
+    #[serde(default)]
     pub machine_id: String,
+    /// File path (JSON may use `file_path` instead of `path`).
+    #[serde(alias = "file_path")]
     pub path: String,
+    #[serde(default)]
     pub uid: u32,
     #[serde(default)]
     pub timestamp: Option<String>,
-    #[serde(default)]
+    /// Last modification time (`mtime` in IronSift CSV/JSON; JSON may use `date`).
+    #[serde(default, alias = "date")]
     pub mtime: Option<String>,
+    #[serde(default)]
+    pub permissions: Option<String>,
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
+    #[serde(default)]
+    pub size: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -185,6 +199,18 @@ pub struct FileSignature {
     pub has_mtime_anomaly: bool,
     #[serde(default)]
     pub recently_modified: bool,
+    #[serde(default)]
+    pub permissions: Option<String>,
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
+    #[serde(default)]
+    pub size: Option<u64>,
+    #[serde(default)]
+    pub is_world_writable: bool,
+    #[serde(default)]
+    pub is_group_writable: bool,
 }
 
 impl FileSignature {
@@ -201,6 +227,30 @@ impl FileSignature {
         }
         if self.uid == 0 && !self.path.starts_with("/proc") && !self.path.starts_with("/sys") {
             factors.push(format!("Root user accessed: {}", self.path));
+        }
+        if self.is_world_writable {
+            factors.push("World-writable file permissions".to_string());
+        }
+        if self.is_group_writable && !self.is_world_writable {
+            factors.push("Group-writable file permissions".to_string());
+        }
+        if let Some(ref p) = self.permissions {
+            if !p.is_empty() {
+                factors.push(format!("Permissions: {}", p));
+            }
+        }
+        if let Some(ref o) = self.owner {
+            if !o.is_empty() {
+                factors.push(format!("Owner: {}", o));
+            }
+        }
+        if let Some(ref g) = self.group {
+            if !g.is_empty() {
+                factors.push(format!("Group: {}", g));
+            }
+        }
+        if let Some(sz) = self.size {
+            factors.push(format!("Size: {} bytes", sz));
         }
         if self.has_mtime_anomaly {
             factors.push("MTIME ANOMALY: file modification time differs from fleet baseline".to_string());
@@ -261,6 +311,10 @@ pub struct MachineFileProfile {
     pub first_seen: Option<DateTime<Utc>>,
     pub last_seen: Option<DateTime<Utc>>,
     pub file_mtimes: HashMap<String, DateTime<Utc>>,
+    /// Latest observed owner string per path (for fleet-wide metadata comparison).
+    pub file_path_owner: HashMap<String, String>,
+    pub file_path_group: HashMap<String, String>,
+    pub file_path_size: HashMap<String, u64>,
 }
 
 impl MachineFileProfile {
@@ -272,6 +326,9 @@ impl MachineFileProfile {
             first_seen: None,
             last_seen: None,
             file_mtimes: HashMap::new(),
+            file_path_owner: HashMap::new(),
+            file_path_group: HashMap::new(),
+            file_path_size: HashMap::new(),
         }
     }
 
@@ -280,6 +337,21 @@ impl MachineFileProfile {
         self.total_logs += 1;
         if let Some(mt) = mtime {
             self.file_mtimes.insert(sig.path.clone(), mt);
+        }
+        if let Some(ref o) = sig.owner {
+            let o = o.trim();
+            if !o.is_empty() {
+                self.file_path_owner.insert(sig.path.clone(), o.to_string());
+            }
+        }
+        if let Some(ref g) = sig.group {
+            let g = g.trim();
+            if !g.is_empty() {
+                self.file_path_group.insert(sig.path.clone(), g.to_string());
+            }
+        }
+        if let Some(sz) = sig.size {
+            self.file_path_size.insert(sig.path.clone(), sz);
         }
         if let Some(ts) = timestamp {
             if self.first_seen.is_none() || ts < self.first_seen.unwrap() {

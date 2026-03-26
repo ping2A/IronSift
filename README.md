@@ -13,7 +13,7 @@ Created with [Claude.ai](https://claude.ai) but supervised by a human (me appare
 
 - **Fleet mode (default):** You feed process logs from many machines (CSV, JSON, or JSONL). IronSift builds a behavioral profile per machine, turns them into vectors (TF-IDF), and runs **DBSCAN clustering**. Machines that end up alone (noise) or in a small minority cluster are reported as anomalies, with severity and risk factors (entropy, suspicious paths, unexpected root, etc.).
 - **Temporal mode:** For a **single machine**, you can compare two or more snapshots over time. IronSift reports **new processes**, **new or modified files**, and **new IP connections** between snapshots — no clustering involved.
-- **File mode (`--files`):** Same idea as fleet mode, but using file access logs instead of process logs; supports mtime-based anomaly detection across the fleet.
+- **File mode (`--files`):** Same idea as fleet mode, but using file access logs instead of process logs. It compares **modification times (mtime)** across hosts for the same path, and—on system-like paths—**owner, group, and file size** so a machine that disagrees with a clear fleet majority is flagged (**metadata anomaly**).
 
 Input can come from CSV, JSON, or **JSONL** (one JSON object per line; each file can be one machine). Output is a console report and an optional JSON forensic report for integration with other tools.
 
@@ -37,23 +37,23 @@ Input can come from CSV, JSON, or **JSONL** (one JSON object per line; each file
   └─────────┬─────────┘         └─────────┬─────────┘         └─────────┬─────────┘
             │                             │                             │
             │  Group by machine_id        │  Group by machine_id        │  Build snapshot
-            │  Resolve parents,           │  Per-file mtime/risk        │  per time point
+            │  Resolve parents,           │  Per-path mtime + metadata  │  per time point
             │  compute entropy & paths    │                             │
             ▼                             ▼                             ▼
   ┌───────────────────┐         ┌───────────────────┐         ┌───────────────────┐
   │  One profile per  │         │  One file profile  │         │  Diff snapshots:   │
   │  machine          │         │  per machine       │         │  new processes,    │
-  │  (process counts) │         │  (file + mtime)    │         │  new/modified      │
-  │                   │         │                    │         │  files, new IPs     │
+  │  (process counts) │         │  (file + mtime +  │         │  new/modified      │
+  │                   │         │   owner/group/size)│         │  files, new IPs     │
   └─────────┬─────────┘         └─────────┬─────────┘         └───────────────────┘
             │                             │
-            │  TF-IDF matrix              │  TF-IDF + mtime
-            │  (machines × features)      │  anomaly checks
+            │  TF-IDF matrix              │  TF-IDF + mtime +
+            │  (machines × features)      │  metadata fleet checks
             ▼                             ▼
   ┌───────────────────┐         ┌───────────────────┐
   │  DBSCAN           │         │  DBSCAN +          │
-  │  Noise = outlier  │         │  mtime/recent      │
-  │  Small cluster =  │         │  file rules        │
+  │  Noise = outlier  │         │  mtime / metadata  │
+  │  Small cluster =  │         │  / recent / rules  │
   │  minority         │         │                    │
   └─────────┬─────────┘         └─────────┬─────────┘
             │                             │
@@ -61,11 +61,11 @@ Input can come from CSV, JSON, or **JSONL** (one JSON object per line; each file
                            ▼
   ┌─────────────────────────────────────────────────────────────────────────────────┐
   │  OUTPUTS                                                                         │
-  │  Console report (anomalies, severity, suspicious processes) + optional JSON export│
+  │  Console report (anomalies, severity, process/file risk factors) + optional JSON export│
   └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**In short:** Fleet and file modes turn many machines into profiles, then use **TF-IDF + DBSCAN** to find machines that don’t match the majority. Temporal mode skips clustering and just **diffs** consecutive snapshots of one machine.
+**In short:** Fleet and file modes turn many machines into profiles, then use **TF-IDF + DBSCAN** to find machines that don’t match the majority. File mode adds **cross-host checks** for mtime and, on comparable paths, **owner / group / size** outliers. Temporal mode skips clustering and just **diffs** consecutive snapshots of one machine.
 
 ## 🎯 Quick Start (3 Ways)
 
@@ -266,6 +266,18 @@ See `JSON_PARSING.md` and `COMMAND_PARSING.md` for complete documentation.
 | **High Entropy Detection** | Flags obfuscated commands and encoded payloads |
 | **Suspicious Path Analysis** | Detects execution from /tmp, /dev/shm, hidden directories |
 
+### File fleet analysis (`--files`)
+
+Logs can include **path**, **mtime**, **permissions**, **owner**, **group**, and **size** (CSV columns or JSON/JSONL fields). IronSift tracks the latest values seen per path on each machine and compares them across the fleet:
+
+| Feature | Description |
+|---------|-------------|
+| **MTIME anomaly** | Same path on **≥3** hosts: flags machines whose mtime is **>24 hours** from the fleet median for that path. |
+| **Metadata anomaly** | Same path on **comparable** locations (`/etc/…`, paths under `*/bin/*` or `*/sbin/*`, `/usr/bin/…`, `/usr/sbin/…`, `/var/log/…`): with **≥3** hosts and a **majority** owner, group, or size that appears **at least twice**, any host that disagrees is flagged (`METADATA ANOMALY` in the report). |
+| **Per-path risk rules** | Unchanged: suspicious paths, system directories, root access, writable permissions, “recently modified” (mtime within 24h of access), rare paths, plus DBSCAN on file-access TF-IDF features. |
+
+Metadata comparison is **scoped to system-like paths** so legitimate variation (for example different owners on `/home/...`) does not flood the report.
+
 ### Detection Scenarios
 
 IronSift can identify:
@@ -312,6 +324,8 @@ The generated data includes:
 - systemd as PID 1 on each machine
 - Normal processes as children of systemd
 - Attack processes with proper parent relationships
+
+For file datasets, run `cargo run --release --bin generator -- --files`. The sample CSV includes **mtime** and **metadata** scenarios (fleet baseline owner/group/size on common paths, with a few hosts intentionally diverging) so `ironsift --files` exercises **MTIME ANOMALY** and **METADATA ANOMALY** lines in the report.
 
 ### 2. Run Analysis
 
@@ -538,7 +552,7 @@ To check that the generator output is correctly analyzed by the CLI (catches reg
 ./scripts/test_generator_ironsift.sh
 ```
 
-This script builds release, generates process and file datasets, runs `ironsift` (and `ironsift --files`) on them, and verifies that anomalies are reported. Run from the repo root.
+This script builds release, generates process and file datasets, runs `ironsift` (and `ironsift --files`) on them, and verifies that anomalies are reported—including at least one **MTIME ANOMALY** and one **METADATA ANOMALY** line in the file report. Run from the repo root.
 
 ### Test Coverage
 
@@ -550,6 +564,7 @@ This script builds release, generates process and file datasets, runs `ironsift`
 - Process risk factor analysis
 - PID/PPID parent resolution
 - Unknown parent handling
+- File fleet: mtime baseline, metadata (owner/group/size) outliers, JSONL ingestion
 
 ---
 
@@ -591,7 +606,9 @@ This script builds release, generates process and file datasets, runs `ironsift`
   ┌──────────────┐             ┌─────────────────┐
   │ forensic_    │◄────────────│ Risk factors    │
   │ report.json  │  export     │ (entropy, path, │
-  └──────────────┘             │  root, mtime)   │
+  └──────────────┘             │  root; file:    │
+                               │  mtime, owner/  │
+                               │  group/size)    │
                                └─────────────────┘
 ```
 
@@ -604,16 +621,17 @@ This script builds release, generates process and file datasets, runs `ironsift`
   RawLogEntry                         RawFileEntry
   • machine_id, pid, ppid             • machine_id, path, uid
   • name, path, args, uid             • timestamp, mtime
-  • timestamp                         
+  • timestamp                         • permissions, owner, group, size (optional)
          │                                    │
          ▼                                    ▼
   ProcessSignature                    FileSignature
-  • name + parent + uid + path        • path + uid
-  • is_suspicious_path, entropy       • is_suspicious_path
-         │                            • has_mtime_anomaly
+  • name + parent + uid + path        • path + uid + metadata
+  • is_suspicious_path, entropy       • is_suspicious_path, permissions
+         │                            • owner, group, size; mtime flags
          ▼                                    │
   MachineProfile                      MachineFileProfile
-  (counts per process)                (counts per file + mtimes)
+  (counts per process)                (counts per file signature +
+                                      latest mtime + owner/group/size per path)
          │                                    │
          └──────────────┬─────────────────────┘
                         ▼
@@ -630,6 +648,7 @@ This script builds release, generates process and file datasets, runs `ironsift`
 3. **L2 Normalization**: Ensures distance metrics work correctly across varied fleet sizes
 4. **DBSCAN**: Density-based clustering that naturally identifies outliers
 5. **Shannon Entropy**: Measures randomness in command arguments (detects obfuscation)
+6. **File fleet baselines**: Median mtime and majority owner/group/size per path (on comparable paths) to surface hosts that drift from peers
 
 ---
 
@@ -646,6 +665,7 @@ IronSift treats each machine as a vector in N-dimensional feature space:
   - High-entropy obfuscated commands
   - Privilege escalation patterns
   - Abnormal parent-child relationships
+  - **File mode:** rare paths, mtime far from fleet median, or owner/group/size on a system path that disagrees with the majority of peers
 
 ### Clustering (Conceptual)
 

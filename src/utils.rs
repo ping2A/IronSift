@@ -1,6 +1,7 @@
 //! Utility functions: entropy, path matching, command-line parsing.
 
 use std::collections::HashMap;
+use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use regex::Regex;
 
 pub fn calculate_shannon_entropy(s: &str) -> f64 {
@@ -73,6 +74,39 @@ pub fn is_path_suspicious(path: &str, patterns: &[String]) -> bool {
             .map(|re| re.is_match(path))
             .unwrap_or(false)
     })
+}
+
+/// Parse timestamps from RFC3339 or common `T`/space-separated naive datetimes (e.g. `date` / `timestamp` in JSONL).
+pub fn parse_log_datetime(s: &str) -> Option<DateTime<Utc>> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    for fmt in [
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S",
+    ] {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(s, fmt) {
+            return Some(Utc.from_utc_datetime(&naive));
+        }
+    }
+    None
+}
+
+/// Interpret `ls -l` style permission strings (e.g. `-rw-------.`) for group / world write bits.
+pub fn unix_permission_flags(ls_perm: &str) -> (bool, bool) {
+    let p = ls_perm.trim().trim_end_matches('.');
+    let b = p.as_bytes();
+    if b.len() < 10 {
+        return (false, false);
+    }
+    let group_writable = b[5] == b'w';
+    let world_writable = b[8] == b'w';
+    (world_writable, group_writable)
 }
 
 /// Parse a command line into (name, path, args)

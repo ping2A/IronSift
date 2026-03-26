@@ -8,7 +8,7 @@ use log;
 
 use ironsift::{
     load_csv_data, load_json_data, load_jsonl_data, generate_mock_data, analyze_fleet,
-    load_files_csv_data, load_files_json_data, analyze_files_fleet,
+    load_files_csv_data, load_files_json_data, load_files_jsonl_data, analyze_files_fleet,
     DetectionConfig
 };
 
@@ -34,8 +34,8 @@ fn print_usage() {
     println!();
     println!("Supported Input Formats:");
     println!("  • CSV files (.csv)    - Process logs (RawLogEntry) or file logs (RawFileEntry)");
-    println!("  • JSON files (.json)  - JSON array, NDJSON, or single object");
-    println!("  • JSONL files (.jsonl) - One JSON object per line (timestamp, user, command, pid, ppid)");
+    println!("  • JSON files (.json)  - Process logs, or file logs (array / NDJSON / single object)");
+    println!("  • JSONL files (.jsonl) - Process logs, or with --files: one JSON object per line (file_path, date, permissions, …)");
     println!();
     println!("Examples:");
     println!("  ironsift                           # Run with defaults (auto-detect input)");
@@ -169,10 +169,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                 log::info!("Loading file data from: {}", input);
                 if input.ends_with(".json") {
                     all.extend(load_files_json_data(input, &config)?);
+                } else if input.ends_with(".jsonl") {
+                    all.extend(load_files_jsonl_data(input, &config)?);
                 } else if input.ends_with(".csv") {
                     all.extend(load_files_csv_data(input, &config)?);
                 } else {
-                    return Err(format!("Unsupported file format for file analysis: {}. Use .csv or .json", input).into());
+                    return Err(format!(
+                        "Unsupported file format for file analysis: {}. Use .csv, .json, or .jsonl",
+                        input
+                    )
+                    .into());
                 }
             }
             all

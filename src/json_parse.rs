@@ -165,17 +165,31 @@ pub fn parse_jsonl_logs(
     Ok(entries)
 }
 
+fn normalize_raw_file_entry(mut entry: RawFileEntry, default_machine_id: &str) -> RawFileEntry {
+    if entry.machine_id.is_empty() {
+        entry.machine_id = default_machine_id.to_string();
+    }
+    entry
+}
+
 /// Parse file access logs from JSON (array, single object, or NDJSON).
-pub fn parse_files_json_logs(content: &str) -> Result<Vec<RawFileEntry>, Box<dyn Error>> {
+/// Lines without `machine_id` use `default_machine_id` (typically the input file stem).
+pub fn parse_files_json_logs(
+    content: &str,
+    default_machine_id: &str,
+) -> Result<Vec<RawFileEntry>, Box<dyn Error>> {
     let trimmed = content.trim();
     if trimmed.is_empty() {
         return Ok(Vec::new());
     }
     if let Ok(entries) = serde_json::from_str::<Vec<RawFileEntry>>(trimmed) {
-        return Ok(entries);
+        return Ok(entries
+            .into_iter()
+            .map(|e| normalize_raw_file_entry(e, default_machine_id))
+            .collect());
     }
     if let Ok(entry) = serde_json::from_str::<RawFileEntry>(trimmed) {
-        return Ok(vec![entry]);
+        return Ok(vec![normalize_raw_file_entry(entry, default_machine_id)]);
     }
     let mut entries = Vec::new();
     for line in trimmed.lines() {
@@ -184,7 +198,7 @@ pub fn parse_files_json_logs(content: &str) -> Result<Vec<RawFileEntry>, Box<dyn
             continue;
         }
         match serde_json::from_str::<RawFileEntry>(line) {
-            Ok(entry) => entries.push(entry),
+            Ok(entry) => entries.push(normalize_raw_file_entry(entry, default_machine_id)),
             Err(e) => log::warn!("Failed to parse JSON line: {} - {}", line, e),
         }
     }

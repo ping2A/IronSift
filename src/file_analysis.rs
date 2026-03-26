@@ -12,7 +12,116 @@ use log;
 use crate::config::DetectionConfig;
 use crate::report::{AnalysisReport, AnalysisType, AnomalyDetails, AnomalyLevel};
 use crate::types::{FileSignature, MachineFileProfile, RawFileEntry};
-use crate::utils::{is_path_suspicious, is_path_whitelisted};
+use crate::utils::{is_path_suspicious, is_path_whitelisted, parse_log_datetime, unix_permission_flags};
+
+/// Paths where owner/group/size are expected to be uniform across a homogeneous fleet.
+fn path_supports_fleet_metadata_baseline(path: &str) -> bool {
+    path.starts_with("/etc/")
+        || path.contains("/bin/")
+        || path.contains("/sbin/")
+        || path.starts_with("/usr/bin/")
+        || path.starts_with("/usr/sbin/")
+        || path.starts_with("/var/log/")
+}
+
+/// Per-path fleet comparison: same path on ≥3 hosts, a string value (owner/group) must match a
+/// majority that appears at least twice; hosts with a different value are flagged.
+fn fleet_string_metadata_outliers(
+    profiles: &[MachineFileProfile],
+    field: impl Fn(&MachineFileProfile) -> &HashMap<String, String>,
+    field_label: &str,
+) -> HashMap<usize, Vec<String>> {
+    let mut path_hosts: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+    for (i, p) in profiles.iter().enumerate() {
+        for (path, val) in field(p) {
+            if !path_supports_fleet_metadata_baseline(path) {
+                continue;
+            }
+            path_hosts
+                .entry(path.clone())
+                .or_default()
+                .push((i, val.clone()));
+        }
+    }
+    let mut out: HashMap<usize, Vec<String>> = HashMap::new();
+    for (path, rows) in path_hosts {
+        if rows.len() < 3 {
+            continue;
+        }
+        let mut freq: HashMap<String, usize> = HashMap::new();
+        for (_, ref v) in &rows {
+            *freq.entry(v.clone()).or_insert(0) += 1;
+        }
+        let (mode, mode_count) = freq.into_iter().max_by_key(|(_, c)| *c).unwrap();
+        if mode_count < 2 {
+            continue;
+        }
+        for (machine_idx, v) in rows {
+            if v != mode {
+                out.entry(machine_idx).or_default().push(format!(
+                    "METADATA ANOMALY: {} on {} is '{}' (fleet majority: '{}')",
+                    field_label, path, v, mode
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// Same path on ≥3 hosts with recorded size; majority size must appear at least twice.
+fn fleet_size_metadata_outliers(profiles: &[MachineFileProfile]) -> HashMap<usize, Vec<String>> {
+    let mut path_hosts: HashMap<String, Vec<(usize, u64)>> = HashMap::new();
+    for (i, p) in profiles.iter().enumerate() {
+        for (path, sz) in &p.file_path_size {
+            if !path_supports_fleet_metadata_baseline(path) {
+                continue;
+            }
+            path_hosts
+                .entry(path.clone())
+                .or_default()
+                .push((i, *sz));
+        }
+    }
+    let mut out: HashMap<usize, Vec<String>> = HashMap::new();
+    for (path, rows) in path_hosts {
+        if rows.len() < 3 {
+            continue;
+        }
+        let mut freq: HashMap<u64, usize> = HashMap::new();
+        for (_, sz) in &rows {
+            *freq.entry(*sz).or_insert(0) += 1;
+        }
+        let (mode_size, mode_count) = freq.into_iter().max_by_key(|(_, c)| *c).unwrap();
+        if mode_count < 2 {
+            continue;
+        }
+        for (machine_idx, sz) in rows {
+            if sz != mode_size {
+                out.entry(machine_idx).or_default().push(format!(
+                    "METADATA ANOMALY: size on {} is {} bytes (fleet majority: {} bytes)",
+                    path, sz, mode_size
+                ));
+            }
+        }
+    }
+    out
+}
+
+fn effective_file_uid(entry: &RawFileEntry) -> u32 {
+    if entry.uid != 0 {
+        return entry.uid;
+    }
+    if let Some(ref o) = entry.owner {
+        let o = o.trim();
+        if o.eq_ignore_ascii_case("root") {
+            return 0;
+        }
+        if let Ok(u) = o.parse::<u32>() {
+            return u;
+        }
+    }
+    entry.uid
+}
 
 pub fn build_file_profiles(
     entries: Vec<RawFileEntry>,
@@ -59,26 +168,37 @@ pub fn build_file_profiles(
             for entry in logs {
                 let path_is_suspicious =
                     is_path_suspicious(&entry.path, &config.suspicious_path_patterns);
-                let timestamp = entry.timestamp.as_ref().and_then(|ts| {
-                    DateTime::parse_from_rfc3339(ts).ok().map(|dt| dt.with_timezone(&Utc))
-                });
-                let mtime = entry.mtime.as_ref().and_then(|ts| {
-                    DateTime::parse_from_rfc3339(ts).ok().map(|dt| dt.with_timezone(&Utc))
-                });
+                let timestamp = entry.timestamp.as_ref().and_then(|s| parse_log_datetime(s));
+                let mtime = entry.mtime.as_ref().and_then(|s| parse_log_datetime(s));
                 let recently_modified = if let (Some(ts), Some(mt)) = (timestamp, mtime) {
                     let diff = ts.signed_duration_since(mt);
                     diff.num_hours().abs() < 24
                 } else {
                     false
                 };
+                let uid = effective_file_uid(entry);
+                let (is_world_writable, is_group_writable) = entry
+                    .permissions
+                    .as_deref()
+                    .map(unix_permission_flags)
+                    .unwrap_or((false, false));
                 let sig = FileSignature {
                     path: entry.path.clone(),
-                    uid: entry.uid,
+                    uid,
                     is_suspicious_path: path_is_suspicious,
                     has_mtime_anomaly: false,
                     recently_modified,
+                    permissions: entry.permissions.clone(),
+                    owner: entry.owner.clone(),
+                    group: entry.group.clone(),
+                    size: entry.size,
+                    is_world_writable,
+                    is_group_writable,
                 };
-                let file_key = format!("{}:{}", sig.path, sig.uid);
+                let file_key = format!(
+                    "{}:{}:{:?}:{:?}:{:?}",
+                    sig.path, sig.uid, sig.permissions, sig.owner, sig.size
+                );
                 let is_new_file = !file_counts.contains_key(&file_key);
                 file_counts.entry(file_key).and_modify(|c| *c += 1).or_insert(1);
                 if config.debug_display && is_new_file {
@@ -96,7 +216,7 @@ pub fn build_file_profiles(
                         } else {
                             None
                         },
-                        if entry.uid == 0 {
+                        if uid == 0 {
                             Some("ROOT_ACCESS")
                         } else {
                             None
@@ -119,7 +239,7 @@ pub fn build_file_profiles(
                         "New file access in {}: {} (uid: {}){}",
                         machine_id,
                         entry.path,
-                        entry.uid,
+                        uid,
                         risk_str
                     );
                 }
@@ -190,6 +310,18 @@ pub fn analyze_files_fleet(
             }
         }
     }
+
+    let mut metadata_anomaly_details: HashMap<usize, Vec<String>> = HashMap::new();
+    for (k, v) in fleet_string_metadata_outliers(profiles, |p| &p.file_path_owner, "owner") {
+        metadata_anomaly_details.entry(k).or_default().extend(v);
+    }
+    for (k, v) in fleet_string_metadata_outliers(profiles, |p| &p.file_path_group, "group") {
+        metadata_anomaly_details.entry(k).or_default().extend(v);
+    }
+    for (k, v) in fleet_size_metadata_outliers(profiles) {
+        metadata_anomaly_details.entry(k).or_default().extend(v);
+    }
+    let metadata_anomaly_machines: HashSet<usize> = metadata_anomaly_details.keys().copied().collect();
 
     let mut recently_modified_machines: HashSet<usize> = HashSet::new();
     let mut recently_modified_details: HashMap<usize, Vec<String>> = HashMap::new();
@@ -278,6 +410,13 @@ pub fn analyze_files_fleet(
             has_genuine_risk = true;
             suspicious_count += recent_details.len() as u32;
         }
+        if let Some(meta_details) = metadata_anomaly_details.get(&i) {
+            for detail in meta_details {
+                anomalous_features.push(detail.clone());
+            }
+            has_genuine_risk = true;
+            suspicious_count += meta_details.len() as u32;
+        }
 
         for (sig, count) in &profile.counts {
             let is_behavioral_risk = sig.is_suspicious_path;
@@ -287,10 +426,27 @@ pub fn analyze_files_fleet(
             let is_root_access = sig.uid == 0
                 && !sig.path.starts_with("/proc")
                 && !sig.path.starts_with("/sys");
-            if is_behavioral_risk || is_system_directory || is_root_access {
+            let perm_risk = sig.is_world_writable
+                || (sig.is_group_writable && (sig.path.contains("/etc") || sig.path.contains("/tmp")));
+            let owner_mismatch = (sig.path.starts_with("/etc") || sig.path.starts_with("/root"))
+                && sig.owner.as_ref().map_or(false, |o| {
+                    let o = o.trim();
+                    !o.is_empty() && !o.eq_ignore_ascii_case("root")
+                });
+            if is_behavioral_risk || is_system_directory || is_root_access || perm_risk || owner_mismatch {
                 suspicious_count += *count;
                 has_genuine_risk = true;
-                if is_system_directory {
+                if sig.is_world_writable {
+                    anomalous_features.push(format!(
+                        "RISK DETECTED: world-writable {}",
+                        sig.path
+                    ));
+                } else if owner_mismatch {
+                    anomalous_features.push(format!(
+                        "RISK DETECTED: non-root owner on sensitive path {} ({:?})",
+                        sig.path, sig.owner
+                    ));
+                } else if is_system_directory {
                     anomalous_features.push(format!(
                         "RISK DETECTED: system directory access {}",
                         sig.path
@@ -302,6 +458,11 @@ pub fn analyze_files_fleet(
                     ));
                 } else if is_root_access {
                     anomalous_features.push(format!("RISK DETECTED: root access to {}", sig.path));
+                } else if perm_risk {
+                    anomalous_features.push(format!(
+                        "RISK DETECTED: group-writable sensitive file {}",
+                        sig.path
+                    ));
                 }
             }
             let doc_count = profiles.iter().filter(|p| p.counts.contains_key(sig)).count();
@@ -315,10 +476,16 @@ pub fn analyze_files_fleet(
             && cluster_id.unwrap() != largest_cluster.unwrap_or(999);
         let has_mtime_anomaly = mtime_anomaly_machines.contains(&i);
         let has_recently_modified = recently_modified_machines.contains(&i);
+        let has_metadata_fleet_anomaly = metadata_anomaly_machines.contains(&i);
 
-        if is_noise || is_minority || has_genuine_risk || has_mtime_anomaly || has_recently_modified
+        if is_noise
+            || is_minority
+            || has_genuine_risk
+            || has_mtime_anomaly
+            || has_recently_modified
+            || has_metadata_fleet_anomaly
         {
-            let severity = if has_mtime_anomaly {
+            let severity = if has_mtime_anomaly || has_metadata_fleet_anomaly {
                 AnomalyLevel::Critical
             } else if has_recently_modified && has_genuine_risk {
                 AnomalyLevel::Critical
@@ -337,7 +504,7 @@ pub fn analyze_files_fleet(
             anomalies.push(AnomalyDetails {
                 machine_id: profile.id.clone(),
                 severity,
-                distance_score: if has_mtime_anomaly {
+                distance_score: if has_mtime_anomaly || has_metadata_fleet_anomaly {
                     2.0
                 } else if is_noise {
                     1.5

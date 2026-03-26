@@ -111,12 +111,45 @@ pub fn load_files_json_data(
     if metadata.len() == 0 {
         return Err(format!("Input file is empty: '{}'", path).into());
     }
+    let default_machine_id = Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("default");
     let content = fs::read_to_string(path)?;
-    let entries = parse_files_json_logs(&content)?;
+    let entries = parse_files_json_logs(&content, default_machine_id)?;
     if entries.is_empty() {
         return Err(format!("No valid file access logs found in '{}'.", path).into());
     }
     log::info!("Loaded {} file access entries from JSON", entries.len());
+    Ok(build_file_profiles(entries, config))
+}
+
+/// Load file access logs from JSONL (one JSON object per line). Same schema as JSON; `machine_id` defaults to the file stem.
+pub fn load_files_jsonl_data(
+    path: &str,
+    config: &DetectionConfig,
+) -> Result<Vec<MachineFileProfile>, Box<dyn Error>> {
+    if !Path::new(path).exists() {
+        return Err(format!("Input file not found: '{}'", path).into());
+    }
+    let metadata = fs::metadata(path)?;
+    if metadata.len() == 0 {
+        return Err(format!("Input file is empty: '{}'", path).into());
+    }
+    let default_machine_id = Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("default");
+    let content = fs::read_to_string(path)?;
+    let entries = parse_files_json_logs(&content, default_machine_id)?;
+    if entries.is_empty() {
+        return Err(format!("No valid file access lines found in '{}'.", path).into());
+    }
+    log::info!(
+        "Loaded {} file access entries from JSONL (default machine_id: {})",
+        entries.len(),
+        default_machine_id
+    );
     Ok(build_file_profiles(entries, config))
 }
 

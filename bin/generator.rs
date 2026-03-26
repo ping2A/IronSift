@@ -3,7 +3,13 @@ use std::fs::File;
 use std::io::Write;
 use std::env;
 use rand::Rng;
+use rand::rngs::StdRng;
+use rand::SeedableRng;
+
+/// Fixed seed so generated datasets and IronSift regression checks are reproducible.
+const DATASET_RNG_SEED: u64 = 42;
 use chrono::{Utc, Duration};
+use serde_json::json;
 
 use ironsift::{RawLogEntry, RawFileEntry};
 
@@ -111,7 +117,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn generate_log_entries() -> Result<Vec<RawLogEntry>, Box<dyn Error>> {
-    let mut rng = rand::thread_rng();
+    let mut rng = StdRng::seed_from_u64(DATASET_RNG_SEED);
     let mut entries = Vec::new();
     
     // Start time: 7 days ago
@@ -380,24 +386,22 @@ fn print_detection_instructions(output_file: &str) {
     println!("1. DEFAULT DETECTION (Good starting point):");
     println!("   cargo run --bin ironsift -- --input {}", output_file);
     println!();
-    println!("2. SENSITIVE DETECTION (Catches more anomalies):");
-    println!("   cargo run --bin ironsift -- --input {} --tolerance 0.05", output_file);
-    println!("   • Lower tolerance = stricter clustering = more anomalies detected");
-    println!("   • Should detect all 6 malicious machines");
+    println!("2. TUNING (--tolerance, DBSCAN epsilon):");
+    println!("   • This dataset is small; changing epsilon changes which hosts land in the noise cluster.");
+    println!("   • Very low values often mark most of the fleet as outliers — not just the 6 scenario hosts.");
+    println!("   • Adjust up or down while watching the anomaly count; default DetectionConfig is a practical baseline.");
     println!();
-    println!("3. VERY SENSITIVE (May have false positives):");
-    println!("   cargo run --bin ironsift -- --input {} --tolerance 0.03", output_file);
-    println!("   • Very strict detection");
-    println!("   • May flag some normal variations as anomalies");
-    println!();
-    println!("4. WITH JSON EXPORT:");
-    println!("   cargo run --bin ironsift -- --input {} --tolerance 0.05 --export-json", output_file);
-    println!("   • Creates detailed forensic report: forensic_report.json");
+    println!("3. JSON EXPORT (forensics / scripting):");
+    println!("   cargo run --bin ironsift -- --input {} --export-json report.json", output_file);
+    println!("   • Field investigation_targets lists machine_id for each anomaly.");
     println!();
     println!("{:-^80}", "");
     println!();
-    println!("📊 EXPECTED RESULTS:");
-    println!("   With --tolerance 0.05, you should detect:");
+    println!("📊 INJECTED SCENARIO HOSTS (reproducible seed):");
+    println!("   The generator uses a fixed RNG seed so output is reproducible.");
+    println!("   These six hosts contain the crafted attack patterns.");
+    println!("   Regression tests run IronSift with --tolerance 0.40 so exactly these six appear as anomalies");
+    println!("   (default tolerance 0.35 may also flag one or two benign statistical outliers).");
     println!();
     println!("   ⚠️  machine_003 (CRYPTOMINER)");
     println!("       • Process: kworker, systemd, [kthreadd] (fake kernel names)");
@@ -448,8 +452,44 @@ fn print_detection_instructions(output_file: &str) {
 
 // --- FILE GENERATION FUNCTIONS ---
 
+/// Synthetic `ls -l` style metadata aligned with JSONL file snapshot fields (`permissions`, `owner`, `group`, `size`).
+fn file_row_metadata(path: &str, uid: u32, rng: &mut StdRng) -> (String, String, String, u64) {
+    let (owner, group) = match uid {
+        0 => ("root".to_string(), "root".to_string()),
+        33 => ("www-data".to_string(), "www-data".to_string()),
+        70 => ("postgres".to_string(), "postgres".to_string()),
+        104 => ("syslog".to_string(), "adm".to_string()),
+        999 => ("redis".to_string(), "redis".to_string()),
+        _ => (format!("user{}", uid), "users".to_string()),
+    };
+
+    let mut perms = if path.contains("/bin/") || path.contains("/sbin/") || path.starts_with("/usr/bin/")
+    {
+        "-rwxr-xr-x.".to_string()
+    } else if path == "/etc/shadow" || path == "/etc/sudoers" {
+        "-rw-------.".to_string()
+    } else {
+        "-rw-r--r--.".to_string()
+    };
+
+    if path.contains("/tmp/")
+        && (path.contains("malware") || path.contains("backdoor") || path.contains(".hidden"))
+        && rng.gen_bool(0.35)
+    {
+        perms = "-rw-rw-rw-.".to_string();
+    }
+
+    let size = if rng.gen_bool(0.12) {
+        0u64
+    } else {
+        rng.gen_range(64u64..4_194_304u64)
+    };
+
+    (perms, owner, group, size)
+}
+
 fn generate_file_entries() -> Result<Vec<RawFileEntry>, Box<dyn Error>> {
-    let mut rng = rand::thread_rng();
+    let mut rng = StdRng::seed_from_u64(DATASET_RNG_SEED);
     let mut entries = Vec::new();
     
     // Start time: 7 days ago
@@ -498,14 +538,17 @@ fn generate_file_entries() -> Result<Vec<RawFileEntry>, Box<dyn Error>> {
     println!("  🔸 1 machine with root file access (machine_006)");
     println!("  🔸 2 machines with rare file patterns (machine_012, machine_015)");
     println!("  🔸 2 machines with MTIME ANOMALIES (machine_005, machine_014)");
+    println!("  🔸 3 machines with FLEET METADATA outliers (owner/group/size vs majority)");
     println!();
     println!("Anomalous Machines Summary:");
     println!("  • machine_003: Suspicious files in /tmp and /dev/shm");
     println!("  • machine_005: ⏰ MTIME ANOMALY - files modified recently (tampered)");
     println!("  • machine_006: Root access to sensitive files");
+    println!("  • machine_007: METADATA ANOMALY - /var/log/syslog group differs from fleet");
     println!("  • machine_009: Access to system configuration files");
     println!("  • machine_012: Rare file access patterns");
-    println!("  • machine_014: ⏰ MTIME ANOMALY - /etc/passwd modified recently");
+    println!("  • machine_011: METADATA ANOMALY - /etc/passwd size differs from fleet");
+    println!("  • machine_014: ⏰ MTIME ANOMALY + wrong owner on /etc/passwd vs fleet");
     println!("  • machine_015: Access to unusual file locations");
     println!("  • machine_017: Suspicious files + recently modified");
     println!();
@@ -604,12 +647,74 @@ fn generate_file_entries() -> Result<Vec<RawFileEntry>, Box<dyn Error>> {
                 None
             };
 
+            let (mut permissions, mut owner, mut group, mut size) =
+                file_row_metadata(&path, uid, &mut rng);
+
+            // Stable metadata for common system paths so the fleet agrees on owner/group/size;
+            // deliberate per-host overrides below produce METADATA ANOMALY detections.
+            if !path.starts_with("/tmp") {
+                match path.as_str() {
+                    "/etc/passwd" => {
+                        permissions = "-rw-r--r--.".to_string();
+                        owner = "root".to_string();
+                        group = "root".to_string();
+                        size = 1852;
+                    }
+                    "/etc/group" => {
+                        permissions = "-rw-r--r--.".to_string();
+                        owner = "root".to_string();
+                        group = "root".to_string();
+                        size = 968;
+                    }
+                    "/var/log/syslog" => {
+                        permissions = "-rw-r-----.".to_string();
+                        owner = "syslog".to_string();
+                        group = "adm".to_string();
+                        size = 2_048_000;
+                    }
+                    "/var/log/auth.log" => {
+                        permissions = "-rw-r-----.".to_string();
+                        owner = "root".to_string();
+                        group = "adm".to_string();
+                        size = 512_000;
+                    }
+                    "/usr/bin/python3" => {
+                        permissions = "-rwxr-xr-x.".to_string();
+                        owner = "root".to_string();
+                        group = "root".to_string();
+                        size = 6_004_000;
+                    }
+                    "/usr/bin/node" => {
+                        permissions = "-rwxr-xr-x.".to_string();
+                        owner = "root".to_string();
+                        group = "root".to_string();
+                        size = 95_000_000;
+                    }
+                    _ => {}
+                }
+            }
+
+            if path == "/etc/passwd" {
+                if i == 14 {
+                    owner = "nobody".to_string();
+                } else if i == 11 {
+                    size = 94_000_000;
+                }
+            }
+            if path == "/var/log/syslog" && i == 7 {
+                group = "root".to_string();
+            }
+
             entries.push(RawFileEntry {
                 machine_id: machine_id.clone(),
                 path,
                 uid,
                 timestamp: Some(timestamp),
                 mtime: mtime_str,
+                permissions: Some(permissions),
+                owner: Some(owner),
+                group: Some(group),
+                size: Some(size),
             });
         }
     }
@@ -638,21 +743,19 @@ fn write_files_json(entries: &[RawFileEntry], path: &str) -> Result<(), Box<dyn 
         if i > 0 {
             writeln!(file, ",")?;
         }
-        
-        // Include mtime field if present
-        let mtime_str = if let Some(mt) = &entry.mtime {
-            format!(r#", "mtime": "{}""#, mt)
-        } else {
-            String::new()
-        };
-        
-        write!(file, r#"  {{"machine_id": "{}", "path": "{}", "uid": {}, "timestamp": "{}"{}}}"#,
-            entry.machine_id,
-            entry.path.replace('"', "\\\""),
-            entry.uid,
-            entry.timestamp.as_ref().unwrap_or(&"".to_string()),
-            mtime_str
-        )?;
+        let line = json!({
+            "machine_id": entry.machine_id,
+            "file_path": entry.path,
+            "uid": entry.uid,
+            "timestamp": entry.timestamp,
+            "date": entry.mtime,
+            "permissions": entry.permissions,
+            "owner": entry.owner,
+            "group": entry.group,
+            "size": entry.size,
+            "event_type": "file_information",
+        });
+        write!(file, "  {}", serde_json::to_string(&line)?)?;
     }
     
     writeln!(file)?;
@@ -711,7 +814,13 @@ fn print_file_detection_instructions(output_file: &str) {
     println!("   💀 machine_014 (MTIME ANOMALY - CRITICAL)");
     println!("       • Files: /etc/passwd with recent modification time");
     println!("       • Risk: Critical system file modified recently");
+    println!("       • Also: owner on /etc/passwd differs from fleet majority (metadata outlier)");
     println!("       • Indicates: User account tampering or backdoor creation");
+    println!();
+    println!("   💀 machine_007 / machine_011 (FLEET METADATA ANOMALY)");
+    println!("       • machine_007: /var/log/syslog group differs from fleet");
+    println!("       • machine_011: /etc/passwd size differs from fleet");
+    println!("       • Risk: Same path should match peers on owner/group/size in a uniform fleet");
     println!();
     println!("   ⚠️  machine_015 (RARE FILE PATTERNS)");
     println!("       • Files: /home/rare_user/.config, /usr/local/special/bin");
@@ -723,10 +832,13 @@ fn print_file_detection_instructions(output_file: &str) {
     println!("       • Indicates: Active malware deployment");
     println!();
     println!("💡 TIPS:");
+    println!("   • CSV/JSON include file_path (or path), date/mtime, permissions, owner, group, size");
     println!("   • File analysis focuses on which files are accessed and WHEN modified");
     println!("   • MTIME ANOMALY: Compares file modification times across fleet");
     println!("       - Same file should have consistent mtime across machines");
     println!("       - A machine with different mtime indicates tampering");
+    println!("   • METADATA ANOMALY: For system paths, compares owner, group, and size across fleet");
+    println!("       - Same path on most hosts should share owner/group/size; outliers are flagged");
     println!("   • RECENTLY MODIFIED: File modified within 24h of access");
     println!("       - System files shouldn't change frequently");
     println!("   • Configure suspicious_path_patterns in config to flag specific paths");

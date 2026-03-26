@@ -22,7 +22,7 @@ pub use report::{
 };
 pub use utils::{
     calculate_shannon_entropy, is_path_suspicious, is_path_whitelisted, matches_wildcard,
-    parse_command_line,
+    parse_command_line, parse_log_datetime, unix_permission_flags,
 };
 pub use json_parse::{
     parse_files_json_logs, parse_json_log, parse_json_logs, parse_jsonl_logs,
@@ -37,7 +37,7 @@ pub use temporal::{
 };
 pub use loaders::{
     build_profiles_simple, generate_mock_data, load_csv_data, load_files_csv_data,
-    load_files_json_data, load_json_data, load_jsonl_data,
+    load_files_json_data, load_files_jsonl_data, load_json_data, load_jsonl_data,
 };
 
 #[cfg(test)]

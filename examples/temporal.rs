@@ -138,6 +138,7 @@ fn main() {
                 uid: 0,
                 timestamp: Some(ts.to_string()),
                 mtime: Some(nginx_mtime.to_string()),
+                ..Default::default()
             },
             RawFileEntry {
                 machine_id: mid.to_string(),
@@ -145,6 +146,7 @@ fn main() {
                 uid: 0,
                 timestamp: Some(ts.to_string()),
                 mtime: Some(nginx_mtime.to_string()),
+                ..Default::default()
             },
             RawFileEntry {
                 machine_id: mid.to_string(),
@@ -152,6 +154,7 @@ fn main() {
                 uid: 0,
                 timestamp: Some(ts.to_string()),
                 mtime: Some("2023-12-15T10:00:00Z".to_string()),
+                ..Default::default()
             },
             RawFileEntry {
                 machine_id: mid.to_string(),
@@ -159,6 +162,7 @@ fn main() {
                 uid: 0,
                 timestamp: Some(ts.to_string()),
                 mtime: Some("2023-12-15T10:00:00Z".to_string()),
+                ..Default::default()
             },
             RawFileEntry {
                 machine_id: mid.to_string(),
@@ -166,6 +170,7 @@ fn main() {
                 uid: 0,
                 timestamp: Some(ts.to_string()),
                 mtime: Some("2023-12-20T06:00:00Z".to_string()),
+                ..Default::default()
             },
             RawFileEntry {
                 machine_id: mid.to_string(),
@@ -173,6 +178,7 @@ fn main() {
                 uid: 0,
                 timestamp: Some(ts.to_string()),
                 mtime: None,
+                ..Default::default()
             },
             RawFileEntry {
                 machine_id: mid.to_string(),
@@ -180,6 +186,7 @@ fn main() {
                 uid: 33,
                 timestamp: Some(ts.to_string()),
                 mtime: Some(ts.to_string()),
+                ..Default::default()
             },
             RawFileEntry {
                 machine_id: mid.to_string(),
@@ -187,6 +194,7 @@ fn main() {
                 uid: 33,
                 timestamp: Some(ts.to_string()),
                 mtime: Some(ts.to_string()),
+                ..Default::default()
             },
             RawFileEntry {
                 machine_id: mid.to_string(),
@@ -194,6 +202,7 @@ fn main() {
                 uid: 104,
                 timestamp: Some(ts.to_string()),
                 mtime: Some(ts.to_string()),
+                ..Default::default()
             },
             RawFileEntry {
                 machine_id: mid.to_string(),
@@ -201,6 +210,7 @@ fn main() {
                 uid: 0,
                 timestamp: Some(ts.to_string()),
                 mtime: None,
+                ..Default::default()
             },
             RawFileEntry {
                 machine_id: mid.to_string(),
@@ -208,6 +218,7 @@ fn main() {
                 uid: 0,
                 timestamp: Some(ts.to_string()),
                 mtime: Some("2023-12-01T00:00:00Z".to_string()),
+                ..Default::default()
             },
             RawFileEntry {
                 machine_id: mid.to_string(),
@@ -215,6 +226,7 @@ fn main() {
                 uid: 0,
                 timestamp: Some(ts.to_string()),
                 mtime: Some("2024-01-01T00:00:00Z".to_string()),
+                ..Default::default()
             },
         ]
     }
@@ -290,6 +302,7 @@ fn main() {
         uid: 0,
         timestamp: Some(t2.to_string()),
         mtime: None,
+        ..Default::default()
     });
     let mut c2 = baseline_connections(machine_id);
     c2.push(RawConnectionEntry {
@@ -332,6 +345,7 @@ fn main() {
         uid: 0,
         timestamp: Some(t2.to_string()),
         mtime: None,
+        ..Default::default()
     });
     f3.push(RawFileEntry {
         machine_id: machine_id.to_string(),
@@ -339,6 +353,7 @@ fn main() {
         uid: 0,
         timestamp: Some(t3.to_string()),
         mtime: Some("2024-01-02T08:55:00Z".to_string()),
+        ..Default::default()
     });
     let mut c3 = baseline_connections(machine_id);
     c3.push(RawConnectionEntry {
@@ -400,6 +415,7 @@ fn main() {
         uid: 0,
         timestamp: Some(t2.to_string()),
         mtime: None,
+        ..Default::default()
     });
     f4.push(RawFileEntry {
         machine_id: machine_id.to_string(),
@@ -407,6 +423,7 @@ fn main() {
         uid: 0,
         timestamp: Some(t3.to_string()),
         mtime: Some("2024-01-02T08:55:00Z".to_string()),
+        ..Default::default()
     });
     f4.iter_mut()
         .find(|e| e.path == "/etc/hosts")
@@ -488,6 +505,7 @@ fn main() {
         uid: 0,
         timestamp: Some(t2.to_string()),
         mtime: None,
+        ..Default::default()
     });
     f5.push(RawFileEntry {
         machine_id: machine_id.to_string(),
@@ -495,6 +513,7 @@ fn main() {
         uid: 0,
         timestamp: Some(t3.to_string()),
         mtime: Some("2024-01-02T08:55:00Z".to_string()),
+        ..Default::default()
     });
     f5.iter_mut()
         .find(|e| e.path == "/etc/hosts")
@@ -505,6 +524,7 @@ fn main() {
         uid: 0,
         timestamp: Some(t5.to_string()),
         mtime: Some("2024-01-03T09:45:00Z".to_string()),
+        ..Default::default()
     });
     let mut c5 = baseline_connections(machine_id);
     c5.push(RawConnectionEntry {
@@ -552,6 +572,7 @@ fn main() {
         uid: 0,
         timestamp: Some(t2.to_string()),
         mtime: None,
+        ..Default::default()
     });
     f6.push(RawFileEntry {
         machine_id: machine_id.to_string(),
@@ -559,6 +580,7 @@ fn main() {
         uid: 0,
         timestamp: Some(t3.to_string()),
         mtime: Some("2024-01-02T08:55:00Z".to_string()),
+        ..Default::default()
     });
     f6.iter_mut()
         .find(|e| e.path == "/etc/hosts")
@@ -569,6 +591,7 @@ fn main() {
         uid: 0,
         timestamp: Some(t5.to_string()),
         mtime: Some("2024-01-03T09:45:00Z".to_string()),
+        ..Default::default()
     });
     let mut c6 = baseline_connections(machine_id);
     c6.push(RawConnectionEntry {
