@@ -48,5 +48,7 @@
     "/home/*/venv/*",
     "/home/*/anaconda3/*",
     "/opt/custom-app/*"
-  ]
+  ],
+  "file_excluded_path_regexes": [],
+  "file_excluded_filename_regexes": []
 }

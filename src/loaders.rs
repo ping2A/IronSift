@@ -1,15 +1,28 @@
 //! Data loaders: CSV/JSON and mock data.
+//!
+//! CSV and JSONL inputs use **streaming** (two-pass for process logs so PID→name is complete,
+//! single-pass for file logs) to scale to millions of rows without holding the full dataset in RAM.
 
+use std::collections::HashMap;
 use std::error::Error;
+use std::sync::Arc;
 use std::fs;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 use log;
 
-use crate::builder::{build_profiles, ProcessBuilder};
+use crate::builder::{
+    build_profiles, merge_log_into_profile, process_entry_passes_filters, ProcessBuilder,
+};
 use crate::config::DetectionConfig;
-use crate::file_analysis::build_file_profiles;
-use crate::json_parse::{parse_files_json_logs, parse_json_logs, parse_jsonl_logs};
+use crate::interner::{merge_pid_map_entry, SharedInterner};
+use crate::file_analysis::{
+    build_file_profiles, merge_file_log_into_profile, should_ingest_file_entry,
+};
+use crate::json_parse::{parse_files_json_logs, parse_json_logs, parse_jsonl_process_line};
 use crate::types::{MachineFileProfile, MachineProfile, RawFileEntry, RawLogEntry};
+use crate::utils::compile_regex_list;
 
 pub fn load_csv_data(
     path: &str,
@@ -22,12 +35,54 @@ pub fn load_csv_data(
     if metadata.len() == 0 {
         return Err(format!("Input file is empty: '{}'", path).into());
     }
-    let mut rdr = csv::Reader::from_path(path)?;
-    let entries: Vec<RawLogEntry> = rdr.deserialize().collect::<Result<Vec<_>, _>>()?;
-    if entries.is_empty() {
+
+    let interner = SharedInterner::default();
+    let mut pid_to_name: HashMap<(Arc<str>, u32), Arc<str>> = HashMap::new();
+    {
+        let mut rdr = csv::Reader::from_path(path)?;
+        for result in rdr.deserialize::<RawLogEntry>() {
+            let entry = result?;
+            merge_pid_map_entry(&interner, &mut pid_to_name, &entry);
+        }
+    }
+
+    let mut machine_profiles: HashMap<String, MachineProfile> = HashMap::new();
+    let mut debug_keys: HashMap<String, HashMap<String, u32>> = HashMap::new();
+    let mut row_count: u64 = 0;
+    {
+        let mut rdr = csv::Reader::from_path(path)?;
+        for result in rdr.deserialize::<RawLogEntry>() {
+            let entry = result?;
+            row_count += 1;
+            if !process_entry_passes_filters(&entry, config) {
+                continue;
+            }
+            let mid = entry.machine_id.clone();
+            let profile = machine_profiles
+                .entry(mid.clone())
+                .or_insert_with(|| MachineProfile::new(&mid));
+            let pc = if config.debug_display {
+                Some(debug_keys.entry(mid).or_default())
+            } else {
+                None
+            };
+            merge_log_into_profile(profile, &entry, &pid_to_name, config, &interner, pc);
+        }
+    }
+
+    if machine_profiles.is_empty() {
         return Err(format!("No valid machine logs found in '{}'.", path).into());
     }
-    Ok(build_profiles(entries, config))
+
+    log::info!(
+        "Loaded {} CSV process rows into {} machine profiles (streaming)",
+        row_count,
+        machine_profiles.len()
+    );
+
+    let mut profiles: Vec<MachineProfile> = machine_profiles.into_values().collect();
+    profiles.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(profiles)
 }
 
 pub fn load_json_data(
@@ -64,21 +119,77 @@ pub fn load_jsonl_data(
     if metadata.len() == 0 {
         return Err(format!("Input file is empty: '{}'", path).into());
     }
-    let content = fs::read_to_string(path)?;
     let default_machine_id = Path::new(path)
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("default");
-    let entries = parse_jsonl_logs(&content, default_machine_id)?;
-    if entries.is_empty() {
+
+    let interner = SharedInterner::default();
+    let mut pid_to_name: HashMap<(Arc<str>, u32), Arc<str>> = HashMap::new();
+    {
+        let f = File::open(path)?;
+        for line in BufReader::new(f).lines() {
+            let line = line?;
+            let t = line.trim();
+            if t.is_empty() || t.starts_with("//") || t.starts_with('#') {
+                continue;
+            }
+            match parse_jsonl_process_line(t, default_machine_id) {
+                Ok(entry) => merge_pid_map_entry(&interner, &mut pid_to_name, &entry),
+                Err(e) => log::warn!("JSONL pid-map pass skipped line: {} — {}", t, e),
+            }
+        }
+    }
+
+    let mut machine_profiles: HashMap<String, MachineProfile> = HashMap::new();
+    let mut debug_keys: HashMap<String, HashMap<String, u32>> = HashMap::new();
+    let mut row_count: u64 = 0;
+    {
+        let f = File::open(path)?;
+        for line in BufReader::new(f).lines() {
+            let line = line?;
+            let t = line.trim();
+            if t.is_empty() || t.starts_with("//") || t.starts_with('#') {
+                continue;
+            }
+            let entry = match parse_jsonl_process_line(t, default_machine_id) {
+                Ok(e) => e,
+                Err(e) => {
+                    log::warn!("JSONL profile pass skipped line: {} — {}", t, e);
+                    continue;
+                }
+            };
+            row_count += 1;
+            if !process_entry_passes_filters(&entry, config) {
+                continue;
+            }
+            let mid = entry.machine_id.clone();
+            let profile = machine_profiles
+                .entry(mid.clone())
+                .or_insert_with(|| MachineProfile::new(&mid));
+            let pc = if config.debug_display {
+                Some(debug_keys.entry(mid).or_default())
+            } else {
+                None
+            };
+            merge_log_into_profile(profile, &entry, &pid_to_name, config, &interner, pc);
+        }
+    }
+
+    if machine_profiles.is_empty() {
         return Err(format!("No valid process lines found in '{}'.", path).into());
     }
+
     log::info!(
-        "Loaded {} process entries from JSONL (machine_id: {})",
-        entries.len(),
+        "Loaded {} JSONL process rows into {} machine profiles (streaming, default machine_id: {})",
+        row_count,
+        machine_profiles.len(),
         default_machine_id
     );
-    Ok(build_profiles(entries, config))
+
+    let mut profiles: Vec<MachineProfile> = machine_profiles.into_values().collect();
+    profiles.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(profiles)
 }
 
 pub fn load_files_csv_data(
@@ -92,12 +203,51 @@ pub fn load_files_csv_data(
     if metadata.len() == 0 {
         return Err(format!("Input file is empty: '{}'", path).into());
     }
+
+    let path_exclude_res = compile_regex_list(&config.file_excluded_path_regexes);
+    let filename_exclude_res = compile_regex_list(&config.file_excluded_filename_regexes);
+    let interner = SharedInterner::default();
+
+    let mut machine_profiles: HashMap<String, MachineFileProfile> = HashMap::new();
+    let mut debug_keys: HashMap<String, HashMap<String, u32>> = HashMap::new();
+    let mut row_count: u64 = 0;
     let mut rdr = csv::Reader::from_path(path)?;
-    let entries: Vec<RawFileEntry> = rdr.deserialize().collect::<Result<Vec<_>, _>>()?;
-    if entries.is_empty() {
+    for result in rdr.deserialize::<RawFileEntry>() {
+        let entry = result?;
+        row_count += 1;
+        if !should_ingest_file_entry(
+            &entry,
+            config,
+            &path_exclude_res,
+            &filename_exclude_res,
+        ) {
+            continue;
+        }
+        let mid = entry.machine_id.clone();
+        let profile = machine_profiles
+            .entry(mid.clone())
+            .or_insert_with(|| MachineFileProfile::new(&mid));
+        let fc = if config.debug_display {
+            Some(debug_keys.entry(mid).or_default())
+        } else {
+            None
+        };
+        merge_file_log_into_profile(profile, &entry, config, &interner, fc);
+    }
+
+    if machine_profiles.is_empty() {
         return Err(format!("No valid file access logs found in '{}'.", path).into());
     }
-    Ok(build_file_profiles(entries, config))
+
+    log::info!(
+        "Loaded {} CSV file rows into {} machine profiles (streaming)",
+        row_count,
+        machine_profiles.len()
+    );
+
+    let mut profiles: Vec<MachineFileProfile> = machine_profiles.into_values().collect();
+    profiles.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(profiles)
 }
 
 pub fn load_files_json_data(
@@ -140,17 +290,66 @@ pub fn load_files_jsonl_data(
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("default");
-    let content = fs::read_to_string(path)?;
-    let entries = parse_files_json_logs(&content, default_machine_id)?;
-    if entries.is_empty() {
+
+    let path_exclude_res = compile_regex_list(&config.file_excluded_path_regexes);
+    let filename_exclude_res = compile_regex_list(&config.file_excluded_filename_regexes);
+    let interner = SharedInterner::default();
+
+    let mut machine_profiles: HashMap<String, MachineFileProfile> = HashMap::new();
+    let mut debug_keys: HashMap<String, HashMap<String, u32>> = HashMap::new();
+    let mut row_count: u64 = 0;
+    let f = File::open(path)?;
+    for line in BufReader::new(f).lines() {
+        let line = line?;
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let mut entry: RawFileEntry = match serde_json::from_str(t) {
+            Ok(e) => e,
+            Err(e) => {
+                log::warn!("JSONL file line skipped: {} — {}", t, e);
+                continue;
+            }
+        };
+        if entry.machine_id.is_empty() {
+            entry.machine_id = default_machine_id.to_string();
+        }
+        row_count += 1;
+        if !should_ingest_file_entry(
+            &entry,
+            config,
+            &path_exclude_res,
+            &filename_exclude_res,
+        ) {
+            continue;
+        }
+        let mid = entry.machine_id.clone();
+        let profile = machine_profiles
+            .entry(mid.clone())
+            .or_insert_with(|| MachineFileProfile::new(&mid));
+        let fc = if config.debug_display {
+            Some(debug_keys.entry(mid).or_default())
+        } else {
+            None
+        };
+        merge_file_log_into_profile(profile, &entry, config, &interner, fc);
+    }
+
+    if machine_profiles.is_empty() {
         return Err(format!("No valid file access lines found in '{}'.", path).into());
     }
+
     log::info!(
-        "Loaded {} file access entries from JSONL (default machine_id: {})",
-        entries.len(),
+        "Loaded {} JSONL file rows into {} machine profiles (streaming, default machine_id: {})",
+        row_count,
+        machine_profiles.len(),
         default_machine_id
     );
-    Ok(build_file_profiles(entries, config))
+
+    let mut profiles: Vec<MachineFileProfile> = machine_profiles.into_values().collect();
+    profiles.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(profiles)
 }
 
 pub fn generate_mock_data(config: &DetectionConfig) -> Vec<MachineProfile> {

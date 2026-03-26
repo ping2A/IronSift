@@ -2,17 +2,23 @@
 
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
+use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use ndarray::Array2;
 use linfa::traits::Transformer;
 use linfa_clustering::Dbscan;
 use rayon::prelude::*;
 use log;
+use regex::Regex;
 
 use crate::config::DetectionConfig;
+use crate::interner::SharedInterner;
 use crate::report::{AnalysisReport, AnalysisType, AnomalyDetails, AnomalyLevel};
 use crate::types::{FileSignature, MachineFileProfile, RawFileEntry};
-use crate::utils::{is_path_suspicious, is_path_whitelisted, parse_log_datetime, unix_permission_flags};
+use crate::utils::{
+    compile_regex_list, file_path_matches_exclusion, is_path_suspicious, is_path_whitelisted,
+    parse_log_datetime, unix_permission_flags,
+};
 
 /// Paths where owner/group/size are expected to be uniform across a homogeneous fleet.
 fn path_supports_fleet_metadata_baseline(path: &str) -> bool {
@@ -28,13 +34,13 @@ fn path_supports_fleet_metadata_baseline(path: &str) -> bool {
 /// majority that appears at least twice; hosts with a different value are flagged.
 fn fleet_string_metadata_outliers(
     profiles: &[MachineFileProfile],
-    field: impl Fn(&MachineFileProfile) -> &HashMap<String, String>,
+    field: impl Fn(&MachineFileProfile) -> &HashMap<Arc<str>, Arc<str>>,
     field_label: &str,
 ) -> HashMap<usize, Vec<String>> {
-    let mut path_hosts: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+    let mut path_hosts: HashMap<Arc<str>, Vec<(usize, Arc<str>)>> = HashMap::new();
     for (i, p) in profiles.iter().enumerate() {
         for (path, val) in field(p) {
-            if !path_supports_fleet_metadata_baseline(path) {
+            if !path_supports_fleet_metadata_baseline(path.as_ref()) {
                 continue;
             }
             path_hosts
@@ -48,7 +54,7 @@ fn fleet_string_metadata_outliers(
         if rows.len() < 3 {
             continue;
         }
-        let mut freq: HashMap<String, usize> = HashMap::new();
+        let mut freq: HashMap<Arc<str>, usize> = HashMap::new();
         for (_, ref v) in &rows {
             *freq.entry(v.clone()).or_insert(0) += 1;
         }
@@ -60,7 +66,10 @@ fn fleet_string_metadata_outliers(
             if v != mode {
                 out.entry(machine_idx).or_default().push(format!(
                     "METADATA ANOMALY: {} on {} is '{}' (fleet majority: '{}')",
-                    field_label, path, v, mode
+                    field_label,
+                    path.as_ref(),
+                    v.as_ref(),
+                    mode.as_ref()
                 ));
             }
         }
@@ -70,10 +79,10 @@ fn fleet_string_metadata_outliers(
 
 /// Same path on ≥3 hosts with recorded size; majority size must appear at least twice.
 fn fleet_size_metadata_outliers(profiles: &[MachineFileProfile]) -> HashMap<usize, Vec<String>> {
-    let mut path_hosts: HashMap<String, Vec<(usize, u64)>> = HashMap::new();
+    let mut path_hosts: HashMap<Arc<str>, Vec<(usize, u64)>> = HashMap::new();
     for (i, p) in profiles.iter().enumerate() {
         for (path, sz) in &p.file_path_size {
-            if !path_supports_fleet_metadata_baseline(path) {
+            if !path_supports_fleet_metadata_baseline(path.as_ref()) {
                 continue;
             }
             path_hosts
@@ -99,12 +108,147 @@ fn fleet_size_metadata_outliers(profiles: &[MachineFileProfile]) -> HashMap<usiz
             if sz != mode_size {
                 out.entry(machine_idx).or_default().push(format!(
                     "METADATA ANOMALY: size on {} is {} bytes (fleet majority: {} bytes)",
-                    path, sz, mode_size
+                    path.as_ref(),
+                    sz,
+                    mode_size
                 ));
             }
         }
     }
     out
+}
+
+/// Whether a raw file row should be ingested into file profiles. Applies glob whitelist
+/// (`whitelisted_path_patterns`) and regex exclusions (`file_excluded_path_regexes`,
+/// `file_excluded_filename_regexes` on compiled patterns).
+pub fn should_ingest_file_entry(
+    entry: &RawFileEntry,
+    config: &DetectionConfig,
+    path_exclude_res: &[Regex],
+    filename_exclude_res: &[Regex],
+) -> bool {
+    if !config.whitelisted_path_patterns.is_empty()
+        && is_path_whitelisted(&entry.path, &config.whitelisted_path_patterns)
+    {
+        return false;
+    }
+    if file_path_matches_exclusion(&entry.path, path_exclude_res, filename_exclude_res) {
+        return false;
+    }
+    true
+}
+
+/// Append one file access log to a profile (batch and streaming loaders).
+pub(crate) fn merge_file_log_into_profile(
+    profile: &mut MachineFileProfile,
+    entry: &RawFileEntry,
+    config: &DetectionConfig,
+    interner: &SharedInterner,
+    file_counts: Option<&mut HashMap<String, u32>>,
+) {
+    let path_is_suspicious = is_path_suspicious(&entry.path, &config.suspicious_path_patterns);
+    let timestamp = entry.timestamp.as_ref().and_then(|s| parse_log_datetime(s));
+    let mtime = entry.mtime.as_ref().and_then(|s| parse_log_datetime(s));
+    let recently_modified = if let (Some(ts), Some(mt)) = (timestamp, mtime) {
+        let diff = ts.signed_duration_since(mt);
+        diff.num_hours().abs() < 24
+    } else {
+        false
+    };
+    let uid = effective_file_uid(entry);
+    let (is_world_writable, is_group_writable) = entry
+        .permissions
+        .as_deref()
+        .map(unix_permission_flags)
+        .unwrap_or((false, false));
+    let permissions = entry.permissions.as_deref().and_then(|p| {
+        let t = p.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some(interner.intern(t))
+        }
+    });
+    let owner = entry.owner.as_deref().and_then(|o| {
+        let t = o.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some(interner.intern(t))
+        }
+    });
+    let group = entry.group.as_deref().and_then(|g| {
+        let t = g.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some(interner.intern(t))
+        }
+    });
+    let sig = FileSignature {
+        path: interner.intern(&entry.path),
+        uid,
+        is_suspicious_path: path_is_suspicious,
+        has_mtime_anomaly: false,
+        recently_modified,
+        permissions,
+        owner,
+        group,
+        size: entry.size,
+        is_world_writable,
+        is_group_writable,
+    };
+    if let Some(fc) = file_counts {
+        let file_key = format!(
+            "{}:{}:{:?}:{:?}:{:?}",
+            sig.path, sig.uid, sig.permissions, sig.owner, sig.size
+        );
+        let is_new_file = !fc.contains_key(&file_key);
+        fc.entry(file_key).and_modify(|c| *c += 1).or_insert(1);
+        if config.debug_display && is_new_file {
+            let risk_flags: Vec<&str> = [
+                if path_is_suspicious {
+                    Some("SUSPICIOUS_PATH")
+                } else {
+                    None
+                },
+                if entry.path.contains("/etc")
+                    || entry.path.contains("/bin")
+                    || entry.path.contains("/sbin")
+                {
+                    Some("SYSTEM_DIRECTORY")
+                } else {
+                    None
+                },
+                if uid == 0 {
+                    Some("ROOT_ACCESS")
+                } else {
+                    None
+                },
+                if recently_modified {
+                    Some("RECENTLY_MODIFIED")
+                } else {
+                    None
+                },
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            let risk_str = if risk_flags.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", risk_flags.join(", "))
+            };
+            log::debug!(
+                "New file access in {}: {} (uid: {}){}",
+                profile.id,
+                entry.path,
+                uid,
+                risk_str
+            );
+        }
+    }
+    profile.add_file(sig, timestamp, mtime);
 }
 
 fn effective_file_uid(entry: &RawFileEntry) -> u32 {
@@ -128,25 +272,24 @@ pub fn build_file_profiles(
     config: &DetectionConfig,
 ) -> Vec<MachineFileProfile> {
     log::info!("Building file profiles from {} raw file entries", entries.len());
-    let entries: Vec<RawFileEntry> = if !config.whitelisted_path_patterns.is_empty() {
-        let before_count = entries.len();
-        let filtered: Vec<_> = entries
-            .into_iter()
-            .filter(|e| !is_path_whitelisted(&e.path, &config.whitelisted_path_patterns))
-            .collect();
-        let after_count = filtered.len();
-        if config.debug_display {
-            log::debug!(
-                "Whitelisted file path filtering: before={}, after={}, filtered={}",
-                before_count,
-                after_count,
-                before_count - after_count
-            );
-        }
-        filtered
-    } else {
-        entries
-    };
+    let path_exclude_res = compile_regex_list(&config.file_excluded_path_regexes);
+    let filename_exclude_res = compile_regex_list(&config.file_excluded_filename_regexes);
+    let before_count = entries.len();
+    let entries: Vec<RawFileEntry> = entries
+        .into_iter()
+        .filter(|e| should_ingest_file_entry(e, config, &path_exclude_res, &filename_exclude_res))
+        .collect();
+    let after_count = entries.len();
+    if config.debug_display && before_count != after_count {
+        log::debug!(
+            "File ingest filter (whitelist + regex exclusions): before={}, after={}, filtered={}",
+            before_count,
+            after_count,
+            before_count - after_count
+        );
+    }
+
+    let interner = SharedInterner::default();
 
     let mut machine_entries: HashMap<String, Vec<RawFileEntry>> = HashMap::new();
     for entry in entries {
@@ -165,85 +308,14 @@ pub fn build_file_profiles(
         .map(|(machine_id, logs)| {
             let mut profile = MachineFileProfile::new(machine_id);
             let mut file_counts: HashMap<String, u32> = HashMap::new();
+            let interner_par = interner.clone();
             for entry in logs {
-                let path_is_suspicious =
-                    is_path_suspicious(&entry.path, &config.suspicious_path_patterns);
-                let timestamp = entry.timestamp.as_ref().and_then(|s| parse_log_datetime(s));
-                let mtime = entry.mtime.as_ref().and_then(|s| parse_log_datetime(s));
-                let recently_modified = if let (Some(ts), Some(mt)) = (timestamp, mtime) {
-                    let diff = ts.signed_duration_since(mt);
-                    diff.num_hours().abs() < 24
+                let fc = if config.debug_display {
+                    Some(&mut file_counts)
                 } else {
-                    false
+                    None
                 };
-                let uid = effective_file_uid(entry);
-                let (is_world_writable, is_group_writable) = entry
-                    .permissions
-                    .as_deref()
-                    .map(unix_permission_flags)
-                    .unwrap_or((false, false));
-                let sig = FileSignature {
-                    path: entry.path.clone(),
-                    uid,
-                    is_suspicious_path: path_is_suspicious,
-                    has_mtime_anomaly: false,
-                    recently_modified,
-                    permissions: entry.permissions.clone(),
-                    owner: entry.owner.clone(),
-                    group: entry.group.clone(),
-                    size: entry.size,
-                    is_world_writable,
-                    is_group_writable,
-                };
-                let file_key = format!(
-                    "{}:{}:{:?}:{:?}:{:?}",
-                    sig.path, sig.uid, sig.permissions, sig.owner, sig.size
-                );
-                let is_new_file = !file_counts.contains_key(&file_key);
-                file_counts.entry(file_key).and_modify(|c| *c += 1).or_insert(1);
-                if config.debug_display && is_new_file {
-                    let risk_flags: Vec<&str> = [
-                        if path_is_suspicious {
-                            Some("SUSPICIOUS_PATH")
-                        } else {
-                            None
-                        },
-                        if entry.path.contains("/etc")
-                            || entry.path.contains("/bin")
-                            || entry.path.contains("/sbin")
-                        {
-                            Some("SYSTEM_DIRECTORY")
-                        } else {
-                            None
-                        },
-                        if uid == 0 {
-                            Some("ROOT_ACCESS")
-                        } else {
-                            None
-                        },
-                        if recently_modified {
-                            Some("RECENTLY_MODIFIED")
-                        } else {
-                            None
-                        },
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .collect();
-                    let risk_str = if risk_flags.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" [{}]", risk_flags.join(", "))
-                    };
-                    log::debug!(
-                        "New file access in {}: {} (uid: {}){}",
-                        machine_id,
-                        entry.path,
-                        uid,
-                        risk_str
-                    );
-                }
-                profile.add_file(sig, timestamp, mtime);
+                merge_file_log_into_profile(&mut profile, entry, config, &interner_par, fc);
             }
             profile
         })
@@ -267,7 +339,7 @@ pub fn analyze_files_fleet(
         });
     }
 
-    let mut file_mtimes_fleet: HashMap<String, Vec<(usize, DateTime<Utc>)>> = HashMap::new();
+    let mut file_mtimes_fleet: HashMap<Arc<str>, Vec<(usize, DateTime<Utc>)>> = HashMap::new();
     for (i, profile) in profiles.iter().enumerate() {
         for (path, mtime) in &profile.file_mtimes {
             file_mtimes_fleet
@@ -295,12 +367,14 @@ pub fn analyze_files_fleet(
                 let detail = if diff.num_hours() > 0 {
                     format!(
                         "MTIME ANOMALY: {} modified {}h NEWER than fleet baseline",
-                        path, diff_hours
+                        path.as_ref(),
+                        diff_hours
                     )
                 } else {
                     format!(
                         "MTIME ANOMALY: {} modified {}h OLDER than fleet baseline",
-                        path, diff_hours
+                        path.as_ref(),
+                        diff_hours
                     )
                 };
                 mtime_anomaly_details
@@ -346,33 +420,75 @@ pub fn analyze_files_fleet(
             unique_features.insert(key);
         }
     }
-    let feature_list: Vec<&FileSignature> = unique_features.into_iter().collect();
+    let mut feature_list: Vec<&FileSignature> = unique_features.into_iter().collect();
+    feature_list.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then(a.uid.cmp(&b.uid))
+            .then(a.is_suspicious_path.cmp(&b.is_suspicious_path))
+            .then(a.has_mtime_anomaly.cmp(&b.has_mtime_anomaly))
+            .then(a.recently_modified.cmp(&b.recently_modified))
+            .then((&a.permissions, &a.owner, &a.group, &a.size).cmp(&(
+                &b.permissions,
+                &b.owner,
+                &b.group,
+                &b.size,
+            )))
+            .then(a.is_world_writable.cmp(&b.is_world_writable))
+            .then(a.is_group_writable.cmp(&b.is_group_writable))
+    });
     let n_samples = profiles.len();
     let n_features = feature_list.len();
 
-    let mut data = Array2::<f64>::zeros((n_samples, n_features));
-    for (row_idx, profile) in profiles.iter().enumerate() {
-        if profile.total_logs == 0 {
-            continue;
-        }
-        for (col_idx, feature) in feature_list.iter().enumerate() {
-            if let Some(&count) = profile.counts.get(feature) {
-                let tf = count as f64 / profile.total_logs as f64;
-                let doc_count = profiles.iter().filter(|p| p.counts.contains_key(feature)).count();
-                let idf = ((n_samples as f64) / (doc_count as f64 + 1.0)).ln() + 1.0;
-                data[[row_idx, col_idx]] = tf * idf;
-            }
-        }
-    }
+    let feature_doc_freq: Vec<usize> = feature_list
+        .par_iter()
+        .map(|feature| profiles.iter().filter(|p| p.counts.contains_key(*feature)).count())
+        .collect();
 
-    if config.normalize_features {
-        for mut row in data.rows_mut() {
-            let norm = row.mapv(|x| x * x).sum().sqrt();
-            if norm > 0.0 {
-                row.mapv_inplace(|x| x / norm);
-            }
+    let file_doc_count_map: HashMap<&FileSignature, usize> = feature_list
+        .iter()
+        .enumerate()
+        .map(|(i, &f)| (f, feature_doc_freq[i]))
+        .collect();
+
+    let data = if n_features == 0 {
+        Array2::<f64>::zeros((n_samples, 1))
+    } else {
+        let n_samples_f = n_samples as f64;
+        let mut flat = vec![0.0f64; n_samples * n_features];
+        flat.par_chunks_mut(n_features)
+            .enumerate()
+            .for_each(|(row_idx, row)| {
+                let profile = &profiles[row_idx];
+                if profile.total_logs == 0 {
+                    return;
+                }
+                let tlog = profile.total_logs as f64;
+                for (col_idx, feature) in feature_list.iter().enumerate() {
+                    if let Some(&count) = profile.counts.get(feature) {
+                        let tf = count as f64 / tlog;
+                        let doc_count = feature_doc_freq[col_idx].max(1) as f64;
+                        let idf = (n_samples_f / doc_count).ln() + 1.0;
+                        row[col_idx] = tf * idf;
+                    }
+                }
+            });
+
+        if config.normalize_features {
+            flat.par_chunks_mut(n_features).for_each(|row| {
+                let norm = row.iter().map(|x| x * x).sum::<f64>().sqrt();
+                if norm > 0.0 {
+                    for x in row.iter_mut() {
+                        *x /= norm;
+                    }
+                }
+            });
         }
-    }
+
+        Array2::from_shape_vec((n_samples, n_features), flat).map_err(|e| -> Box<dyn Error> {
+            format!("internal: file TF-IDF matrix shape: {}", e).into()
+        })?
+    };
 
     let clusters = Dbscan::params(config.dbscan_min_samples)
         .tolerance(config.dbscan_tolerance)
@@ -430,7 +546,7 @@ pub fn analyze_files_fleet(
                 || (sig.is_group_writable && (sig.path.contains("/etc") || sig.path.contains("/tmp")));
             let owner_mismatch = (sig.path.starts_with("/etc") || sig.path.starts_with("/root"))
                 && sig.owner.as_ref().map_or(false, |o| {
-                    let o = o.trim();
+                    let o = o.as_ref().trim();
                     !o.is_empty() && !o.eq_ignore_ascii_case("root")
                 });
             if is_behavioral_risk || is_system_directory || is_root_access || perm_risk || owner_mismatch {
@@ -443,8 +559,9 @@ pub fn analyze_files_fleet(
                     ));
                 } else if owner_mismatch {
                     anomalous_features.push(format!(
-                        "RISK DETECTED: non-root owner on sensitive path {} ({:?})",
-                        sig.path, sig.owner
+                        "RISK DETECTED: non-root owner on sensitive path {} ({})",
+                        sig.path.as_ref(),
+                        sig.owner.as_deref().unwrap_or("")
                     ));
                 } else if is_system_directory {
                     anomalous_features.push(format!(
@@ -465,7 +582,7 @@ pub fn analyze_files_fleet(
                     ));
                 }
             }
-            let doc_count = profiles.iter().filter(|p| p.counts.contains_key(sig)).count();
+            let doc_count = file_doc_count_map.get(sig).copied().unwrap_or(0);
             if doc_count == 1 {
                 anomalous_features.push(format!("Rare file access: {}", sig.path));
             }

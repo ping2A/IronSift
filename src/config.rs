@@ -44,6 +44,16 @@ pub struct DetectionConfig {
     /// Path whitelist patterns (glob-style wildcards: * and ?)
     pub whitelisted_path_patterns: Vec<String>,
 
+    /// **File analysis only:** Rust regex patterns matched against the full file path; matching
+    /// events are dropped before profiling (no effect on process analysis).
+    #[serde(default)]
+    pub file_excluded_path_regexes: Vec<String>,
+
+    /// **File analysis only:** Rust regex patterns matched against the basename (last `/` segment);
+    /// matching events are dropped before profiling.
+    #[serde(default)]
+    pub file_excluded_filename_regexes: Vec<String>,
+
     /// When true, suppress progress and verbose output (for use by scripts/pipelines)
     #[serde(default)]
     pub quiet: bool,
@@ -97,6 +107,8 @@ impl Default for DetectionConfig {
             debug_display: false,
             exclude_init_children: false,
             whitelisted_path_patterns: vec![],
+            file_excluded_path_regexes: vec![],
+            file_excluded_filename_regexes: vec![],
             quiet: false,
         }
     }
@@ -142,6 +154,18 @@ impl DetectionConfig {
         }
         if !self.whitelisted_path_patterns.is_empty() {
             log::info!("Whitelisted path patterns: {} configured", self.whitelisted_path_patterns.len());
+        }
+        if !self.file_excluded_path_regexes.is_empty() {
+            log::info!(
+                "File analysis: {} excluded-path regex(es)",
+                self.file_excluded_path_regexes.len()
+            );
+        }
+        if !self.file_excluded_filename_regexes.is_empty() {
+            log::info!(
+                "File analysis: {} excluded-filename regex(es)",
+                self.file_excluded_filename_regexes.len()
+            );
         }
         if !self.common_root_processes.is_empty() {
             log::info!("Common root processes: {} listed", self.common_root_processes.len());

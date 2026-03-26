@@ -32,33 +32,70 @@ pub fn analyze_fleet(
         }
     }
 
-    let feature_list: Vec<&ProcessSignature> = unique_features.into_iter().collect();
+    let mut feature_list: Vec<&ProcessSignature> = unique_features.into_iter().collect();
+    feature_list.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then(a.path.cmp(&b.path))
+            .then(a.parent_name.cmp(&b.parent_name))
+            .then(a.uid.cmp(&b.uid))
+            .then(a.is_high_entropy.cmp(&b.is_high_entropy))
+            .then(a.is_suspicious_path.cmp(&b.is_suspicious_path))
+    });
+
     let n_samples = profiles.len();
     let n_features = feature_list.len();
 
-    let mut data = Array2::<f64>::zeros((n_samples, n_features));
-    for (row_idx, profile) in profiles.iter().enumerate() {
-        if profile.total_logs == 0 {
-            continue;
-        }
-        for (col_idx, feature) in feature_list.iter().enumerate() {
-            if let Some(&count) = profile.counts.get(feature) {
-                let tf = count as f64 / profile.total_logs as f64;
-                let doc_count = profiles.iter().filter(|p| p.counts.contains_key(feature)).count();
-                let idf = ((n_samples as f64) / (doc_count as f64 + 1.0)).ln() + 1.0;
-                data[[row_idx, col_idx]] = tf * idf;
-            }
-        }
-    }
+    // Document frequency per feature — O(features × machines), not O(features × machines²).
+    let feature_doc_freq: Vec<usize> = feature_list
+        .par_iter()
+        .map(|feature| profiles.iter().filter(|p| p.counts.contains_key(*feature)).count())
+        .collect();
 
-    if config.normalize_features {
-        for mut row in data.rows_mut() {
-            let norm = row.mapv(|x| x * x).sum().sqrt();
-            if norm > 0.0 {
-                row.mapv_inplace(|x| x / norm);
-            }
+    let doc_count_map: HashMap<&ProcessSignature, usize> = feature_list
+        .iter()
+        .enumerate()
+        .map(|(i, &f)| (f, feature_doc_freq[i]))
+        .collect();
+
+    let data = if n_features == 0 {
+        Array2::<f64>::zeros((n_samples, 1))
+    } else {
+        let n_samples_f = n_samples as f64;
+        let mut flat = vec![0.0f64; n_samples * n_features];
+        flat.par_chunks_mut(n_features)
+            .enumerate()
+            .for_each(|(row_idx, row)| {
+                let profile = &profiles[row_idx];
+                if profile.total_logs == 0 {
+                    return;
+                }
+                let tlog = profile.total_logs as f64;
+                for (col_idx, feature) in feature_list.iter().enumerate() {
+                    if let Some(&count) = profile.counts.get(feature) {
+                        let tf = count as f64 / tlog;
+                        let doc_count = feature_doc_freq[col_idx].max(1) as f64;
+                        let idf = (n_samples_f / doc_count).ln() + 1.0;
+                        row[col_idx] = tf * idf;
+                    }
+                }
+            });
+
+        if config.normalize_features {
+            flat.par_chunks_mut(n_features).for_each(|row| {
+                let norm = row.iter().map(|x| x * x).sum::<f64>().sqrt();
+                if norm > 0.0 {
+                    for x in row.iter_mut() {
+                        *x /= norm;
+                    }
+                }
+            });
         }
-    }
+
+        Array2::from_shape_vec((n_samples, n_features), flat).map_err(|e| -> Box<dyn Error> {
+            format!("internal: TF-IDF matrix shape: {}", e).into()
+        })?
+    };
 
     let clusters = Dbscan::params(config.dbscan_min_samples)
         .tolerance(config.dbscan_tolerance)
@@ -94,7 +131,7 @@ pub fn analyze_fleet(
                 anomalous_features.push(format!("RISK DETECTED: {} (root/path/entropy)", sig.name));
             }
 
-            let doc_count = profiles.iter().filter(|p| p.counts.contains_key(sig)).count();
+            let doc_count = doc_count_map.get(sig).copied().unwrap_or(0);
             if doc_count == 1 && !is_common_root {
                 anomalous_features.push(format!("Rare process: {}", sig.name));
             }
@@ -172,29 +209,42 @@ pub fn analyze_fleet2(
         .map(|feature| profiles.iter().filter(|p| p.counts.contains_key(feature)).count())
         .collect();
 
-    let mut data = Array2::<f64>::zeros((n_samples, n_features));
-    for (row_idx, profile) in profiles.iter().enumerate() {
-        if profile.total_logs == 0 {
-            continue;
+    let data = if n_features == 0 {
+        Array2::<f64>::zeros((n_samples, 1))
+    } else {
+        let n_samples_f = n_samples as f64;
+        let mut flat = vec![0.0f64; n_samples * n_features];
+        flat.par_chunks_mut(n_features)
+            .enumerate()
+            .for_each(|(row_idx, row)| {
+                let profile = &profiles[row_idx];
+                if profile.total_logs == 0 {
+                    return;
+                }
+                let tlog = profile.total_logs as f64;
+                for (col_idx, feature) in feature_list.iter().enumerate() {
+                    if let Some(&count) = profile.counts.get(feature) {
+                        let tf = count as f64 / tlog;
+                        let doc_count = feature_doc_freq[col_idx].max(1) as f64;
+                        let idf = (n_samples_f / doc_count).ln() + 1.0;
+                        row[col_idx] = tf * idf;
+                    }
+                }
+            });
+        if config.normalize_features {
+            flat.par_chunks_mut(n_features).for_each(|row| {
+                let norm = row.iter().map(|x| x * x).sum::<f64>().sqrt();
+                if norm > 0.0 {
+                    for x in row.iter_mut() {
+                        *x /= norm;
+                    }
+                }
+            });
         }
-        for (col_idx, feature) in feature_list.iter().enumerate() {
-            if let Some(&count) = profile.counts.get(feature) {
-                let tf = count as f64 / profile.total_logs as f64;
-                let doc_count = feature_doc_freq[col_idx].max(1) as f64;
-                let idf = (n_samples as f64 / doc_count).ln() + 1.0;
-                data[[row_idx, col_idx]] = tf * idf;
-            }
-        }
-    }
-
-    if config.normalize_features {
-        for mut row in data.rows_mut() {
-            let norm = row.mapv(|x| x * x).sum().sqrt();
-            if norm > 0.0 {
-                row.mapv_inplace(|x| x / norm);
-            }
-        }
-    }
+        Array2::from_shape_vec((n_samples, n_features), flat).map_err(|e| -> Box<dyn Error> {
+            format!("internal: TF-IDF matrix shape (fleet2): {}", e).into()
+        })?
+    };
 
     let clusters = Dbscan::params(config.dbscan_min_samples)
         .tolerance(config.dbscan_tolerance)

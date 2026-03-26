@@ -151,13 +151,15 @@ pub fn compare_temporal(baseline: &MachineSnapshot, current: &MachineSnapshot) -
                     let old_mtime = base.file_mtimes.get(path);
                     if old_mtime != Some(new_mtime) && old_mtime.is_some() {
                         Some((
-                            path.clone(),
+                            path.as_ref().to_string(),
                             base.file_mtimes.get(path).copied(),
                             Some(*new_mtime),
                         ))
-                    } else if old_mtime.is_none() && base.counts.keys().any(|s| s.path == *path) {
+                    } else if old_mtime.is_none()
+                        && base.counts.keys().any(|s| s.path.as_ref() == path.as_ref())
+                    {
                         Some((
-                            path.clone(),
+                            path.as_ref().to_string(),
                             base.file_mtimes.get(path).copied(),
                             Some(*new_mtime),
                         ))

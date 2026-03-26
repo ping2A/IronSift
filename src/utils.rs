@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+use log;
 use regex::Regex;
 
 pub fn calculate_shannon_entropy(s: &str) -> f64 {
@@ -74,6 +75,32 @@ pub fn is_path_suspicious(path: &str, patterns: &[String]) -> bool {
             .map(|re| re.is_match(path))
             .unwrap_or(false)
     })
+}
+
+/// Compile regex strings for repeated matching; invalid patterns are skipped with a warning.
+pub fn compile_regex_list(patterns: &[String]) -> Vec<Regex> {
+    patterns
+        .iter()
+        .filter_map(|p| match Regex::new(p) {
+            Ok(re) => Some(re),
+            Err(e) => {
+                log::warn!("Invalid regex pattern {:?}: {}", p, e);
+                None
+            }
+        })
+        .collect()
+}
+
+/// True if `path` matches any full-path regex, or its basename matches any filename regex.
+pub fn file_path_matches_exclusion(path: &str, path_res: &[Regex], filename_res: &[Regex]) -> bool {
+    if path_res.iter().any(|r| r.is_match(path)) {
+        return true;
+    }
+    let basename = path
+        .rsplit(|c| c == '/' || c == '\\')
+        .next()
+        .unwrap_or(path);
+    filename_res.iter().any(|r| r.is_match(basename))
 }
 
 /// Parse timestamps from RFC3339 or common `T`/space-separated naive datetimes (e.g. `date` / `timestamp` in JSONL).

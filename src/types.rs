@@ -1,6 +1,7 @@
 //! Core data structures: raw entries, signatures, and machine profiles.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use log;
 use serde::{Deserialize, Serialize};
@@ -149,10 +150,10 @@ impl ProcessEntry {
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone, Serialize, Deserialize)]
 pub struct ProcessSignature {
-    pub name: String,
-    pub parent_name: String,
+    pub name: Arc<str>,
+    pub parent_name: Arc<str>,
     pub uid: u32,
-    pub path: String,
+    pub path: Arc<str>,
     pub is_high_entropy: bool,
     pub is_suspicious_path: bool,
 }
@@ -162,9 +163,9 @@ impl ProcessSignature {
         if self.uid != 0 {
             return false;
         }
-        !common_root_processes
-            .iter()
-            .any(|common| self.name == *common || self.name.starts_with(common))
+        !common_root_processes.iter().any(|common| {
+            self.name.as_ref() == common.as_str() || self.name.starts_with(common)
+        })
     }
 
     pub fn risk_factors(&self, config: &DetectionConfig) -> Vec<String> {
@@ -173,10 +174,13 @@ impl ProcessSignature {
             factors.push("High entropy arguments (possible obfuscation)".to_string());
         }
         if self.is_suspicious_path {
-            factors.push(format!("Suspicious execution path: {}", self.path));
+            factors.push(format!("Suspicious execution path: {}", self.path.as_ref()));
         }
         if config.flag_unexpected_root && self.is_unexpected_root(&config.common_root_processes) {
-            factors.push(format!("Unexpected process running as root (UID 0): {}", self.name));
+            factors.push(format!(
+                "Unexpected process running as root (UID 0): {}",
+                self.name.as_ref()
+            ));
         }
         if self.path.contains("/tmp") {
             factors.push("Executing from temporary directory".to_string());
@@ -192,7 +196,7 @@ impl ProcessSignature {
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone, Serialize, Deserialize)]
 pub struct FileSignature {
-    pub path: String,
+    pub path: Arc<str>,
     pub uid: u32,
     pub is_suspicious_path: bool,
     #[serde(default)]
@@ -200,11 +204,11 @@ pub struct FileSignature {
     #[serde(default)]
     pub recently_modified: bool,
     #[serde(default)]
-    pub permissions: Option<String>,
+    pub permissions: Option<Arc<str>>,
     #[serde(default)]
-    pub owner: Option<String>,
+    pub owner: Option<Arc<str>>,
     #[serde(default)]
-    pub group: Option<String>,
+    pub group: Option<Arc<str>>,
     #[serde(default)]
     pub size: Option<u64>,
     #[serde(default)]
@@ -217,16 +221,16 @@ impl FileSignature {
     pub fn risk_factors(&self, _config: &DetectionConfig) -> Vec<String> {
         let mut factors = Vec::new();
         if self.is_suspicious_path {
-            factors.push(format!("Suspicious file path: {}", self.path));
+            factors.push(format!("Suspicious file path: {}", self.path.as_ref()));
         }
         if self.path.contains("/etc") || self.path.contains("/bin") || self.path.contains("/sbin") {
-            factors.push(format!("System directory access: {}", self.path));
+            factors.push(format!("System directory access: {}", self.path.as_ref()));
         }
         if self.path.contains("/tmp") {
             factors.push("Temporary directory access".to_string());
         }
         if self.uid == 0 && !self.path.starts_with("/proc") && !self.path.starts_with("/sys") {
-            factors.push(format!("Root user accessed: {}", self.path));
+            factors.push(format!("Root user accessed: {}", self.path.as_ref()));
         }
         if self.is_world_writable {
             factors.push("World-writable file permissions".to_string());
@@ -236,17 +240,17 @@ impl FileSignature {
         }
         if let Some(ref p) = self.permissions {
             if !p.is_empty() {
-                factors.push(format!("Permissions: {}", p));
+                factors.push(format!("Permissions: {}", p.as_ref()));
             }
         }
         if let Some(ref o) = self.owner {
             if !o.is_empty() {
-                factors.push(format!("Owner: {}", o));
+                factors.push(format!("Owner: {}", o.as_ref()));
             }
         }
         if let Some(ref g) = self.group {
             if !g.is_empty() {
-                factors.push(format!("Group: {}", g));
+                factors.push(format!("Group: {}", g.as_ref()));
             }
         }
         if let Some(sz) = self.size {
@@ -310,11 +314,11 @@ pub struct MachineFileProfile {
     pub total_logs: u32,
     pub first_seen: Option<DateTime<Utc>>,
     pub last_seen: Option<DateTime<Utc>>,
-    pub file_mtimes: HashMap<String, DateTime<Utc>>,
+    pub file_mtimes: HashMap<Arc<str>, DateTime<Utc>>,
     /// Latest observed owner string per path (for fleet-wide metadata comparison).
-    pub file_path_owner: HashMap<String, String>,
-    pub file_path_group: HashMap<String, String>,
-    pub file_path_size: HashMap<String, u64>,
+    pub file_path_owner: HashMap<Arc<str>, Arc<str>>,
+    pub file_path_group: HashMap<Arc<str>, Arc<str>>,
+    pub file_path_size: HashMap<Arc<str>, u64>,
 }
 
 impl MachineFileProfile {
@@ -339,15 +343,13 @@ impl MachineFileProfile {
             self.file_mtimes.insert(sig.path.clone(), mt);
         }
         if let Some(ref o) = sig.owner {
-            let o = o.trim();
             if !o.is_empty() {
-                self.file_path_owner.insert(sig.path.clone(), o.to_string());
+                self.file_path_owner.insert(sig.path.clone(), o.clone());
             }
         }
         if let Some(ref g) = sig.group {
-            let g = g.trim();
             if !g.is_empty() {
-                self.file_path_group.insert(sig.path.clone(), g.to_string());
+                self.file_path_group.insert(sig.path.clone(), g.clone());
             }
         }
         if let Some(sz) = sig.size {
@@ -363,7 +365,7 @@ impl MachineFileProfile {
         }
     }
 
-    pub fn file_paths_with_mtimes(&self) -> impl Iterator<Item = (String, Option<DateTime<Utc>>)> + '_ {
+    pub fn file_paths_with_mtimes(&self) -> impl Iterator<Item = (Arc<str>, Option<DateTime<Utc>>)> + '_ {
         self.counts.keys().map(move |sig| {
             let mtime = self.file_mtimes.get(&sig.path).copied();
             (sig.path.clone(), mtime)

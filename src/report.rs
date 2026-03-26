@@ -315,10 +315,10 @@ impl AnalysisReport {
         suspicious.sort_by(|(a, _), (b, _)| {
             let a_score = (a.is_high_entropy as i32)
                 + (a.is_suspicious_path as i32)
-                + ((a.uid == 0 && a.name != "systemd" && a.name != "init") as i32);
+                + ((a.uid == 0 && a.name.as_ref() != "systemd" && a.name.as_ref() != "init") as i32);
             let b_score = (b.is_high_entropy as i32)
                 + (b.is_suspicious_path as i32)
-                + ((b.uid == 0 && b.name != "systemd" && b.name != "init") as i32);
+                + ((b.uid == 0 && b.name.as_ref() != "systemd" && b.name.as_ref() != "init") as i32);
             b_score.cmp(&a_score)
         });
         println!("     ├─ Suspicious processes detected:");
@@ -366,7 +366,11 @@ impl AnalysisReport {
                         web_shells.push(anomaly.machine_id.clone());
                         break;
                     }
-                    if sig.uid == 0 && sig.name != "systemd" && sig.name != "init" && (sig.is_high_entropy || sig.is_suspicious_path) {
+                    if sig.uid == 0
+                        && sig.name.as_ref() != "systemd"
+                        && sig.name.as_ref() != "init"
+                        && (sig.is_high_entropy || sig.is_suspicious_path)
+                    {
                         privilege_escalation.push(anomaly.machine_id.clone());
                         break;
                     }

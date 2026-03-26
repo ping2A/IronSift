@@ -1,11 +1,13 @@
 //! ProcessBuilder and process profile building from raw logs.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use log;
 use chrono::{DateTime, Utc};
 use rayon::prelude::*;
 
 use crate::config::DetectionConfig;
+use crate::interner::{merge_pid_map_entry, SharedInterner};
 use crate::json_parse::{parse_json_log, parse_json_logs};
 use crate::types::{MachineProfile, ProcessEntry, ProcessSignature, RawLogEntry};
 use crate::utils::{calculate_shannon_entropy, is_path_suspicious, is_path_whitelisted, parse_command_line};
@@ -266,18 +268,127 @@ impl Default for ProcessBuilder {
     }
 }
 
-/// Resolve parent process names from PIDs
-pub fn resolve_parent_names(entries: &[RawLogEntry]) -> HashMap<(String, u32), String> {
-    let mut pid_to_name: HashMap<(String, u32), String> = HashMap::new();
-    
-    // First pass: build PID -> name mapping
-    for entry in entries {
-        pid_to_name.insert(
-            (entry.machine_id.clone(), entry.pid),
-            entry.name.clone()
-        );
+/// Whether a row should be counted toward profiles given kernel / init / path whitelist settings.
+pub(crate) fn process_entry_passes_filters(entry: &RawLogEntry, config: &DetectionConfig) -> bool {
+    if config.exclude_kernel_threads && is_kernel_thread(&entry.name) {
+        return false;
     }
-    
+    if config.exclude_init_children && entry.ppid == 1 {
+        return false;
+    }
+    if !config.whitelisted_path_patterns.is_empty()
+        && is_path_whitelisted(&entry.path, &config.whitelisted_path_patterns)
+    {
+        return false;
+    }
+    true
+}
+
+/// Append one filtered process log to a machine profile (shared by batch and streaming builders).
+pub(crate) fn merge_log_into_profile(
+    profile: &mut MachineProfile,
+    entry: &RawLogEntry,
+    pid_to_name: &HashMap<(Arc<str>, u32), Arc<str>>,
+    config: &DetectionConfig,
+    interner: &SharedInterner,
+    process_counts: Option<&mut HashMap<String, u32>>,
+) {
+    let mid = interner.intern(&entry.machine_id);
+    let parent_name = pid_to_name
+        .get(&(mid.clone(), entry.ppid))
+        .cloned()
+        .unwrap_or_else(|| {
+            if config.debug_display && entry.ppid != 0 {
+                log::warn!(
+                    "Unresolved PPID for {}:{} (PPID: {})",
+                    entry.machine_id,
+                    entry.name,
+                    entry.ppid
+                );
+            }
+            interner.intern(&format!("[unknown:{}]", entry.ppid))
+        });
+
+    let entropy = calculate_shannon_entropy(&entry.args);
+    let is_high_entropy = entropy > config.entropy_threshold;
+    let is_suspicious_path = is_path_suspicious(&entry.path, &config.suspicious_path_patterns);
+
+    let timestamp = entry
+        .timestamp
+        .as_ref()
+        .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+        .map(|dt| dt.with_timezone(&Utc));
+
+    let sig = ProcessSignature {
+        name: interner.intern(&entry.name),
+        parent_name,
+        uid: entry.uid,
+        path: interner.intern(&entry.path),
+        is_high_entropy,
+        is_suspicious_path,
+    };
+
+    if let Some(pc) = process_counts {
+        let process_key = format!(
+            "{}:{}:{}:{}",
+            sig.name, sig.path, sig.parent_name, sig.uid
+        );
+        let is_new_process = !pc.contains_key(&process_key);
+        pc.entry(process_key).and_modify(|c| *c += 1).or_insert(1);
+
+        if config.debug_display && is_new_process {
+            let risk_flags: Vec<&str> = [
+                if is_high_entropy {
+                    Some("HIGH_ENTROPY")
+                } else {
+                    None
+                },
+                if is_suspicious_path {
+                    Some("SUSPICIOUS_PATH")
+                } else {
+                    None
+                },
+                if entry.uid == 0
+                    && !config
+                        .common_root_processes
+                        .iter()
+                        .any(|p| entry.name.contains(p))
+                {
+                    Some("UNEXPECTED_ROOT")
+                } else {
+                    None
+                },
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            let risk_str = if risk_flags.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", risk_flags.join(", "))
+            };
+            log::debug!(
+                "New process in {}: {} (path: {}, parent: {}, uid: {}){}",
+                profile.id,
+                entry.name,
+                entry.path,
+                sig.parent_name.as_ref(),
+                entry.uid,
+                risk_str
+            );
+        }
+    }
+
+    profile.add_process(sig, timestamp);
+}
+
+/// Resolve parent process names from PIDs (interned `Arc<str>` keys and values).
+pub fn resolve_parent_names(entries: &[RawLogEntry]) -> HashMap<(Arc<str>, u32), Arc<str>> {
+    let interner = SharedInterner::default();
+    let mut pid_to_name = HashMap::new();
+    for entry in entries {
+        merge_pid_map_entry(&interner, &mut pid_to_name, entry);
+    }
     pid_to_name
 }
 
@@ -289,9 +400,12 @@ pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Ve
             entries.iter().take(5).map(|e| (e.machine_id.as_str(), e.name.as_str(), e.ppid)).collect::<Vec<_>>());
     }
     
-    // Resolve parent names
-    let pid_to_name = resolve_parent_names(&entries);
-    
+    let interner = SharedInterner::default();
+    let mut pid_to_name: HashMap<(Arc<str>, u32), Arc<str>> = HashMap::new();
+    for e in &entries {
+        merge_pid_map_entry(&interner, &mut pid_to_name, e);
+    }
+
     if config.debug_display {
         log::debug!("Resolved {} PID-to-name mappings", pid_to_name.len());
     }
@@ -359,63 +473,27 @@ pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Ve
         log::debug!("Grouped into {} machines", machine_entries.len());
     }
     
-    // Build profiles in parallel
-    let profiles: Vec<MachineProfile> = machine_entries.par_iter()
+    let profiles: Vec<MachineProfile> = machine_entries
+        .par_iter()
         .map(|(machine_id, logs)| {
             let mut profile = MachineProfile::new(machine_id);
-            let mut process_counts: HashMap<String, u32> = HashMap::new(); // Track unique processes for logging
-            
+            let mut process_counts: HashMap<String, u32> = HashMap::new();
+            let interner_par = interner.clone();
             for entry in logs {
-                // Resolve parent name
-                let parent_name = pid_to_name
-                    .get(&(entry.machine_id.clone(), entry.ppid))
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        if config.debug_display && entry.ppid != 0 {
-                            log::warn!("Unresolved PPID for {}:{} (PPID: {})", entry.machine_id, entry.name, entry.ppid);
-                        }
-                        format!("[unknown:{}]", entry.ppid)
-                    });
-                
-                // Calculate entropy and path risk
-                let entropy = calculate_shannon_entropy(&entry.args);
-                let is_high_entropy = entropy > config.entropy_threshold;
-                
-                // Check if path is suspicious (whitelisted paths are already filtered out above)
-                let is_suspicious_path = is_path_suspicious(&entry.path, &config.suspicious_path_patterns);
-                
-                let timestamp = entry.timestamp.as_ref()
-                    .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
-                    .map(|dt| dt.with_timezone(&Utc));
-                
-                let sig = ProcessSignature {
-                    name: entry.name.clone(),
-                    parent_name: parent_name.clone(),
-           //         ppid: entry.ppid,  // ⭐ PRESERVE PPID!
-                    uid: entry.uid,
-                    path: entry.path.clone(),
-                    is_high_entropy,
-                    is_suspicious_path,
+                let pc = if config.debug_display {
+                    Some(&mut process_counts)
+                } else {
+                    None
                 };
-                
-                // Track if this is a new unique process signature
-                let process_key = format!("{}:{}:{}:{}", sig.name, sig.path, sig.parent_name, sig.uid);
-                let is_new_process = !process_counts.contains_key(&process_key);
-                process_counts.entry(process_key).and_modify(|c| *c += 1).or_insert(1);
-                
-                if config.debug_display && is_new_process {
-                    let risk_flags: Vec<&str> = [
-                        if is_high_entropy { Some("HIGH_ENTROPY") } else { None },
-                        if is_suspicious_path { Some("SUSPICIOUS_PATH") } else { None },
-                        if entry.uid == 0 && !config.common_root_processes.iter().any(|p| entry.name.contains(p)) { Some("UNEXPECTED_ROOT") } else { None },
-                    ].into_iter().flatten().collect();
-                    let risk_str = if risk_flags.is_empty() { String::new() } else { format!(" [{}]", risk_flags.join(", ")) };
-                    log::debug!("New process in {}: {} (path: {}, parent: {}, uid: {}){}", machine_id, entry.name, entry.path, parent_name, entry.uid, risk_str);
-                }
-                
-                profile.add_process(sig, timestamp);
+                merge_log_into_profile(
+                    &mut profile,
+                    entry,
+                    &pid_to_name,
+                    config,
+                    &interner_par,
+                    pc,
+                );
             }
-            
             profile
         })
         .collect();

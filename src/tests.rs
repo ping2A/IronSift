@@ -1,6 +1,7 @@
 use crate::*;
 use chrono::Utc;
 use std::fs;
+use std::sync::Arc;
 use tempfile::tempdir;
 
 #[test]
@@ -314,7 +315,7 @@ fn test_new_process_detection() {
     let new_procs = current.find_new_processes(baseline);
     
     assert_eq!(new_procs.len(), 1);
-    assert_eq!(new_procs[0].name, "miner");
+    assert_eq!(new_procs[0].name.as_ref(), "miner");
 }
 
 #[test]
@@ -359,14 +360,14 @@ fn test_parent_resolution() {
     
     // Check that parent names are resolved correctly
     let nginx_sig = profile.counts.keys()
-        .find(|s| s.name == "nginx")
+        .find(|s| s.name.as_ref() == "nginx")
         .unwrap();
-    assert_eq!(nginx_sig.parent_name, "systemd");
+    assert_eq!(nginx_sig.parent_name.as_ref(), "systemd");
     
     let worker_sig = profile.counts.keys()
-        .find(|s| s.name == "worker")
+        .find(|s| s.name.as_ref() == "worker")
         .unwrap();
-    assert_eq!(worker_sig.parent_name, "nginx");
+    assert_eq!(worker_sig.parent_name.as_ref(), "nginx");
 }
 
 #[test]
@@ -426,7 +427,6 @@ fn test_process_builder_simple() {
 
 #[test]
 fn test_process_builder_fluent_api() {
-    let config = DetectionConfig::default();
     let mut builder = ProcessBuilder::new();
     
     // Use fluent API
@@ -494,7 +494,6 @@ fn test_process_builder_multiple_machines() {
 
 #[test]
 fn test_process_builder_no_parent_specified() {
-    let config = DetectionConfig::default();
     let mut builder = ProcessBuilder::new();
     
     // Add process without specifying parent - should default to systemd
@@ -604,7 +603,6 @@ fn test_process_entry_from_command_line() {
 
 #[test]
 fn test_builder_add_command() {
-    let config = DetectionConfig::default();
     let mut builder = ProcessBuilder::new();
     
     // Add processes using full command lines
@@ -635,7 +633,6 @@ fn test_builder_add_command() {
 
 #[test]
 fn test_builder_add_command_with_uid() {
-    let config = DetectionConfig::default();
     let mut builder = ProcessBuilder::new();
     
     // Normal process
@@ -685,21 +682,21 @@ fn test_full_workflow_with_command_parsing() {
 #[test]
 fn test_command_parsing_edge_cases() {
     // Leading/trailing whitespace
-    let (name, path, args) = parse_command_line("  /usr/bin/nginx -c /etc/nginx.conf  ");
+    let (name, path, _args) = parse_command_line("  /usr/bin/nginx -c /etc/nginx.conf  ");
     assert_eq!(name, "nginx");
     assert_eq!(path, "/usr/bin/nginx");
     
     // Multiple spaces
-    let (name, path, args) = parse_command_line("/usr/bin/python3    script.py    --flag");
+    let (name, _path, args) = parse_command_line("/usr/bin/python3    script.py    --flag");
     assert_eq!(name, "python3");
     assert_eq!(args, "script.py --flag");
     
     // Process name with numbers
-    let (name, path, args) = parse_command_line("/usr/bin/node16 app.js");
+    let (name, _path, _args) = parse_command_line("/usr/bin/node16 app.js");
     assert_eq!(name, "node16");
     
     // Dots in name
-    let (name, path, args) = parse_command_line("/usr/bin/systemd-resolved --config");
+    let (name, path, _args) = parse_command_line("/usr/bin/systemd-resolved --config");
     assert_eq!(name, "systemd-resolved");
     assert_eq!(path, "/usr/bin/systemd-resolved");
 }
@@ -835,7 +832,6 @@ fn test_parse_json_logs_ndjson() {
 
 #[test]
 fn test_builder_add_json() {
-    let config = DetectionConfig::default();
     let mut builder = ProcessBuilder::new();
     
     builder.add_json(r#"{"host": "server1", "command": "/usr/bin/nginx -c /etc/nginx.conf", "uid": 33}"#);
@@ -851,7 +847,6 @@ fn test_builder_add_json() {
 
 #[test]
 fn test_builder_add_json_batch() {
-    let config = DetectionConfig::default();
     let mut builder = ProcessBuilder::new();
     
     builder.add_json_batch(r#"[
@@ -937,7 +932,10 @@ fn test_resolve_parent_names_function() {
     ];
     
     let pid_map = resolve_parent_names(&entries);
-    assert_eq!(pid_map.get(&("m1".to_string(), 1)), Some(&"systemd".to_string()));
+    assert_eq!(
+        pid_map.get(&(Arc::from("m1"), 1)),
+        Some(&Arc::from("systemd"))
+    );
 }
 
 #[test]
@@ -1036,10 +1034,10 @@ fn test_detect_single_outlier() {
 fn test_process_risk_factors() {
     let config = DetectionConfig::default();
     let sig = ProcessSignature {
-        name: "malware".to_string(),
-        parent_name: "bash".to_string(),
+        name: Arc::from("malware"),
+        parent_name: Arc::from("bash"),
         uid: 0,
-        path: "/tmp/hidden".to_string(),
+        path: Arc::from("/tmp/hidden"),
         is_high_entropy: true,
         is_suspicious_path: true,
     };
@@ -1151,7 +1149,7 @@ fn test_ppid_resolution_comprehensive() {
     
     // Check that nginx processes exist and have correct parent
     let nginx_procs: Vec<_> = m1_profile.counts.iter()
-        .filter(|(sig, _)| sig.name == "nginx")
+        .filter(|(sig, _)| sig.name.as_ref() == "nginx")
         .collect();
     
     assert!(!nginx_procs.is_empty(), "Should have nginx processes");
@@ -1159,9 +1157,9 @@ fn test_ppid_resolution_comprehensive() {
     // All nginx processes should have nginx as parent (workers) or systemd (master)
     for (sig, _) in nginx_procs {
         assert!(
-            sig.parent_name == "nginx" || sig.parent_name == "systemd",
+            sig.parent_name.as_ref() == "nginx" || sig.parent_name.as_ref() == "systemd",
             "Nginx process should have 'nginx' or 'systemd' as parent, got '{}'", 
-            sig.parent_name
+            sig.parent_name.as_ref()
         );
     }
     
@@ -1170,36 +1168,36 @@ fn test_ppid_resolution_comprehensive() {
     
     // Check that miner has bash as parent
     let miner_procs: Vec<_> = m2_profile.counts.iter()
-        .filter(|(sig, _)| sig.name == "miner")
+        .filter(|(sig, _)| sig.name.as_ref() == "miner")
         .collect();
     
     assert!(!miner_procs.is_empty(), "Should have miner process");
     
     for (sig, _) in miner_procs {
-        assert_eq!(sig.parent_name, "bash",
-            "Miner should have 'bash' as parent, got '{}'", sig.parent_name);
+        assert_eq!(sig.parent_name.as_ref(), "bash",
+            "Miner should have 'bash' as parent, got '{}'", sig.parent_name.as_ref());
     }
     
     // Check that bash has sshd as parent
     let bash_procs: Vec<_> = m2_profile.counts.iter()
-        .filter(|(sig, _)| sig.name == "bash")
+        .filter(|(sig, _)| sig.name.as_ref() == "bash")
         .collect();
     
     assert!(!bash_procs.is_empty(), "Should have bash process");
     
     for (sig, _) in bash_procs {
-        assert_eq!(sig.parent_name, "sshd",
-            "Bash should have 'sshd' as parent, got '{}'", sig.parent_name);
+        assert_eq!(sig.parent_name.as_ref(), "sshd",
+            "Bash should have 'sshd' as parent, got '{}'", sig.parent_name.as_ref());
     }
     
     // Verify parent resolution worked correctly by checking the PID map
     let pid_map = resolve_parent_names(&entries);
     
     // Check specific parent resolutions
-    assert_eq!(pid_map.get(&("m1".to_string(), 1)), Some(&"systemd".to_string()));
-    assert_eq!(pid_map.get(&("m1".to_string(), 100)), Some(&"nginx".to_string()));
-    assert_eq!(pid_map.get(&("m2".to_string(), 200)), Some(&"sshd".to_string()));
-    assert_eq!(pid_map.get(&("m2".to_string(), 201)), Some(&"bash".to_string()));
+    assert_eq!(pid_map.get(&(Arc::from("m1"), 1)), Some(&Arc::from("systemd")));
+    assert_eq!(pid_map.get(&(Arc::from("m1"), 100)), Some(&Arc::from("nginx")));
+    assert_eq!(pid_map.get(&(Arc::from("m2"), 200)), Some(&Arc::from("sshd")));
+    assert_eq!(pid_map.get(&(Arc::from("m2"), 201)), Some(&Arc::from("bash")));
     
     println!("✅ PPID resolution test passed!");
     println!("   - Multi-level parent-child relationships resolved correctly");
@@ -1242,8 +1240,8 @@ fn test_ppid_resolution_with_missing_parents() {
     let profile = &profiles[0];
     
     // Check that processes exist even with missing parents
-    assert!(profile.counts.iter().any(|(sig, _)| sig.name == "nginx"));
-    assert!(profile.counts.iter().any(|(sig, _)| sig.name == "worker"));
+    assert!(profile.counts.iter().any(|(sig, _)| sig.name.as_ref() == "nginx"));
+    assert!(profile.counts.iter().any(|(sig, _)| sig.name.as_ref() == "worker"));
     
     println!("✅ Missing parent PPID test passed!");
 }
@@ -1524,10 +1522,10 @@ fn test_privilege_escalation_detection() {
     
     for (name, path, _args) in unexpected_root {
         let sig = ProcessSignature {
-            name: name.to_string(),
-            parent_name: "systemd".to_string(),
+            name: Arc::from(name),
+            parent_name: Arc::from("systemd"),
             uid: 0,
-            path: path.to_string(),
+            path: Arc::from(path),
             is_high_entropy: false,
             is_suspicious_path: false,
         };
@@ -1545,10 +1543,10 @@ fn test_privilege_escalation_detection() {
     
     for name in expected_root {
         let sig = ProcessSignature {
-            name: name.to_string(),
-            parent_name: "init".to_string(),
+            name: Arc::from(name),
+            parent_name: Arc::from("init"),
             uid: 0,
-            path: format!("/usr/sbin/{}", name),
+            path: Arc::from(format!("/usr/sbin/{}", name)),
             is_high_entropy: false,
             is_suspicious_path: false,
         };
@@ -2321,8 +2319,8 @@ fn test_init_children_filtering() {
     );
     
     // Verify init children are filtered out
-    let has_sshd = profile_filtered.counts.keys().any(|sig| sig.name == "sshd");
-    let has_bash = profile_filtered.counts.keys().any(|sig| sig.name == "bash");
+    let has_sshd = profile_filtered.counts.keys().any(|sig| sig.name.as_ref() == "sshd");
+    let has_bash = profile_filtered.counts.keys().any(|sig| sig.name.as_ref() == "bash");
     
     assert!(!has_sshd, "sshd (init child) should be filtered out");
     assert!(has_bash, "bash (not init child) should remain");
@@ -2474,15 +2472,15 @@ fn test_init_and_whitelist_integration() {
     let profile = &profiles[0];
     
     // Should have filtered out init child (service)
-    let has_service = profile.counts.keys().any(|sig| sig.name == "service");
+    let has_service = profile.counts.keys().any(|sig| sig.name.as_ref() == "service");
     assert!(!has_service, "Init child should be filtered");
     
     // Should NOT have app (whitelisted paths are filtered out entirely)
-    let app_sig = profile.counts.keys().find(|sig| sig.name == "app");
+    let app_sig = profile.counts.keys().find(|sig| sig.name.as_ref() == "app");
     assert!(app_sig.is_none(), "Whitelisted app should be filtered out");
     
     // Should have bad (suspicious)
-    let bad_sig = profile.counts.keys().find(|sig| sig.name == "bad");
+    let bad_sig = profile.counts.keys().find(|sig| sig.name.as_ref() == "bad");
     assert!(bad_sig.is_some(), "Suspicious process should be present");
     assert!(bad_sig.unwrap().is_suspicious_path, "Non-whitelisted path should be suspicious");
     
@@ -2689,11 +2687,11 @@ fn test_ppid_in_process_signature() {
     
     // Find nginx signature
     let nginx_sig = profile.counts.keys()
-        .find(|sig| sig.name == "nginx")
+        .find(|sig| sig.name.as_ref() == "nginx")
         .expect("nginx signature should exist");
     
     // ⭐ Verify parent name is preserved in signature (PPID information is in RawLogEntry, not ProcessSignature)
-    assert_eq!(nginx_sig.parent_name, "systemd");
+    assert_eq!(nginx_sig.parent_name.as_ref(), "systemd");
     
     println!("✅ PPID in ProcessSignature test passed!");
 }
@@ -2769,13 +2767,13 @@ fn test_ppid_with_builder_api() {
     let profile = &profiles[0];
     
     let worker_sig = profile.counts.keys()
-        .find(|sig| sig.name == "worker")
+        .find(|sig| sig.name.as_ref() == "worker")
         .expect("worker signature should exist");
     
     // Note: ProcessBuilder.build() reassigns PIDs, so PPID 100 may not match reassigned PID for nginx
     // The important thing is that PPIDs are preserved in RawLogEntry (verified above)
     // Parent resolution depends on PID/PPID matching, which may fail when PPIDs don't match reassigned PIDs
-    assert_eq!(worker_sig.name, "worker");
+    assert_eq!(worker_sig.name.as_ref(), "worker");
     
     println!("✅ Builder API PPID test passed!");
 }
@@ -2880,11 +2878,11 @@ fn test_ppid_zero_handling() {
     assert_eq!(profiles.len(), 1);
     
     let systemd_sig = profiles[0].counts.keys()
-        .find(|sig| sig.name == "systemd")
+        .find(|sig| sig.name.as_ref() == "systemd")
         .expect("systemd signature should exist");
     
     // Verify systemd signature exists (PPID is in RawLogEntry, not ProcessSignature)
-    assert_eq!(systemd_sig.name, "systemd");
+    assert_eq!(systemd_sig.name.as_ref(), "systemd");
     
     println!("✅ PPID=0 handling test passed!");
 }
@@ -2981,10 +2979,10 @@ fn test_file_signature_uniqueness() {
     
     // Check that uid=1000 has count=2
     for (sig, count) in &profile.counts {
-        if sig.uid == 1000 && sig.path == "/etc/passwd" {
+        if sig.uid == 1000 && sig.path.as_ref() == "/etc/passwd" {
             assert_eq!(*count, 2);
         }
-        if sig.uid == 0 && sig.path == "/etc/passwd" {
+        if sig.uid == 0 && sig.path.as_ref() == "/etc/passwd" {
             assert_eq!(*count, 1);
         }
     }
@@ -3025,10 +3023,10 @@ fn test_file_suspicious_path_detection() {
     let profile = &profiles[0];
     
     for (sig, _) in &profile.counts {
-        if sig.path == "/tmp/suspicious_file" {
+        if sig.path.as_ref() == "/tmp/suspicious_file" {
             assert!(sig.is_suspicious_path, "Suspicious path should be flagged");
         }
-        if sig.path == "/home/user/normal_file" {
+        if sig.path.as_ref() == "/home/user/normal_file" {
             assert!(!sig.is_suspicious_path, "Normal path should not be flagged");
         }
     }
@@ -3072,10 +3070,104 @@ fn test_file_whitelisting() {
     
     // Whitelisted path should be filtered out entirely
     assert_eq!(profile.counts.len(), 1);
-    assert!(profile.counts.keys().any(|sig| sig.path == "/tmp/suspicious"));
-    assert!(!profile.counts.keys().any(|sig| sig.path == "/tmp/legitimate/file"));
+    assert!(profile.counts.keys().any(|sig| sig.path.as_ref() == "/tmp/suspicious"));
+    assert!(!profile.counts.keys().any(|sig| sig.path.as_ref() == "/tmp/legitimate/file"));
     
     println!("✅ File whitelisting test passed!");
+}
+
+#[test]
+fn test_file_regex_exclusion() {
+    println!("\n🧪 Testing file path / filename regex exclusions");
+
+    let mut config = DetectionConfig::default();
+    config.file_excluded_path_regexes = vec![r"^/proc/".to_string(), r"/\.cache/".to_string()];
+    config.file_excluded_filename_regexes =
+        vec![r"^\.DS_Store$".to_string(), r"\.pyc$".to_string()];
+
+    let entries = vec![
+        RawFileEntry {
+            machine_id: "m1".to_string(),
+            path: "/etc/passwd".to_string(),
+            uid: 0,
+            timestamp: None,
+            mtime: None,
+            ..Default::default()
+        },
+        RawFileEntry {
+            machine_id: "m1".to_string(),
+            path: "/proc/self/maps".to_string(),
+            uid: 0,
+            timestamp: None,
+            mtime: None,
+            ..Default::default()
+        },
+        RawFileEntry {
+            machine_id: "m1".to_string(),
+            path: "/home/u/.cache/pip/pkg".to_string(),
+            uid: 1000,
+            timestamp: None,
+            mtime: None,
+            ..Default::default()
+        },
+        RawFileEntry {
+            machine_id: "m1".to_string(),
+            path: "/var/foo/.DS_Store".to_string(),
+            uid: 0,
+            timestamp: None,
+            mtime: None,
+            ..Default::default()
+        },
+        RawFileEntry {
+            machine_id: "m1".to_string(),
+            path: "/opt/app/module.pyc".to_string(),
+            uid: 0,
+            timestamp: None,
+            mtime: None,
+            ..Default::default()
+        },
+    ];
+
+    let profiles = build_file_profiles(entries, &config);
+    let profile = &profiles[0];
+    let paths: Vec<&str> = profile.counts.keys().map(|s| s.path.as_ref()).collect();
+
+    assert!(paths.contains(&"/etc/passwd"));
+    assert!(!paths.contains(&"/proc/self/maps"));
+    assert!(!paths.contains(&"/home/u/.cache/pip/pkg"));
+    assert!(!paths.contains(&"/var/foo/.DS_Store"));
+    assert!(!paths.contains(&"/opt/app/module.pyc"));
+
+    let path_re = compile_regex_list(&config.file_excluded_path_regexes);
+    let name_re = compile_regex_list(&config.file_excluded_filename_regexes);
+    assert!(should_ingest_file_entry(
+        &RawFileEntry {
+            machine_id: "x".into(),
+            path: "/etc/hosts".into(),
+            uid: 0,
+            timestamp: None,
+            mtime: None,
+            ..Default::default()
+        },
+        &config,
+        &path_re,
+        &name_re
+    ));
+    assert!(!should_ingest_file_entry(
+        &RawFileEntry {
+            machine_id: "x".into(),
+            path: "/proc/cpuinfo".into(),
+            uid: 0,
+            timestamp: None,
+            mtime: None,
+            ..Default::default()
+        },
+        &config,
+        &path_re,
+        &name_re
+    ));
+
+    println!("✅ File regex exclusion test passed!");
 }
 
 #[test]
@@ -3191,16 +3283,16 @@ fn test_file_risk_factors() {
     for (sig, _) in &profile.counts {
         let risks = sig.risk_factors(&config);
         
-        if sig.path == "/tmp/suspicious" {
+        if sig.path.as_ref() == "/tmp/suspicious" {
             assert!(!risks.is_empty(), "Suspicious path should have risk factors");
             assert!(risks.iter().any(|r| r.contains("Suspicious file path")));
         }
         
-        if sig.path == "/etc/shadow" {
+        if sig.path.as_ref() == "/etc/shadow" {
             assert!(risks.iter().any(|r| r.contains("System directory")));
         }
         
-        if sig.uid == 0 && sig.path == "/home/user/file" {
+        if sig.uid == 0 && sig.path.as_ref() == "/home/user/file" {
             assert!(risks.iter().any(|r| r.contains("Root user accessed")));
         }
     }
@@ -3501,8 +3593,8 @@ fn test_file_recently_modified_detection() {
     let profile = &profiles[0];
     
     // Check that recently_modified flag is set correctly
-    let old_file = profile.counts.keys().find(|s| s.path == "/etc/passwd");
-    let recent_file = profile.counts.keys().find(|s| s.path == "/etc/shadow");
+    let old_file = profile.counts.keys().find(|s| s.path.as_ref() == "/etc/passwd");
+    let recent_file = profile.counts.keys().find(|s| s.path.as_ref() == "/etc/shadow");
     
     assert!(old_file.is_some());
     assert!(recent_file.is_some());
@@ -3606,7 +3698,7 @@ fn test_temporal_new_processes() {
     let diff = compare_temporal(&baseline, &current);
     assert!(diff.has_changes());
     assert_eq!(diff.new_processes.len(), 1);
-    assert_eq!(diff.new_processes[0].name, "miner");
+    assert_eq!(diff.new_processes[0].name.as_ref(), "miner");
     assert!(diff.new_files.is_empty());
     assert!(diff.new_connections.is_empty());
 }
@@ -3663,7 +3755,7 @@ fn test_temporal_new_files_and_modified() {
     let diff = compare_temporal(&baseline, &current);
     assert!(diff.has_changes());
     assert_eq!(diff.new_files.len(), 1);
-    assert_eq!(diff.new_files[0].path, "/etc/new_config");
+    assert_eq!(diff.new_files[0].path.as_ref(), "/etc/new_config");
     assert!(!diff.modified_files.is_empty());
     assert_eq!(diff.modified_files[0].0, "/etc/passwd");
 }
@@ -3774,4 +3866,154 @@ fn test_temporal_no_changes() {
     let diff = compare_temporal(&baseline, &current);
     assert!(!diff.has_changes());
     assert!(diff.is_empty());
+}
+
+/// Row count for multi-million benchmarks. Override with `IRONSIFT_BENCH_LINES` (default `1000000`, max `5000000`).
+fn mega_bench_line_count() -> usize {
+    const DEFAULT: usize = 1_000_000;
+    const MAX: usize = 5_000_000;
+    std::env::var("IRONSIFT_BENCH_LINES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT)
+        .clamp(1, MAX)
+}
+
+/// Writes a large process CSV, then times streaming `load_csv_data` + `analyze_fleet`.
+///
+/// Run (release recommended):
+/// `cargo test --release test_mega_line_process_csv_benchmark -- --ignored --nocapture`
+///
+/// Optional: `IRONSIFT_BENCH_LINES=2000000` for two million rows.
+#[test]
+#[ignore = "slow multi-million-row benchmark; see IRONSIFT_BENCH_LINES and cargo test -- --ignored --nocapture"]
+fn test_mega_line_process_csv_benchmark() {
+    use std::io::BufWriter;
+    use std::time::Instant;
+
+    let n = mega_bench_line_count();
+    let dir = tempdir().unwrap();
+    let csv_path = dir.path().join("mega_process.csv");
+    let config = DetectionConfig::default();
+
+    let machine_n = 256.min(n.max(1));
+    let machine_ids: Vec<String> = (0..machine_n)
+        .map(|i| format!("bench_proc_{}", i))
+        .collect();
+
+    let name = "nginx".to_string();
+    let exe_path = "/usr/bin/nginx".to_string();
+    let args = "-c /etc/nginx.conf".to_string();
+
+    let t_write = Instant::now();
+    {
+        let f = fs::File::create(&csv_path).unwrap();
+        let mut wtr = csv::Writer::from_writer(BufWriter::with_capacity(1 << 20, f));
+        for k in 0..n {
+            let i = k % machine_n;
+            wtr.serialize(RawLogEntry {
+                machine_id: machine_ids[i].clone(),
+                pid: 1000 + (k % 500) as u32,
+                ppid: 1,
+                name: name.clone(),
+                uid: 33,
+                path: exe_path.clone(),
+                args: args.clone(),
+                timestamp: None,
+            })
+            .unwrap();
+        }
+        wtr.flush().unwrap();
+    }
+    let write_elapsed = t_write.elapsed();
+
+    let t_load = Instant::now();
+    let profiles = load_csv_data(csv_path.to_str().unwrap(), &config).unwrap();
+    let load_elapsed = t_load.elapsed();
+
+    let t_analyze = Instant::now();
+    let report = analyze_fleet(&profiles, &config).unwrap();
+    let analyze_elapsed = t_analyze.elapsed();
+
+    let total = write_elapsed + load_elapsed + analyze_elapsed;
+    let load_rps = n as f64 / load_elapsed.as_secs_f64().max(1e-9);
+    let rows_rps = n as f64 / total.as_secs_f64().max(1e-9);
+    println!(
+        "\n=== Process CSV benchmark ({n} data rows) ===\n  (Timings: use `cargo test --release` for realistic throughput; debug is much slower.)\n  CSV write:      {write_elapsed:>10.2?}\n  load_csv_data:  {load_elapsed:>10.2?}  ({load_rps:.0} rows/s)\n  analyze_fleet:  {analyze_elapsed:>10.2?}\n  ─────────────────────────\n  total:          {total:>10.2?}  (end-to-end {rows_rps:.0} rows/s)\n  machines:       {}\n  anomalies:      {}",
+        profiles.len(),
+        report.anomalies.len()
+    );
+
+    assert_eq!(profiles.len(), machine_n);
+    assert_eq!(report.total_analyzed, machine_n);
+}
+
+/// Writes a large file-access CSV, then times streaming `load_files_csv_data` + `analyze_files_fleet`.
+///
+/// Run (release recommended):
+/// `cargo test --release test_mega_line_file_csv_benchmark -- --ignored --nocapture`
+#[test]
+#[ignore = "slow multi-million-row benchmark; see IRONSIFT_BENCH_LINES and cargo test -- --ignored --nocapture"]
+fn test_mega_line_file_csv_benchmark() {
+    use std::io::BufWriter;
+    use std::time::Instant;
+
+    let n = mega_bench_line_count();
+    let dir = tempdir().unwrap();
+    let csv_path = dir.path().join("mega_files.csv");
+    let config = DetectionConfig::default();
+
+    let machine_n = 256.min(n.max(1));
+    let machine_ids: Vec<String> = (0..machine_n)
+        .map(|i| format!("bench_file_{}", i))
+        .collect();
+
+    let path_s = "/var/log/syslog".to_string();
+    let perms = Some("-rw-r-----.".to_string());
+    let owner = Some("syslog".to_string());
+    let group = Some("adm".to_string());
+    let size = Some(2048u64);
+
+    let t_write = Instant::now();
+    {
+        let f = fs::File::create(&csv_path).unwrap();
+        let mut wtr = csv::Writer::from_writer(BufWriter::with_capacity(1 << 20, f));
+        for k in 0..n {
+            let i = k % machine_n;
+            wtr.serialize(RawFileEntry {
+                machine_id: machine_ids[i].clone(),
+                path: path_s.clone(),
+                uid: 104,
+                timestamp: None,
+                mtime: None,
+                permissions: perms.clone(),
+                owner: owner.clone(),
+                group: group.clone(),
+                size,
+            })
+            .unwrap();
+        }
+        wtr.flush().unwrap();
+    }
+    let write_elapsed = t_write.elapsed();
+
+    let t_load = Instant::now();
+    let profiles = load_files_csv_data(csv_path.to_str().unwrap(), &config).unwrap();
+    let load_elapsed = t_load.elapsed();
+
+    let t_analyze = Instant::now();
+    let report = analyze_files_fleet(&profiles, &config).unwrap();
+    let analyze_elapsed = t_analyze.elapsed();
+
+    let total = write_elapsed + load_elapsed + analyze_elapsed;
+    let load_rps = n as f64 / load_elapsed.as_secs_f64().max(1e-9);
+    let rows_rps = n as f64 / total.as_secs_f64().max(1e-9);
+    println!(
+        "\n=== File CSV benchmark ({n} data rows) ===\n  (Timings: use `cargo test --release` for realistic throughput; debug is much slower.)\n  CSV write:           {write_elapsed:>10.2?}\n  load_files_csv_data: {load_elapsed:>10.2?}  ({load_rps:.0} rows/s)\n  analyze_files_fleet: {analyze_elapsed:>10.2?}\n  ─────────────────────────\n  total:               {total:>10.2?}  (end-to-end {rows_rps:.0} rows/s)\n  machines:            {}\n  anomalies:           {}",
+        profiles.len(),
+        report.anomalies.len()
+    );
+
+    assert_eq!(profiles.len(), machine_n);
+    assert_eq!(report.total_analyzed, machine_n);
 }
