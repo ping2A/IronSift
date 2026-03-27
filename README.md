@@ -13,7 +13,7 @@ Created with [Claude.ai](https://claude.ai) but supervised by a human (me appare
 
 - **Fleet mode (default):** You feed process logs from many machines (CSV, JSON, or JSONL). IronSift builds a behavioral profile per machine, turns them into vectors (TF-IDF), and runs **DBSCAN clustering**. Machines that end up alone (noise) or in a small minority cluster are reported as anomalies, with severity and risk factors (entropy, suspicious paths, unexpected root, etc.).
 - **Temporal mode:** For a **single machine**, you can compare two or more snapshots over time. IronSift reports **new processes**, **new or modified files**, and **new IP connections** between snapshots — no clustering involved.
-- **File mode (`--files`):** Same idea as fleet mode, but using file access logs instead of process logs. It compares **modification times (mtime)** across hosts for the same path, and—on system-like paths—**owner, group, and file size** so a machine that disagrees with a clear fleet majority is flagged (**metadata anomaly**).
+- **File mode (`--files`):** File access logs per host are turned into **file profiles** (counts per `FileSignature`, plus per-path mtime and metadata). Fleet analysis combines **TF‑IDF + DBSCAN** (same pattern as process mode: noise / minority cluster) with **explicit cross-host rules**: mtime vs fleet median, owner/group/size baselines on comparable paths, **fleet-relative access outliers** (e.g. root UID on a path only where most peers use non-root—no blanket “root read” alerts), **rare signatures** seen on a single host, and configurable **mtime-vs-access** heuristics. Rows matching `file_excluded_*` regexes are never merged into profiles.
 
 Input can come from CSV, JSON, or **JSONL** (one JSON object per line; each file can be one machine). Output is a console report and an optional JSON forensic report for integration with other tools.
 
@@ -51,10 +51,10 @@ Input can come from CSV, JSON, or **JSONL** (one JSON object per line; each file
             │  (machines × features)      │  metadata fleet checks
             ▼                             ▼
   ┌───────────────────┐         ┌───────────────────┐
-  │  DBSCAN           │         │  DBSCAN +          │
-  │  Noise = outlier  │         │  mtime / metadata  │
-  │  Small cluster =  │         │  / recent / rules  │
-  │  minority         │         │                    │
+  │  DBSCAN           │         │  DBSCAN + fleet   │
+  │  Noise = outlier  │         │  rules: mtime,    │
+  │  Small cluster =  │         │  metadata, FLEET  │
+  │  minority         │         │  OUTLIER, rare    │
   └─────────┬─────────┘         └─────────┬─────────┘
             │                             │
             └──────────────┬──────────────┘
@@ -65,7 +65,7 @@ Input can come from CSV, JSON, or **JSONL** (one JSON object per line; each file
   └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**In short:** Fleet and file modes turn many machines into profiles, then use **TF-IDF + DBSCAN** to find machines that don’t match the majority. File mode adds **cross-host checks** for mtime and, on comparable paths, **owner / group / size** outliers. Temporal mode skips clustering and just **diffs** consecutive snapshots of one machine.
+**In short:** Fleet and file modes turn many machines into profiles, then use **TF-IDF + DBSCAN** so hosts in **noise** or a **small cluster** diverge from the dense majority. File mode **also** flags hosts using **fleet baselines** (mtime, owner/group/size) and **path-level minority patterns** (root vs non-root, permissions, recent-mtime signal)—not per-row “every root access is suspicious.” Temporal mode skips clustering and **diffs** snapshots of one machine.
 
 ## 🎯 Quick Start (3 Ways)
 
@@ -192,12 +192,17 @@ let diffs = compare_temporal_series(&[snap1, snap2, snap3]);
 
 ## 📜 Version History
 
-### v0.3.0 (Current) - Enhanced Analysis & Input Flexibility
+### v0.4.0 (Current) - File fleet & performance
+- **File fleet:** Fleet-relative **`FLEET OUTLIER`** signals (root/permissions/recent-mtime **per path** vs majority), ingest **`file_excluded_*`**, configurable **`file_recent_mtime`**, stricter recent-mtime heuristic to cut false positives.
+- **Process/file profiles:** Hot strings deduplicated via **interning** (`Arc<str>` on signatures and file maps).
+- 🧪 Expanded tests for file fleet and exclusions.
+
+### v0.3.0 - Enhanced Analysis & Input Flexibility
 - ✨ **Enhanced Detailed Console Output** - Rich reporting with attack categorization
 - ✨ **Automatic Command Line Parsing** - Handles bare commands (`ls /etc/`) and full paths
 - ✨ **Native JSON Log Parsing** - Docker, Kubernetes, CloudWatch, Elasticsearch support
 - 📚 Comprehensive documentation (15+ guides)
-- 🧪 50+ tests covering all features
+- 🧪 Broad test coverage
 
 ### v0.2.0 - Flexible APIs & Automation
 - 🎯 Three flexible APIs (Simple, Builder, Direct)
@@ -268,15 +273,20 @@ See `JSON_PARSING.md` and `COMMAND_PARSING.md` for complete documentation.
 
 ### File fleet analysis (`--files`)
 
-Logs can include **path**, **mtime**, **permissions**, **owner**, **group**, and **size** (CSV columns or JSON/JSONL fields). IronSift tracks the latest values seen per path on each machine and compares them across the fleet:
+Logs can include **path**, **mtime**, **permissions**, **owner**, **group**, and **size** (CSV columns or JSON/JSONL fields). Profiles aggregate **per `FileSignature`** (path + uid + flags + optional metadata). IronSift compares hosts using several **independent** signals:
 
-| Feature | Description |
-|---------|-------------|
-| **MTIME anomaly** | Same path on **≥3** hosts: flags machines whose mtime is **>24 hours** from the fleet median for that path. |
-| **Metadata anomaly** | Same path on **comparable** locations (`/etc/…`, paths under `*/bin/*` or `*/sbin/*`, `/usr/bin/…`, `/usr/sbin/…`, `/var/log/…`): with **≥3** hosts and a **majority** owner, group, or size that appears **at least twice**, any host that disagrees is flagged (`METADATA ANOMALY` in the report). |
-| **Per-path risk rules** | Unchanged: suspicious paths, system directories, root access, writable permissions, “recently modified” (mtime within 24h of access), rare paths, plus DBSCAN on file-access TF-IDF features. |
+| Signal | What it does |
+|--------|----------------|
+| **DBSCAN (clustering-only)** | **TF‑IDF** over unique file signatures × normalized counts per host → **DBSCAN**. **Noise** (`cluster_id = none`) or membership in a **non-largest** cluster can mark a host as anomalous even if no text feature lines are attached—**purely geometric** distance from the main blob. |
+| **MTIME anomaly** | Same path on **≥3** hosts: flags machines whose mtime is **>24 hours** from the fleet **median** for that path (`MTIME ANOMALY`). |
+| **Metadata anomaly** | On **comparable** paths (`/etc/…`, `*/bin/*`, `*/sbin/*`, `/usr/bin/…`, `/usr/sbin/…`, `/var/log/…`), with **≥3** hosts and a **majority** value appearing **≥2** times, hosts that disagree on **owner**, **group**, or **size** are flagged (`METADATA ANOMALY`). |
+| **FLEET OUTLIER** (path minorities) | For paths seen on **≥3** hosts with a **strict majority** (majority count **≥2**): flags hosts in the **minority** class for **root vs non-root** access to that path, **world-writable** vs not, **group-writable** (only under paths containing `/etc` or `/tmp`), and **recent mtime vs access** (see `file_recent_mtime` in config). Avoids fleet-wide false positives when everyone behaves the same. |
+| **Rare file access** | A full **signature** appears on exactly **one** machine in the fleet (`Rare file access: …`). |
+| **Ingest exclusions** | `file_excluded_path_regexes` / `file_excluded_filename_regexes`: matching rows are **not** merged into profiles (enforced in the merge path). |
 
-Metadata comparison is **scoped to system-like paths** so legitimate variation (for example different owners on `/home/...`) does not flood the report.
+**Per-signature** helpers (e.g. in `FileSignature::risk_factors`) still describe suspicious path, system dir, root, etc. for **local** explanations; the **fleet report** does **not** treat “root read” or “system directory” as automatic anomalies without a **fleet-relative** or **rare-signature** signal above.
+
+**Config:** `file_recent_mtime` tunes clock skew, time windows, and volatile path prefixes for the recent-mtime heuristic. Metadata comparison stays **scoped** so `/home/…` variation does not dominate.
 
 ### Detection Scenarios
 
@@ -344,7 +354,7 @@ Fleet Size: 100 machines
 Detection Sensitivity: High
 
 --- Configuration ---
-  DBSCAN Tolerance: 0.05
+  DBSCAN Tolerance: 0.35
   Entropy Threshold: 4.5
   Minority Cluster Ratio: 10%
 
@@ -451,37 +461,63 @@ ironsift [OPTIONS]
 Options:
   --config <file>       Load configuration from JSON file
   --export-json         Export detailed forensic report
-  --tolerance <value>   Override DBSCAN tolerance (default: 0.05)
+  --tolerance <value>   Override DBSCAN tolerance (default: from config, 0.35)
   --help                Show help message
 ```
 
 ### Custom Configuration
 
-On first run, IronSift creates `ironsift_config.json`:
+On first run, IronSift creates `ironsift_config.json`. Important keys:
 
 ```json
 {
   "entropy_threshold": 4.5,
   "minority_cluster_ratio": 0.10,
-  "dbscan_tolerance": 0.05,
+  "dbscan_tolerance": 0.35,
   "dbscan_min_samples": 2,
   "normalize_features": true,
   "suspicious_path_patterns": [
     "/tmp/",
     "/dev/shm/",
     "/var/tmp/",
-    "/home/[^/]+/\\.[^/]+"
-  ]
+    "/home/[^/]+/\\.[^/]+",
+    "^\\./",
+    "/(?:bin|sbin|usr/bin|usr/sbin)/\\.[^/]+"
+  ],
+  "file_excluded_path_regexes": [],
+  "file_excluded_filename_regexes": [],
+  "file_recent_mtime": {
+    "clock_skew_minutes": 5,
+    "max_hours_critical_paths": 12,
+    "max_hours_system_elevated": 6,
+    "max_hours_suspicious_only": 3,
+    "volatile_path_prefixes": [
+      "/var/log/",
+      "/var/cache/",
+      "/var/lib/dpkg/",
+      "/var/lib/apt/",
+      "/var/tmp/",
+      "/tmp/",
+      "/run/",
+      "/proc/",
+      "/sys/",
+      "/dev/"
+    ]
+  }
 }
 ```
+
+- **`file_excluded_path_regexes` / `file_excluded_filename_regexes`:** Rust regexes; matching file-log rows are dropped before profiling (e.g. `^/proc/`, `^/var/cache/`).
+- **`file_recent_mtime`:** Controls the **mtime vs access-time** signal used in profiles and in **FLEET OUTLIER** comparisons (volatile prefixes, tiered hour limits).
 
 #### Tuning Guide
 
 | Parameter | Effect | Recommended Range |
 |-----------|--------|-------------------|
-| `dbscan_tolerance` | Detection sensitivity | 0.03 (strict) - 0.10 (loose) |
+| `dbscan_tolerance` | Detection sensitivity (process & file TF‑IDF clustering) | Default **0.35**; lower (e.g. 0.03–0.10) = stricter, higher = looser |
 | `minority_cluster_ratio` | Botnet detection threshold | 0.05 - 0.15 |
 | `entropy_threshold` | Obfuscation detection | 3.5 (sensitive) - 5.5 (strict) |
+| `file_recent_mtime.*` | Strictness of “recent mtime near access” (file mode) | Adjust `max_hours_*` / `volatile_path_prefixes` if too noisy or too quiet |
 
 **Example**: Increase sensitivity for high-security environments:
 
@@ -564,7 +600,7 @@ This script builds release, generates process and file datasets, runs `ironsift`
 - Process risk factor analysis
 - PID/PPID parent resolution
 - Unknown parent handling
-- File fleet: mtime baseline, metadata (owner/group/size) outliers, JSONL ingestion
+- File fleet: DBSCAN + mtime/metadata baselines + `FLEET OUTLIER` path minorities + rare signatures + regex exclusions + `file_recent_mtime`; JSONL/CSV streaming loaders
 
 ---
 
@@ -604,11 +640,12 @@ This script builds release, generates process and file datasets, runs `ironsift`
          ▲                            │
          │                            ▼
   ┌──────────────┐             ┌─────────────────┐
-  │ forensic_    │◄────────────│ Risk factors    │
-  │ report.json  │  export     │ (entropy, path, │
-  └──────────────┘             │  root; file:    │
-                               │  mtime, owner/  │
-                               │  group/size)    │
+  │ forensic_    │◄────────────│ Feature reasons │
+  │ report.json  │  export     │ Process: entropy│
+  └──────────────┘             │ path, root…     │
+                               │ File: mtime,    │
+                               │ metadata, FLEET │
+                               │ OUTLIER, rare   │
                                └─────────────────┘
 ```
 
@@ -648,7 +685,7 @@ This script builds release, generates process and file datasets, runs `ironsift`
 3. **L2 Normalization**: Ensures distance metrics work correctly across varied fleet sizes
 4. **DBSCAN**: Density-based clustering that naturally identifies outliers
 5. **Shannon Entropy**: Measures randomness in command arguments (detects obfuscation)
-6. **File fleet baselines**: Median mtime and majority owner/group/size per path (on comparable paths) to surface hosts that drift from peers
+6. **File fleet baselines**: Median mtime and majority owner/group/size per path (on comparable paths); **path-level binary minorities** (root, writable flags, recent-mtime pattern) when ≥3 hosts and a clear majority; **rare signatures** (single-host `FileSignature`)
 
 ---
 
@@ -665,7 +702,7 @@ IronSift treats each machine as a vector in N-dimensional feature space:
   - High-entropy obfuscated commands
   - Privilege escalation patterns
   - Abnormal parent-child relationships
-  - **File mode:** rare paths, mtime far from fleet median, or owner/group/size on a system path that disagrees with the majority of peers
+  - **File mode:** DBSCAN distance, **rare** file signatures, mtime far from fleet median, metadata disagreements, or **minority** access pattern on a path vs most peers (not “every root read is bad”)
 
 ### Clustering (Conceptual)
 

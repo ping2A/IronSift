@@ -29,7 +29,7 @@ fn print_usage() {
     println!("  --export-json [path]  Export forensic report as JSON (default: forensic_report.json)");
     println!("                        Use '-' to write JSON to stdout (script-friendly)");
     println!("  -q, --quiet           Minimal output: one-line summary only (for pipelines)");
-    println!("  --tolerance <value>   Override DBSCAN tolerance (default: 0.05)");
+    println!("  --tolerance <value>   Override DBSCAN tolerance (default: from config, 0.35)");
     println!("  --help                Show this help message");
     println!();
     println!("Supported Input Formats:");

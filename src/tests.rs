@@ -3231,11 +3231,94 @@ fn test_analyze_files_fleet() {
     let profiles = build_file_profiles(entries, &config);
     let report = analyze_files_fleet(&profiles, &config).unwrap();
     
-    // Should detect the compromised machine
+    // Should detect the compromised machine (rare paths / clustering — not blanket root/system-dir flags)
     assert!(!report.anomalies.is_empty());
-    assert!(report.anomalies.iter().any(|a| a.machine_id == "compromised"));
+    let compromised = report
+        .anomalies
+        .iter()
+        .find(|a| a.machine_id == "compromised")
+        .expect("compromised machine should appear in anomalies");
+    let feat = compromised.anomalous_features.join(" ");
+    assert!(
+        feat.contains("Rare file access") || feat.contains("FLEET OUTLIER"),
+        "expected rare-path or fleet-relative signal, got: {:?}",
+        compromised.anomalous_features
+    );
     
     println!("✅ File fleet analysis test passed!");
+}
+
+/// Root UID on a path is flagged only when a clear fleet majority uses non-root for that same path.
+#[test]
+fn test_fleet_file_root_uid_outlier() {
+    let mut config = DetectionConfig::default();
+    config.dbscan_tolerance = 0.5;
+
+    let mut entries = Vec::new();
+    for i in 0..3 {
+        entries.push(RawFileEntry {
+            machine_id: format!("normal_{}", i),
+            path: "/etc/shared_target".to_string(),
+            uid: 1000,
+            timestamp: None,
+            mtime: None,
+            ..Default::default()
+        });
+    }
+    entries.push(RawFileEntry {
+        machine_id: "outlier".to_string(),
+        path: "/etc/shared_target".to_string(),
+        uid: 0,
+        timestamp: None,
+        mtime: None,
+        ..Default::default()
+    });
+
+    let profiles = build_file_profiles(entries, &config);
+    let report = analyze_files_fleet(&profiles, &config).unwrap();
+    let a = report
+        .anomalies
+        .iter()
+        .find(|x| x.machine_id == "outlier")
+        .expect("outlier host should be reported");
+    assert!(
+        a.anomalous_features.iter().any(|f| {
+            f.contains("FLEET OUTLIER") && f.contains("root UID access")
+        }),
+        "expected fleet root UID outlier: {:?}",
+        a.anomalous_features
+    );
+}
+
+/// Unanimous root on a path across the fleet → no fleet-relative root outlier for that path.
+#[test]
+fn test_fleet_homogeneous_root_no_spurious_fleet_outlier() {
+    let mut config = DetectionConfig::default();
+    config.dbscan_tolerance = 0.5;
+
+    let mut entries = Vec::new();
+    for i in 0..3 {
+        entries.push(RawFileEntry {
+            machine_id: format!("host_{}", i),
+            path: "/opt/app/config".to_string(),
+            uid: 0,
+            timestamp: None,
+            mtime: None,
+            ..Default::default()
+        });
+    }
+
+    let profiles = build_file_profiles(entries, &config);
+    let report = analyze_files_fleet(&profiles, &config).unwrap();
+    for a in &report.anomalies {
+        assert!(
+            !a.anomalous_features.iter().any(|f| {
+                f.contains("FLEET OUTLIER") && f.contains("root UID access")
+            }),
+            "homogeneous root should not produce root fleet outlier: {:?}",
+            a.anomalous_features
+        );
+    }
 }
 
 #[test]

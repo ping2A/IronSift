@@ -199,6 +199,165 @@ fn fleet_size_metadata_outliers(profiles: &[MachineFileProfile]) -> HashMap<usiz
     out
 }
 
+/// Paths that appear on each machine index (deduplicated per host).
+fn path_to_machine_indices(profiles: &[MachineFileProfile]) -> HashMap<Arc<str>, Vec<usize>> {
+    let mut m: HashMap<Arc<str>, HashSet<usize>> = HashMap::new();
+    for (i, p) in profiles.iter().enumerate() {
+        for sig in p.counts.keys() {
+            m.entry(sig.path.clone()).or_default().insert(i);
+        }
+    }
+    m.into_iter()
+        .map(|(path, set)| {
+            let mut v: Vec<usize> = set.into_iter().collect();
+            v.sort_unstable();
+            (path, v)
+        })
+        .collect()
+}
+
+/// Minimum hosts that must see a path before fleet comparison applies (same spirit as metadata baselines).
+const FLEET_PATH_MIN_HOSTS: usize = 3;
+/// Majority class must appear at least this many times.
+const FLEET_PATH_MIN_MAJORITY: usize = 2;
+
+/// For paths seen on enough hosts, compare a boolean attribute per host (e.g. root vs non-root).
+/// Unanimous paths are ignored; ties are ignored. Only the **minority** hosts get detail strings.
+fn fleet_path_binary_outliers<C>(
+    profiles: &[MachineFileProfile],
+    path_machines: &HashMap<Arc<str>, Vec<usize>>,
+    path_gate: impl Fn(&str) -> bool,
+    classify: C,
+    minority_true_detail: impl Fn(&str, usize, usize, usize) -> String,
+    minority_false_detail: impl Fn(&str, usize, usize, usize) -> String,
+) -> HashMap<usize, Vec<String>>
+where
+    C: Fn(&MachineFileProfile, &Arc<str>) -> Option<bool>,
+{
+    let mut out: HashMap<usize, Vec<String>> = HashMap::new();
+    for (path, machine_idxs) in path_machines {
+        if machine_idxs.len() < FLEET_PATH_MIN_HOSTS || !path_gate(path.as_ref()) {
+            continue;
+        }
+        let mut true_machines: Vec<usize> = Vec::new();
+        let mut false_machines: Vec<usize> = Vec::new();
+        for &mi in machine_idxs {
+            match classify(&profiles[mi], path) {
+                Some(true) => true_machines.push(mi),
+                Some(false) => false_machines.push(mi),
+                None => {}
+            }
+        }
+        let n_true = true_machines.len();
+        let n_false = false_machines.len();
+        if n_true == 0 || n_false == 0 {
+            continue;
+        }
+        let n_classified = n_true + n_false;
+        if n_classified < FLEET_PATH_MIN_HOSTS {
+            continue;
+        }
+        let path_s = path.as_ref();
+        if n_true > n_false && n_true >= FLEET_PATH_MIN_MAJORITY {
+            let msg = minority_false_detail(path_s, n_true, n_false, n_classified);
+            for mi in false_machines {
+                out.entry(mi).or_default().push(msg.clone());
+            }
+        } else if n_false > n_true && n_false >= FLEET_PATH_MIN_MAJORITY {
+            let msg = minority_true_detail(path_s, n_false, n_true, n_classified);
+            for mi in true_machines {
+                out.entry(mi).or_default().push(msg.clone());
+            }
+        }
+    }
+    out
+}
+
+fn path_class_root_uid(profile: &MachineFileProfile, path: &Arc<str>) -> Option<bool> {
+    let p = path.as_ref();
+    if p.starts_with("/proc") || p.starts_with("/sys") {
+        return None;
+    }
+    let mut seen = false;
+    let mut has_root = false;
+    for s in profile.counts.keys() {
+        if s.path != *path {
+            continue;
+        }
+        seen = true;
+        if s.uid == 0 {
+            has_root = true;
+        }
+    }
+    if !seen {
+        return None;
+    }
+    Some(has_root)
+}
+
+fn path_class_world_writable(profile: &MachineFileProfile, path: &Arc<str>) -> Option<bool> {
+    let mut seen = false;
+    let mut ww = false;
+    for s in profile.counts.keys() {
+        if s.path != *path {
+            continue;
+        }
+        seen = true;
+        if s.is_world_writable {
+            ww = true;
+        }
+    }
+    if !seen {
+        return None;
+    }
+    Some(ww)
+}
+
+fn path_class_group_writable(profile: &MachineFileProfile, path: &Arc<str>) -> Option<bool> {
+    let mut seen = false;
+    let mut gw = false;
+    for s in profile.counts.keys() {
+        if s.path != *path {
+            continue;
+        }
+        seen = true;
+        if s.is_group_writable {
+            gw = true;
+        }
+    }
+    if !seen {
+        return None;
+    }
+    Some(gw)
+}
+
+fn path_class_recently_modified(profile: &MachineFileProfile, path: &Arc<str>) -> Option<bool> {
+    let mut seen = false;
+    let mut recent = false;
+    for s in profile.counts.keys() {
+        if s.path != *path {
+            continue;
+        }
+        seen = true;
+        if s.recently_modified {
+            recent = true;
+        }
+    }
+    if !seen {
+        return None;
+    }
+    Some(recent)
+}
+
+fn merge_fleet_details(
+    into: &mut HashMap<usize, Vec<String>>,
+    from: HashMap<usize, Vec<String>>,
+) {
+    for (k, mut v) in from {
+        into.entry(k).or_default().append(&mut v);
+    }
+}
+
 /// Whether a raw file row should be ingested into file profiles. Applies glob whitelist
 /// (`whitelisted_path_patterns`) and regex exclusions (`file_excluded_path_regexes`,
 /// `file_excluded_filename_regexes` on compiled patterns).
@@ -507,22 +666,101 @@ pub fn analyze_files_fleet(
     }
     let metadata_anomaly_machines: HashSet<usize> = metadata_anomaly_details.keys().copied().collect();
 
-    let mut recently_modified_machines: HashSet<usize> = HashSet::new();
-    let mut recently_modified_details: HashMap<usize, Vec<String>> = HashMap::new();
-    for (i, profile) in profiles.iter().enumerate() {
-        for sig in profile.counts.keys() {
-            if sig.recently_modified {
-                recently_modified_machines.insert(i);
-                recently_modified_details
-                    .entry(i)
-                    .or_insert_with(Vec::new)
-                    .push(format!(
-                        "RECENTLY MODIFIED: {} — mtime close to access (credential / elevated / suspicious path rule)",
-                        sig.path
-                    ));
-            }
-        }
-    }
+    // Fleet-relative access patterns: flag a host only when it differs from a clear majority on the
+    // same path (≥3 hosts, majority ≥2). Avoids blanket "root access" / system-dir noise.
+    let path_machines = path_to_machine_indices(profiles);
+
+    let mut fleet_access_details: HashMap<usize, Vec<String>> = HashMap::new();
+
+    merge_fleet_details(
+        &mut fleet_access_details,
+        fleet_path_binary_outliers(
+            profiles,
+            &path_machines,
+            |_| true,
+            path_class_root_uid,
+            |path, n_maj_nonroot, _n_min_root, n_tot| {
+                format!(
+                    "FLEET OUTLIER: root UID access to {} — {} of {} hosts use non-root for this path (this host is in the minority)",
+                    path, n_maj_nonroot, n_tot
+                )
+            },
+            |path, n_maj_root, _n_min_nonroot, n_tot| {
+                format!(
+                    "FLEET OUTLIER: non-root access to {} — {} of {} hosts use root for this path (this host is in the minority)",
+                    path, n_maj_root, n_tot
+                )
+            },
+        ),
+    );
+
+    merge_fleet_details(
+        &mut fleet_access_details,
+        fleet_path_binary_outliers(
+            profiles,
+            &path_machines,
+            |_| true,
+            path_class_world_writable,
+            |path, n_maj_not_ww, _n_min_ww, n_tot| {
+                format!(
+                    "FLEET OUTLIER: world-writable {} — {} of {} hosts are not world-writable (minority)",
+                    path, n_maj_not_ww, n_tot
+                )
+            },
+            |path, n_maj_ww, _n_min_not, n_tot| {
+                format!(
+                    "FLEET OUTLIER: non-world-writable {} — {} of {} hosts see world-writable mode (minority)",
+                    path, n_maj_ww, n_tot
+                )
+            },
+        ),
+    );
+
+    merge_fleet_details(
+        &mut fleet_access_details,
+        fleet_path_binary_outliers(
+            profiles,
+            &path_machines,
+            |p| p.contains("/etc") || p.contains("/tmp"),
+            path_class_group_writable,
+            |path, n_maj_not_gw, _n_min_gw, n_tot| {
+                format!(
+                    "FLEET OUTLIER: group-writable {} under /etc or /tmp — {} of {} hosts are not group-writable (minority)",
+                    path, n_maj_not_gw, n_tot
+                )
+            },
+            |path, n_maj_gw, _n_min_not, n_tot| {
+                format!(
+                    "FLEET OUTLIER: not group-writable {} — {} of {} hosts see group-writable on this path (minority)",
+                    path, n_maj_gw, n_tot
+                )
+            },
+        ),
+    );
+
+    let fleet_recent_mtime_details = fleet_path_binary_outliers(
+        profiles,
+        &path_machines,
+        |_| true,
+        path_class_recently_modified,
+        |path, n_maj_not_recent, _n_min_recent, n_tot| {
+            format!(
+                "FLEET OUTLIER: mtime close to access on {} — {} of {} hosts do not show this pattern (minority)",
+                path, n_maj_not_recent, n_tot
+            )
+        },
+        |path, n_maj_recent, _n_min_not, n_tot| {
+            format!(
+                "FLEET OUTLIER: no recent mtime-at-access signal on {} — {} of {} hosts do (minority)",
+                path, n_maj_recent, n_tot
+            )
+        },
+    );
+    let recent_fleet_machine_idxs: HashSet<usize> =
+        fleet_recent_mtime_details.keys().copied().collect();
+    merge_fleet_details(&mut fleet_access_details, fleet_recent_mtime_details);
+
+    let fleet_access_machines: HashSet<usize> = fleet_access_details.keys().copied().collect();
 
     let mut unique_features: HashSet<&FileSignature> = HashSet::new();
     for p in profiles {
@@ -629,12 +867,12 @@ pub fn analyze_files_fleet(
             has_genuine_risk = true;
             suspicious_count += mtime_details.len() as u32;
         }
-        if let Some(recent_details) = recently_modified_details.get(&i) {
-            for detail in recent_details {
+        if let Some(fleet_access) = fleet_access_details.get(&i) {
+            for detail in fleet_access {
                 anomalous_features.push(detail.clone());
             }
             has_genuine_risk = true;
-            suspicious_count += recent_details.len() as u32;
+            suspicious_count += fleet_access.len() as u32;
         }
         if let Some(meta_details) = metadata_anomaly_details.get(&i) {
             for detail in meta_details {
@@ -644,56 +882,13 @@ pub fn analyze_files_fleet(
             suspicious_count += meta_details.len() as u32;
         }
 
+        // Per-signature "rare across fleet" (doc frequency 1). Other risk dimensions use fleet
+        // outlier blocks above or metadata / mtime baselines — not per-row root/system-dir flags.
         for (sig, count) in &profile.counts {
-            let is_behavioral_risk = sig.is_suspicious_path;
-            let is_system_directory = sig.path.contains("/etc")
-                || sig.path.contains("/bin")
-                || sig.path.contains("/sbin");
-            let is_root_access = sig.uid == 0
-                && !sig.path.starts_with("/proc")
-                && !sig.path.starts_with("/sys");
-            let perm_risk = sig.is_world_writable
-                || (sig.is_group_writable && (sig.path.contains("/etc") || sig.path.contains("/tmp")));
-            let owner_mismatch = (sig.path.starts_with("/etc") || sig.path.starts_with("/root"))
-                && sig.owner.as_ref().map_or(false, |o| {
-                    let o = o.as_ref().trim();
-                    !o.is_empty() && !o.eq_ignore_ascii_case("root")
-                });
-            if is_behavioral_risk || is_system_directory || is_root_access || perm_risk || owner_mismatch {
-                suspicious_count += *count;
-                has_genuine_risk = true;
-                if sig.is_world_writable {
-                    anomalous_features.push(format!(
-                        "RISK DETECTED: world-writable {}",
-                        sig.path
-                    ));
-                } else if owner_mismatch {
-                    anomalous_features.push(format!(
-                        "RISK DETECTED: non-root owner on sensitive path {} ({})",
-                        sig.path.as_ref(),
-                        sig.owner.as_deref().unwrap_or("")
-                    ));
-                } else if is_system_directory {
-                    anomalous_features.push(format!(
-                        "RISK DETECTED: system directory access {}",
-                        sig.path
-                    ));
-                } else if sig.is_suspicious_path {
-                    anomalous_features.push(format!(
-                        "RISK DETECTED: suspicious file access {}",
-                        sig.path
-                    ));
-                } else if is_root_access {
-                    anomalous_features.push(format!("RISK DETECTED: root access to {}", sig.path));
-                } else if perm_risk {
-                    anomalous_features.push(format!(
-                        "RISK DETECTED: group-writable sensitive file {}",
-                        sig.path
-                    ));
-                }
-            }
             let doc_count = file_doc_count_map.get(sig).copied().unwrap_or(0);
             if doc_count == 1 {
+                suspicious_count += *count;
+                has_genuine_risk = true;
                 anomalous_features.push(format!("Rare file access: {}", sig.path));
             }
         }
@@ -702,19 +897,20 @@ pub fn analyze_files_fleet(
         let is_minority = cluster_id.is_some()
             && cluster_id.unwrap() != largest_cluster.unwrap_or(999);
         let has_mtime_anomaly = mtime_anomaly_machines.contains(&i);
-        let has_recently_modified = recently_modified_machines.contains(&i);
+        let has_recent_fleet = recent_fleet_machine_idxs.contains(&i);
         let has_metadata_fleet_anomaly = metadata_anomaly_machines.contains(&i);
+        let has_fleet_access_outlier = fleet_access_machines.contains(&i);
 
         if is_noise
             || is_minority
             || has_genuine_risk
             || has_mtime_anomaly
-            || has_recently_modified
+            || has_fleet_access_outlier
             || has_metadata_fleet_anomaly
         {
             let severity = if has_mtime_anomaly || has_metadata_fleet_anomaly {
                 AnomalyLevel::Critical
-            } else if has_recently_modified && has_genuine_risk {
+            } else if has_recent_fleet && has_genuine_risk {
                 AnomalyLevel::Critical
             } else if has_genuine_risk {
                 if suspicious_count > 5 {
@@ -722,7 +918,7 @@ pub fn analyze_files_fleet(
                 } else {
                     AnomalyLevel::High
                 }
-            } else if has_recently_modified {
+            } else if has_recent_fleet {
                 AnomalyLevel::High
             } else {
                 AnomalyLevel::Medium
