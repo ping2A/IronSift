@@ -3607,6 +3607,54 @@ fn test_file_recently_modified_detection() {
     println!("✅ Recently modified file detection test passed!");
 }
 
+/// Routine user read of a system file after apt/package updates should not set recently_modified.
+#[test]
+fn test_file_recently_modified_skips_benign_user_etc_access() {
+    let config = DetectionConfig::default();
+    let access_time = Utc::now();
+    let access_str = access_time.to_rfc3339();
+    let recent_mtime = Utc::now() - chrono::Duration::hours(2);
+    let recent_mtime_str = recent_mtime.to_rfc3339();
+
+    let entries = vec![RawFileEntry {
+        machine_id: "server1".to_string(),
+        path: "/etc/passwd".to_string(),
+        uid: 1000,
+        timestamp: Some(access_str),
+        mtime: Some(recent_mtime_str),
+        ..Default::default()
+    }];
+
+    let profiles = build_file_profiles(entries, &config);
+    let sig = profiles[0].counts.keys().next().expect("signature");
+    assert!(
+        !sig.recently_modified,
+        "Non-privileged /etc/passwd read with recent package mtime should not be RECENTLY_MODIFIED"
+    );
+}
+
+#[test]
+fn test_file_recently_modified_root_system_path() {
+    let config = DetectionConfig::default();
+    let access_time = Utc::now();
+    let access_str = access_time.to_rfc3339();
+    let recent_mtime = Utc::now() - chrono::Duration::hours(2);
+    let recent_mtime_str = recent_mtime.to_rfc3339();
+
+    let entries = vec![RawFileEntry {
+        machine_id: "server1".to_string(),
+        path: "/etc/passwd".to_string(),
+        uid: 0,
+        timestamp: Some(access_str),
+        mtime: Some(recent_mtime_str),
+        ..Default::default()
+    }];
+
+    let profiles = build_file_profiles(entries, &config);
+    let sig = profiles[0].counts.keys().next().expect("signature");
+    assert!(sig.recently_modified, "Root access + system path + tight mtime window should flag");
+}
+
 #[test]
 fn test_jsonl_file_entry_metadata_keys() {
     let line = r#"{"timestamp": "2026-03-22T15:49:54", "date": "2026-02-19T14:14:00", "event_type": "file_information", "permissions": "-rw-------.", "owner": "root", "group": "root", "size": 0, "file_path": "/data/var/runtime/tmp/connector.urs.24aOcF"}"#;
@@ -3726,7 +3774,8 @@ fn test_temporal_new_files_and_modified() {
             path: "/etc/passwd".to_string(),
             uid: 0,
             timestamp: Some("2024-01-01T11:00:00Z".to_string()),
-            mtime: Some("2024-01-01T11:30:00Z".to_string()), // modified
+            // mtime before access (required for heuristic); still newer than baseline file_mtimes
+            mtime: Some("2024-01-01T10:45:00Z".to_string()),
             ..Default::default()
         },
         RawFileEntry {

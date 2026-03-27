@@ -260,7 +260,10 @@ impl FileSignature {
             factors.push("MTIME ANOMALY: file modification time differs from fleet baseline".to_string());
         }
         if self.recently_modified {
-            factors.push("RECENTLY MODIFIED: file was modified shortly before access".to_string());
+            factors.push(
+                "RECENTLY MODIFIED: mtime close to access (sensitive path or elevated/suspicious context)"
+                    .to_string(),
+            );
         }
         factors
     }

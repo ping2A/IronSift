@@ -6,6 +6,45 @@ use std::fs::File;
 use log;
 use serde::{Deserialize, Serialize};
 
+/// **File analysis:** tunables for “mtime close to access” (`FileSignature.recently_modified`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FileRecentMtimeConfig {
+    /// Treat `mtime` up to this many minutes **after** access as clock skew (still eligible).
+    pub clock_skew_minutes: i64,
+    /// Max hours between `mtime` and access for credential/boot–heavy paths (shadow, sudoers, …).
+    pub max_hours_critical_paths: u32,
+    /// Max hours for system dirs (`/etc`, `/usr/bin`, …) when access is elevated or risky.
+    pub max_hours_system_elevated: u32,
+    /// Max hours for paths that match suspicious patterns only (non-system).
+    pub max_hours_suspicious_only: u32,
+    /// Path prefixes where recent-mtime is never flagged (logs, caches, ephemeral dirs).
+    pub volatile_path_prefixes: Vec<String>,
+}
+
+impl Default for FileRecentMtimeConfig {
+    fn default() -> Self {
+        Self {
+            clock_skew_minutes: 5,
+            max_hours_critical_paths: 12,
+            max_hours_system_elevated: 6,
+            max_hours_suspicious_only: 3,
+            volatile_path_prefixes: vec![
+                "/var/log/".to_string(),
+                "/var/cache/".to_string(),
+                "/var/lib/dpkg/".to_string(),
+                "/var/lib/apt/".to_string(),
+                "/var/tmp/".to_string(),
+                "/tmp/".to_string(),
+                "/run/".to_string(),
+                "/proc/".to_string(),
+                "/sys/".to_string(),
+                "/dev/".to_string(),
+            ],
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectionConfig {
     /// Shannon entropy threshold for detecting obfuscated commands
@@ -57,6 +96,10 @@ pub struct DetectionConfig {
     /// When true, suppress progress and verbose output (for use by scripts/pipelines)
     #[serde(default)]
     pub quiet: bool,
+
+    /// **File analysis:** recent modification vs access-time heuristic (`recently_modified` flag).
+    #[serde(default)]
+    pub file_recent_mtime: FileRecentMtimeConfig,
 }
 
 impl Default for DetectionConfig {
@@ -110,6 +153,7 @@ impl Default for DetectionConfig {
             file_excluded_path_regexes: vec![],
             file_excluded_filename_regexes: vec![],
             quiet: false,
+            file_recent_mtime: FileRecentMtimeConfig::default(),
         }
     }
 }
@@ -170,5 +214,13 @@ impl DetectionConfig {
         if !self.common_root_processes.is_empty() {
             log::info!("Common root processes: {} listed", self.common_root_processes.len());
         }
+        log::info!(
+            "File recent-mtime: skew={}m, max_h (critical/system/suspicious)={}/{}/{}, volatile_prefixes={}",
+            self.file_recent_mtime.clock_skew_minutes,
+            self.file_recent_mtime.max_hours_critical_paths,
+            self.file_recent_mtime.max_hours_system_elevated,
+            self.file_recent_mtime.max_hours_suspicious_only,
+            self.file_recent_mtime.volatile_path_prefixes.len()
+        );
     }
 }

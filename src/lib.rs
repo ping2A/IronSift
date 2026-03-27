@@ -13,7 +13,7 @@ mod temporal;
 mod loaders;
 
 // Re-export public API
-pub use config::DetectionConfig;
+pub use config::{DetectionConfig, FileRecentMtimeConfig};
 pub use interner::SharedInterner;
 pub use types::{
     FileSignature, MachineFileProfile, MachineProfile, ProcessEntry, ProcessSignature,

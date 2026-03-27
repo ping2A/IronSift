@@ -50,5 +50,23 @@
     "/opt/custom-app/*"
   ],
   "file_excluded_path_regexes": [],
-  "file_excluded_filename_regexes": []
+  "file_excluded_filename_regexes": [],
+  "file_recent_mtime": {
+    "clock_skew_minutes": 5,
+    "max_hours_critical_paths": 12,
+    "max_hours_system_elevated": 6,
+    "max_hours_suspicious_only": 3,
+    "volatile_path_prefixes": [
+      "/var/log/",
+      "/var/cache/",
+      "/var/lib/dpkg/",
+      "/var/lib/apt/",
+      "/var/tmp/",
+      "/tmp/",
+      "/run/",
+      "/proc/",
+      "/sys/",
+      "/dev/"
+    ]
+  }
 }

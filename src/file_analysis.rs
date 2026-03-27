@@ -11,7 +11,7 @@ use rayon::prelude::*;
 use log;
 use regex::Regex;
 
-use crate::config::DetectionConfig;
+use crate::config::{DetectionConfig, FileRecentMtimeConfig};
 use crate::interner::SharedInterner;
 use crate::report::{AnalysisReport, AnalysisType, AnomalyDetails, AnomalyLevel};
 use crate::types::{FileSignature, MachineFileProfile, RawFileEntry};
@@ -19,6 +19,87 @@ use crate::utils::{
     compile_regex_list, file_path_matches_exclusion, is_path_suspicious, is_path_whitelisted,
     parse_log_datetime, unix_permission_flags,
 };
+
+/// High-impact credential / boot paths: always eligible for the “recent mtime” signal (tighter
+/// window than the old global 24h rule).
+fn is_critical_credential_path(path: &str) -> bool {
+    matches!(path, "/etc/shadow" | "/etc/gshadow")
+        || path.starts_with("/etc/sudoers")
+        || path.starts_with("/boot/")
+        || path.ends_with("/authorized_keys")
+}
+
+/// System locations where a recent mtime matters only together with elevated or risky access.
+fn is_system_path_for_recent_mtime(path: &str) -> bool {
+    path.starts_with("/etc/")
+        || path.starts_with("/bin/")
+        || path.starts_with("/sbin/")
+        || path.starts_with("/usr/bin/")
+        || path.starts_with("/usr/sbin/")
+        || path.starts_with("/root/")
+        || path == "/etc"
+}
+
+fn is_volatile_recent_mtime_path(path: &str, cfg: &FileRecentMtimeConfig) -> bool {
+    cfg.volatile_path_prefixes
+        .iter()
+        .any(|p| path.starts_with(p.as_str()))
+}
+
+/// Whether mtime was updated shortly before the observed access, in a **low-FP** way:
+/// - Skip volatile paths (logs, caches, `/run`, …).
+/// - Require modification at or before access (small clock skew allowed).
+/// - Use short windows; do **not** flag routine user reads of recently updated config (e.g. apt).
+fn recently_modified_heuristic(
+    frt: &FileRecentMtimeConfig,
+    path: &str,
+    access: DateTime<Utc>,
+    mtime: DateTime<Utc>,
+    uid: u32,
+    path_suspicious: bool,
+    is_world_writable: bool,
+    is_group_writable: bool,
+) -> bool {
+    if is_volatile_recent_mtime_path(path, frt) {
+        return false;
+    }
+
+    let skew = chrono::Duration::minutes(frt.clock_skew_minutes.max(0));
+    // mtime far in the future vs access → bad data or skew; ignore.
+    if mtime > access + skew {
+        return false;
+    }
+
+    let delta = access.signed_duration_since(mtime);
+    let delta = if delta < chrono::Duration::zero() {
+        chrono::Duration::zero()
+    } else {
+        delta
+    };
+
+    let max_critical = chrono::Duration::hours(frt.max_hours_critical_paths as i64);
+    let max_system = chrono::Duration::hours(frt.max_hours_system_elevated as i64);
+    let max_suspicious = chrono::Duration::hours(frt.max_hours_suspicious_only as i64);
+
+    let elevated_or_risky = uid == 0
+        || path_suspicious
+        || is_world_writable
+        || (is_group_writable && (path.contains("/etc") || path.contains("/tmp")));
+
+    if is_critical_credential_path(path) {
+        return delta <= max_critical;
+    }
+
+    if is_system_path_for_recent_mtime(path) && elevated_or_risky {
+        return delta <= max_system;
+    }
+
+    if path_suspicious {
+        return delta <= max_suspicious;
+    }
+
+    false
+}
 
 /// Paths where owner/group/size are expected to be uniform across a homogeneous fleet.
 fn path_supports_fleet_metadata_baseline(path: &str) -> bool {
@@ -149,18 +230,25 @@ pub(crate) fn merge_file_log_into_profile(
     let path_is_suspicious = is_path_suspicious(&entry.path, &config.suspicious_path_patterns);
     let timestamp = entry.timestamp.as_ref().and_then(|s| parse_log_datetime(s));
     let mtime = entry.mtime.as_ref().and_then(|s| parse_log_datetime(s));
-    let recently_modified = if let (Some(ts), Some(mt)) = (timestamp, mtime) {
-        let diff = ts.signed_duration_since(mt);
-        diff.num_hours().abs() < 24
-    } else {
-        false
-    };
     let uid = effective_file_uid(entry);
     let (is_world_writable, is_group_writable) = entry
         .permissions
         .as_deref()
         .map(unix_permission_flags)
         .unwrap_or((false, false));
+    let recently_modified = match (timestamp, mtime) {
+        (Some(ts), Some(mt)) => recently_modified_heuristic(
+            &config.file_recent_mtime,
+            &entry.path,
+            ts,
+            mt,
+            uid,
+            path_is_suspicious,
+            is_world_writable,
+            is_group_writable,
+        ),
+        _ => false,
+    };
     let permissions = entry.permissions.as_deref().and_then(|p| {
         let t = p.trim();
         if t.is_empty() {
@@ -407,7 +495,7 @@ pub fn analyze_files_fleet(
                     .entry(i)
                     .or_insert_with(Vec::new)
                     .push(format!(
-                        "RECENTLY MODIFIED: {} was modified within 24h of access",
+                        "RECENTLY MODIFIED: {} — mtime close to access (credential / elevated / suspicious path rule)",
                         sig.path
                     ));
             }
