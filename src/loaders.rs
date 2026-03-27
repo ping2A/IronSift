@@ -232,9 +232,18 @@ pub fn load_files_csv_data(
         } else {
             None
         };
-        merge_file_log_into_profile(profile, &entry, config, &interner, fc);
+        merge_file_log_into_profile(
+            profile,
+            &entry,
+            config,
+            &interner,
+            fc,
+            &path_exclude_res,
+            &filename_exclude_res,
+        );
     }
 
+    machine_profiles.retain(|_, p| p.total_logs > 0);
     if machine_profiles.is_empty() {
         return Err(format!("No valid file access logs found in '{}'.", path).into());
     }
@@ -333,9 +342,18 @@ pub fn load_files_jsonl_data(
         } else {
             None
         };
-        merge_file_log_into_profile(profile, &entry, config, &interner, fc);
+        merge_file_log_into_profile(
+            profile,
+            &entry,
+            config,
+            &interner,
+            fc,
+            &path_exclude_res,
+            &filename_exclude_res,
+        );
     }
 
+    machine_profiles.retain(|_, p| p.total_logs > 0);
     if machine_profiles.is_empty() {
         return Err(format!("No valid file access lines found in '{}'.", path).into());
     }

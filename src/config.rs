@@ -83,13 +83,14 @@ pub struct DetectionConfig {
     /// Path whitelist patterns (glob-style wildcards: * and ?)
     pub whitelisted_path_patterns: Vec<String>,
 
-    /// **File analysis only:** Rust regex patterns matched against the full file path; matching
-    /// events are dropped before profiling (no effect on process analysis).
+    /// **File analysis only:** Rust regex patterns matched against the full file path. Matching
+    /// rows are **never** merged into `MachineFileProfile` (counts, mtimes, TF-IDF, etc.); use
+    /// patterns such as `^/proc/` or `^/var/cache/` to drop whole directory trees.
     #[serde(default)]
     pub file_excluded_path_regexes: Vec<String>,
 
-    /// **File analysis only:** Rust regex patterns matched against the basename (last `/` segment);
-    /// matching events are dropped before profiling.
+    /// **File analysis only:** Rust regex patterns matched against the basename (last `/` segment
+    /// only). Matching rows are **never** merged into file profiles.
     #[serde(default)]
     pub file_excluded_filename_regexes: Vec<String>,
 

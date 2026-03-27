@@ -202,6 +202,10 @@ fn fleet_size_metadata_outliers(profiles: &[MachineFileProfile]) -> HashMap<usiz
 /// Whether a raw file row should be ingested into file profiles. Applies glob whitelist
 /// (`whitelisted_path_patterns`) and regex exclusions (`file_excluded_path_regexes`,
 /// `file_excluded_filename_regexes` on compiled patterns).
+///
+/// Rows for which this returns `false` must not appear in `MachineFileProfile` aggregates;
+/// [`merge_file_log_into_profile`] enforces the same rules so callers cannot accidentally merge
+/// excluded paths.
 pub fn should_ingest_file_entry(
     entry: &RawFileEntry,
     config: &DetectionConfig,
@@ -220,13 +224,22 @@ pub fn should_ingest_file_entry(
 }
 
 /// Append one file access log to a profile (batch and streaming loaders).
+///
+/// No-ops when the row is excluded by `file_excluded_*` regexes or the path whitelist (see
+/// [`should_ingest_file_entry`]); the profile is not updated.
 pub(crate) fn merge_file_log_into_profile(
     profile: &mut MachineFileProfile,
     entry: &RawFileEntry,
     config: &DetectionConfig,
     interner: &SharedInterner,
     file_counts: Option<&mut HashMap<String, u32>>,
+    path_exclude_res: &[Regex],
+    filename_exclude_res: &[Regex],
 ) {
+    if !should_ingest_file_entry(entry, config, path_exclude_res, filename_exclude_res) {
+        return;
+    }
+
     let path_is_suspicious = is_path_suspicious(&entry.path, &config.suspicious_path_patterns);
     let timestamp = entry.timestamp.as_ref().and_then(|s| parse_log_datetime(s));
     let mtime = entry.mtime.as_ref().and_then(|s| parse_log_datetime(s));
@@ -363,17 +376,17 @@ pub fn build_file_profiles(
     let path_exclude_res = compile_regex_list(&config.file_excluded_path_regexes);
     let filename_exclude_res = compile_regex_list(&config.file_excluded_filename_regexes);
     let before_count = entries.len();
-    let entries: Vec<RawFileEntry> = entries
-        .into_iter()
-        .filter(|e| should_ingest_file_entry(e, config, &path_exclude_res, &filename_exclude_res))
-        .collect();
-    let after_count = entries.len();
-    if config.debug_display && before_count != after_count {
+    let dropped = entries
+        .iter()
+        .filter(|e| {
+            !should_ingest_file_entry(e, config, &path_exclude_res, &filename_exclude_res)
+        })
+        .count();
+    if config.debug_display && dropped > 0 {
         log::debug!(
-            "File ingest filter (whitelist + regex exclusions): before={}, after={}, filtered={}",
+            "File ingest filter (whitelist + file_excluded_* regexes): raw_rows={}, excluded_rows={} (not merged into profiles)",
             before_count,
-            after_count,
-            before_count - after_count
+            dropped
         );
     }
 
@@ -391,7 +404,7 @@ pub fn build_file_profiles(
         log::debug!("Grouped into {} machines", machine_entries.len());
     }
 
-    let profiles: Vec<MachineFileProfile> = machine_entries
+    let mut profiles: Vec<MachineFileProfile> = machine_entries
         .par_iter()
         .map(|(machine_id, logs)| {
             let mut profile = MachineFileProfile::new(machine_id);
@@ -403,12 +416,21 @@ pub fn build_file_profiles(
                 } else {
                     None
                 };
-                merge_file_log_into_profile(&mut profile, entry, config, &interner_par, fc);
+                merge_file_log_into_profile(
+                    &mut profile,
+                    entry,
+                    config,
+                    &interner_par,
+                    fc,
+                    &path_exclude_res,
+                    &filename_exclude_res,
+                );
             }
             profile
         })
         .collect();
 
+    profiles.retain(|p| p.total_logs > 0);
     log::info!("Built {} machine file profiles", profiles.len());
     profiles
 }
