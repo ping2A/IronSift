@@ -594,13 +594,36 @@ pub fn build_file_profiles(
     profiles
 }
 
-/// Signature bucket for **“Rare file access”** document frequency (`config.file_rare_signature_includes_size`).
-fn file_signature_rare_bucket(sig: &FileSignature, include_size: bool) -> FileSignature {
+/// Normalize [`FileSignature`] for fleet **rare-file** doc frequency and **TF-IDF / DBSCAN** feature
+/// columns (`DetectionConfig::file_rare_signature_includes_*`).
+fn file_signature_fleet_equivalence(sig: &FileSignature, config: &DetectionConfig) -> FileSignature {
     let mut s = sig.clone();
-    if !include_size {
+    if !config.file_rare_signature_includes_recent_mtime {
+        s.recently_modified = false;
+    }
+    if !config.file_rare_signature_includes_metadata {
+        s.permissions = None;
+        s.owner = None;
+        s.group = None;
+        s.is_world_writable = false;
+        s.is_group_writable = false;
+    }
+    if !config.file_rare_signature_includes_size {
         s.size = None;
     }
     s
+}
+
+fn collapse_profile_counts_for_fleet(
+    profile: &MachineFileProfile,
+    config: &DetectionConfig,
+) -> HashMap<FileSignature, u32> {
+    let mut m: HashMap<FileSignature, u32> = HashMap::new();
+    for (sig, &c) in &profile.counts {
+        let key = file_signature_fleet_equivalence(sig, config);
+        *m.entry(key).or_insert(0) += c;
+    }
+    m
 }
 
 pub fn analyze_files_fleet(
@@ -771,13 +794,18 @@ pub fn analyze_files_fleet(
 
     let fleet_access_machines: HashSet<usize> = fleet_access_details.keys().copied().collect();
 
-    let mut unique_features: HashSet<&FileSignature> = HashSet::new();
-    for p in profiles {
-        for key in p.counts.keys() {
-            unique_features.insert(key);
+    let collapsed_counts: Vec<HashMap<FileSignature, u32>> = profiles
+        .iter()
+        .map(|p| collapse_profile_counts_for_fleet(p, config))
+        .collect();
+
+    let mut unique_features: HashSet<FileSignature> = HashSet::new();
+    for m in &collapsed_counts {
+        for key in m.keys() {
+            unique_features.insert(key.clone());
         }
     }
-    let mut feature_list: Vec<&FileSignature> = unique_features.into_iter().collect();
+    let mut feature_list: Vec<FileSignature> = unique_features.into_iter().collect();
     feature_list.sort_by(|a, b| {
         a.path
             .cmp(&b.path)
@@ -799,19 +827,18 @@ pub fn analyze_files_fleet(
 
     let feature_doc_freq: Vec<usize> = feature_list
         .par_iter()
-        .map(|feature| profiles.iter().filter(|p| p.counts.contains_key(*feature)).count())
+        .map(|feature| {
+            collapsed_counts
+                .iter()
+                .filter(|m| m.contains_key(feature))
+                .count()
+        })
         .collect();
 
-    let include_size_in_rare = config.file_rare_signature_includes_size;
     let mut rare_doc_count: HashMap<FileSignature, usize> = HashMap::new();
-    for profile in profiles {
-        let buckets: HashSet<FileSignature> = profile
-            .counts
-            .keys()
-            .map(|k| file_signature_rare_bucket(k, include_size_in_rare))
-            .collect();
-        for b in buckets {
-            *rare_doc_count.entry(b).or_insert(0) += 1;
+    for m in &collapsed_counts {
+        for k in m.keys() {
+            *rare_doc_count.entry(k.clone()).or_insert(0) += 1;
         }
     }
 
@@ -824,12 +851,13 @@ pub fn analyze_files_fleet(
             .enumerate()
             .for_each(|(row_idx, row)| {
                 let profile = &profiles[row_idx];
+                let counts = &collapsed_counts[row_idx];
                 if profile.total_logs == 0 {
                     return;
                 }
                 let tlog = profile.total_logs as f64;
                 for (col_idx, feature) in feature_list.iter().enumerate() {
-                    if let Some(&count) = profile.counts.get(feature) {
+                    if let Some(&count) = counts.get(feature) {
                         let tf = count as f64 / tlog;
                         let doc_count = feature_doc_freq[col_idx].max(1) as f64;
                         let idf = (n_samples_f / doc_count).ln() + 1.0;
@@ -898,15 +926,9 @@ pub fn analyze_files_fleet(
             suspicious_count += meta_details.len() as u32;
         }
 
-        // Per-bucket "rare across fleet" (doc frequency 1). Bucket may ignore `size` unless
-        // `file_rare_signature_includes_size` — see `file_signature_rare_bucket`.
-        let mut rare_by_bucket: HashMap<FileSignature, u32> = HashMap::new();
-        for (sig, count) in &profile.counts {
-            let bucket = file_signature_rare_bucket(sig, include_size_in_rare);
-            *rare_by_bucket.entry(bucket).or_insert(0) += *count;
-        }
-        for (bucket, total_count) in rare_by_bucket {
-            if rare_doc_count.get(&bucket).copied().unwrap_or(0) == 1 {
+        // Per-bucket "rare across fleet" (doc frequency 1), same equivalence as TF-IDF columns.
+        for (bucket, &total_count) in &collapsed_counts[i] {
+            if rare_doc_count.get(bucket).copied().unwrap_or(0) == 1 {
                 suspicious_count += total_count;
                 has_genuine_risk = true;
                 anomalous_features.push(format!("Rare file access: {}", bucket.path));

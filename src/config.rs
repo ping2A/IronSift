@@ -102,11 +102,20 @@ pub struct DetectionConfig {
     #[serde(default)]
     pub file_recent_mtime: FileRecentMtimeConfig,
 
-    /// **File analysis only:** when **false** (default), **“Rare file access”** treats signatures that
-    /// differ only by `size` as the same bucket (fewer false positives from log noise). When
-    /// **true**, the full `FileSignature` including `size` is used for rare document frequency.
+    /// When **false** (default), `size` is ignored for fleet **equivalence** (rare-file counting and
+    /// TF‑IDF / DBSCAN feature keys). Reduces false splits from log noise.
     #[serde(default)]
     pub file_rare_signature_includes_size: bool,
+
+    /// When **false** (default), `permissions`, `owner`, `group`, and writable flags are ignored for
+    /// fleet equivalence (same as [`Self::file_rare_signature_includes_size`] scope).
+    #[serde(default)]
+    pub file_rare_signature_includes_metadata: bool,
+
+    /// When **false** (default), `recently_modified` is cleared for fleet equivalence so different
+    /// access timestamps across hosts do not split the same path+uid into separate features.
+    #[serde(default)]
+    pub file_rare_signature_includes_recent_mtime: bool,
 }
 
 impl Default for DetectionConfig {
@@ -162,6 +171,8 @@ impl Default for DetectionConfig {
             quiet: false,
             file_recent_mtime: FileRecentMtimeConfig::default(),
             file_rare_signature_includes_size: false,
+            file_rare_signature_includes_metadata: false,
+            file_rare_signature_includes_recent_mtime: false,
         }
     }
 }
@@ -231,8 +242,10 @@ impl DetectionConfig {
             self.file_recent_mtime.volatile_path_prefixes.len()
         );
         log::info!(
-            "File rare signature includes size: {}",
-            self.file_rare_signature_includes_size
+            "File fleet signature equivalence includes: size={}, metadata={}, recent_mtime={}",
+            self.file_rare_signature_includes_size,
+            self.file_rare_signature_includes_metadata,
+            self.file_rare_signature_includes_recent_mtime
         );
     }
 }

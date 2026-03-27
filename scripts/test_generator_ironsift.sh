@@ -19,6 +19,13 @@ EXPECTED_PROCESS_CSV_LINES=2021
 EXPECTED_FILES_HEADER="machine_id,path,uid,timestamp,mtime,permissions,owner,group,size"
 EXPECTED_FILES_CSV_LINES=2001
 
+# Must match `generate_file_entries()` in bin/generator.rs (injected scenarios only). Clean hosts may
+# legitimately be absent from the anomaly list once fleet clustering matches them to the majority.
+EXPECTED_FILE_SCENARIO_HOSTS=(
+    machine_003 machine_005 machine_006 machine_007 machine_009
+    machine_011 machine_012 machine_014 machine_015 machine_017
+)
+
 # Seeded process data (DATASET_RNG_SEED in bin/generator.rs): DBSCAN epsilon 0.40 flags exactly these six
 # injected scenario hosts — no benign outliers. Must stay in sync with analysis (see tolerance sweep).
 PROCESS_REGRESSION_TOLERANCE="0.40"
@@ -137,41 +144,19 @@ check_process_attack_patterns_stdout() {
     return 0
 }
 
-# Anomaly machine_ids must match exactly the distinct machine_id values in the generated CSV
-# (first column, data rows only) — no IDs outside the generator output, none missing from results.
-check_file_exact_anomalies_stdout() {
+# File report: require MTIME + METADATA signals, every generator scenario host flagged, each reported
+# anomaly must exist in the CSV, and Suspicious Machines count must match severity-line entries.
+check_file_regression_stdout() {
     local out="$1"
     local csv_path="$2"
-    local actual expected fleet_n
+    local csv_ids actual n sm h
     if [[ ! -f "$csv_path" ]]; then
         echo "FAIL: CSV not found: $csv_path"
         return 1
     fi
-    expected=$(tail -n +2 "$csv_path" | cut -d, -f1 | sort -u)
-    fleet_n=$(echo "$expected" | grep -c . || true)
-    if [[ -z "${expected// }" || "$fleet_n" -eq 0 ]]; then
+    csv_ids=$(tail -n +2 "$csv_path" | cut -d, -f1 | sort -u)
+    if [[ -z "${csv_ids// }" ]]; then
         echo "FAIL: no machine_id values in $csv_path"
-        return 1
-    fi
-    if ! grep -Fq "Suspicious Machines: $fleet_n" <<< "$out"; then
-        echo "FAIL: expected report line 'Suspicious Machines: $fleet_n' (from CSV distinct hosts)"
-        return 1
-    fi
-    actual=$(grep -E 'machine_[0-9]{3} \[(CRITICAL|HIGH|MEDIUM|LOW)\]' <<< "$out" | grep -oE 'machine_[0-9]{3}' | sort -u)
-    local n=0
-    if [[ -n "$actual" ]]; then
-        n=$(echo "$actual" | wc -l)
-        n="${n// /}"
-    fi
-    if [[ "$n" -ne "$fleet_n" ]]; then
-        echo "FAIL: expected $fleet_n unique hosts in severity lines (same as CSV), got $n"
-        echo "$actual"
-        return 1
-    fi
-    if ! diff -q <(echo "$expected") <(echo "$actual") >/dev/null; then
-        echo "FAIL: file anomaly machine_ids must equal distinct machine_id column from generator CSV (no extras or gaps)"
-        echo "--- from CSV ---"; echo "$expected"
-        echo "--- from IronSift ---"; echo "$actual"
         return 1
     fi
     if ! grep -Fq "MTIME ANOMALY:" <<< "$out"; then
@@ -180,6 +165,42 @@ check_file_exact_anomalies_stdout() {
     fi
     if ! grep -Fq "METADATA ANOMALY:" <<< "$out"; then
         echo "FAIL: expected at least one METADATA ANOMALY line (fleet owner/group/size outlier)"
+        return 1
+    fi
+    actual=$(grep -E 'machine_[0-9]{3} \[(CRITICAL|HIGH|MEDIUM|LOW)\]' <<< "$out" | grep -oE 'machine_[0-9]{3}' | sort -u)
+    n=0
+    if [[ -n "$actual" ]]; then
+        n=$(echo "$actual" | wc -l)
+        n="${n// /}"
+    fi
+    local min_expected=${#EXPECTED_FILE_SCENARIO_HOSTS[@]}
+    if [[ "$n" -lt "$min_expected" ]]; then
+        echo "FAIL: expected at least $min_expected anomalous hosts (generator scenarios), got $n"
+        echo "$actual"
+        return 1
+    fi
+    for h in "${EXPECTED_FILE_SCENARIO_HOSTS[@]}"; do
+        if ! grep -Fxq "$h" <<< "$actual"; then
+            echo "FAIL: scenario host $h missing from anomaly list (generator ↔ analysis regression)"
+            echo "anomalous machine_ids: $(echo "$actual" | tr '\n' ' ')"
+            return 1
+        fi
+    done
+    while IFS= read -r id; do
+        [[ -z "${id// }" ]] && continue
+        if ! grep -Fxq "$id" <<< "$csv_ids"; then
+            echo "FAIL: reported anomaly machine_id '$id' not in generator CSV"
+            return 1
+        fi
+    done <<< "$actual"
+    if [[ "$out" =~ Suspicious\ Machines:\ ([0-9]+) ]]; then
+        sm="${BASH_REMATCH[1]}"
+        if [[ "$sm" != "$n" ]]; then
+            echo "FAIL: Suspicious Machines: $sm does not match $n unique hosts in severity lines"
+            return 1
+        fi
+    else
+        echo "FAIL: missing 'Suspicious Machines:' line in report"
         return 1
     fi
     return 0
@@ -299,7 +320,7 @@ printf "  ironsift --files ... "
 OUT=$(cargo run --release --bin ironsift -- --files --input "$FILES_CSV" 2>&1) || true
 echo "$OUT" > "$REPO_ROOT/scripts/.ironsift_test_out"
 if echo "$OUT" | grep -q "Loaded.*machine file profile" && echo "$OUT" | grep -q "ANOMALIES DETECTED" &&
-    check_file_exact_anomalies_stdout "$OUT" "$REPO_ROOT/$FILES_CSV"; then
+    check_file_regression_stdout "$OUT" "$REPO_ROOT/$FILES_CSV"; then
     echo "OK"
     ((PASS++)) || true
 else

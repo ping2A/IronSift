@@ -3641,6 +3641,49 @@ fn test_file_rare_includes_size_when_configured() {
     );
 }
 
+/// Two hosts, same path+uid, but different log metadata / mtime-vs-access → should **not** flag
+/// when fleet equivalence defaults strip those fields (TF-IDF + rare use collapsed keys).
+#[test]
+fn test_two_hosts_same_file_not_suspicious_with_log_noise() {
+    use chrono::Utc;
+
+    let config = DetectionConfig::default();
+    let access = Utc::now();
+    let access_str = access.to_rfc3339();
+    let mtime_recent = (access - chrono::Duration::hours(1)).to_rfc3339();
+    let mtime_old = (access - chrono::Duration::days(50)).to_rfc3339();
+
+    let entries = vec![
+        RawFileEntry {
+            machine_id: "host_a".to_string(),
+            path: "/opt/org/app/settings.toml".to_string(),
+            uid: 1000,
+            timestamp: Some(access_str.clone()),
+            mtime: Some(mtime_recent),
+            permissions: Some("0644".to_string()),
+            ..Default::default()
+        },
+        RawFileEntry {
+            machine_id: "host_b".to_string(),
+            path: "/opt/org/app/settings.toml".to_string(),
+            uid: 1000,
+            timestamp: Some(access_str),
+            mtime: Some(mtime_old),
+            permissions: Some("-rw-r--r--".to_string()),
+            size: Some(42_000),
+            ..Default::default()
+        },
+    ];
+
+    let profiles = build_file_profiles(entries, &config);
+    let report = analyze_files_fleet(&profiles, &config).unwrap();
+    assert!(
+        report.anomalies.is_empty(),
+        "identical logical file across two hosts should not produce anomalies: {:?}",
+        report.anomalies
+    );
+}
+
 #[test]
 fn test_file_mtime_anomaly_detection() {
     println!("\n🧪 Testing file modification time anomaly detection");
