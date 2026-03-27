@@ -51,6 +51,7 @@
   ],
   "file_excluded_path_regexes": [],
   "file_excluded_filename_regexes": [],
+  "file_rare_signature_includes_size": false,
   "file_recent_mtime": {
     "clock_skew_minutes": 5,
     "max_hours_critical_paths": 12,

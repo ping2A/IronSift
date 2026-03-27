@@ -101,6 +101,12 @@ pub struct DetectionConfig {
     /// **File analysis:** recent modification vs access-time heuristic (`recently_modified` flag).
     #[serde(default)]
     pub file_recent_mtime: FileRecentMtimeConfig,
+
+    /// **File analysis only:** when **false** (default), **“Rare file access”** treats signatures that
+    /// differ only by `size` as the same bucket (fewer false positives from log noise). When
+    /// **true**, the full `FileSignature` including `size` is used for rare document frequency.
+    #[serde(default)]
+    pub file_rare_signature_includes_size: bool,
 }
 
 impl Default for DetectionConfig {
@@ -155,6 +161,7 @@ impl Default for DetectionConfig {
             file_excluded_filename_regexes: vec![],
             quiet: false,
             file_recent_mtime: FileRecentMtimeConfig::default(),
+            file_rare_signature_includes_size: false,
         }
     }
 }
@@ -222,6 +229,10 @@ impl DetectionConfig {
             self.file_recent_mtime.max_hours_system_elevated,
             self.file_recent_mtime.max_hours_suspicious_only,
             self.file_recent_mtime.volatile_path_prefixes.len()
+        );
+        log::info!(
+            "File rare signature includes size: {}",
+            self.file_rare_signature_includes_size
         );
     }
 }

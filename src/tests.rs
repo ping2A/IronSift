@@ -3557,6 +3557,90 @@ fn test_file_rare_file_detection() {
     println!("✅ Rare file detection test passed!");
 }
 
+/// Same path and uid with different reported sizes should not create spurious "Rare file access"
+/// when `file_rare_signature_includes_size` is false (default).
+#[test]
+fn test_file_rare_ignores_size_by_default() {
+    let mut config = DetectionConfig::default();
+    config.dbscan_tolerance = 0.5;
+
+    let mut entries = Vec::new();
+    for i in 0..5 {
+        entries.push(RawFileEntry {
+            machine_id: format!("m{}", i),
+            path: "/etc/passwd".to_string(),
+            uid: 1000,
+            size: Some(900 + i as u64),
+            ..Default::default()
+        });
+    }
+    entries.push(RawFileEntry {
+        machine_id: "only_one".to_string(),
+        path: "/unique/backdoor".to_string(),
+        uid: 1000,
+        ..Default::default()
+    });
+
+    let profiles = build_file_profiles(entries, &config);
+    let report = analyze_files_fleet(&profiles, &config).unwrap();
+
+    for a in &report.anomalies {
+        if a.machine_id.starts_with('m') {
+            let joined = a.anomalous_features.join(" ");
+            assert!(
+                !joined.contains("Rare file access: /etc/passwd"),
+                "size-only variation must not make /etc/passwd rare: {:?}",
+                a.anomalous_features
+            );
+        }
+    }
+
+    let only = report
+        .anomalies
+        .iter()
+        .find(|a| a.machine_id == "only_one")
+        .expect("unique-path host should be anomalous");
+    assert!(
+        only
+            .anomalous_features
+            .iter()
+            .any(|f| f.contains("Rare file access")),
+        "expected rare path signal: {:?}",
+        only.anomalous_features
+    );
+}
+
+#[test]
+fn test_file_rare_includes_size_when_configured() {
+    let mut config = DetectionConfig::default();
+    config.dbscan_tolerance = 0.5;
+    config.file_rare_signature_includes_size = true;
+
+    let mut entries = Vec::new();
+    for i in 0..2 {
+        entries.push(RawFileEntry {
+            machine_id: format!("m{}", i),
+            path: "/shared/config".to_string(),
+            uid: 1000,
+            size: Some(10 + i as u64),
+            ..Default::default()
+        });
+    }
+
+    let profiles = build_file_profiles(entries, &config);
+    let report = analyze_files_fleet(&profiles, &config).unwrap();
+
+    assert!(
+        report.anomalies.iter().all(|a| {
+            a.anomalous_features
+                .iter()
+                .any(|f| f.contains("Rare file access: /shared/config"))
+        }),
+        "each host should be sole owner of its size-specific signature: {:?}",
+        report.anomalies
+    );
+}
+
 #[test]
 fn test_file_mtime_anomaly_detection() {
     println!("\n🧪 Testing file modification time anomaly detection");

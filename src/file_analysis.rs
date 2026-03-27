@@ -594,6 +594,15 @@ pub fn build_file_profiles(
     profiles
 }
 
+/// Signature bucket for **“Rare file access”** document frequency (`config.file_rare_signature_includes_size`).
+fn file_signature_rare_bucket(sig: &FileSignature, include_size: bool) -> FileSignature {
+    let mut s = sig.clone();
+    if !include_size {
+        s.size = None;
+    }
+    s
+}
+
 pub fn analyze_files_fleet(
     profiles: &[MachineFileProfile],
     config: &DetectionConfig,
@@ -793,11 +802,18 @@ pub fn analyze_files_fleet(
         .map(|feature| profiles.iter().filter(|p| p.counts.contains_key(*feature)).count())
         .collect();
 
-    let file_doc_count_map: HashMap<&FileSignature, usize> = feature_list
-        .iter()
-        .enumerate()
-        .map(|(i, &f)| (f, feature_doc_freq[i]))
-        .collect();
+    let include_size_in_rare = config.file_rare_signature_includes_size;
+    let mut rare_doc_count: HashMap<FileSignature, usize> = HashMap::new();
+    for profile in profiles {
+        let buckets: HashSet<FileSignature> = profile
+            .counts
+            .keys()
+            .map(|k| file_signature_rare_bucket(k, include_size_in_rare))
+            .collect();
+        for b in buckets {
+            *rare_doc_count.entry(b).or_insert(0) += 1;
+        }
+    }
 
     let data = if n_features == 0 {
         Array2::<f64>::zeros((n_samples, 1))
@@ -882,14 +898,18 @@ pub fn analyze_files_fleet(
             suspicious_count += meta_details.len() as u32;
         }
 
-        // Per-signature "rare across fleet" (doc frequency 1). Other risk dimensions use fleet
-        // outlier blocks above or metadata / mtime baselines — not per-row root/system-dir flags.
+        // Per-bucket "rare across fleet" (doc frequency 1). Bucket may ignore `size` unless
+        // `file_rare_signature_includes_size` — see `file_signature_rare_bucket`.
+        let mut rare_by_bucket: HashMap<FileSignature, u32> = HashMap::new();
         for (sig, count) in &profile.counts {
-            let doc_count = file_doc_count_map.get(sig).copied().unwrap_or(0);
-            if doc_count == 1 {
-                suspicious_count += *count;
+            let bucket = file_signature_rare_bucket(sig, include_size_in_rare);
+            *rare_by_bucket.entry(bucket).or_insert(0) += *count;
+        }
+        for (bucket, total_count) in rare_by_bucket {
+            if rare_doc_count.get(&bucket).copied().unwrap_or(0) == 1 {
+                suspicious_count += total_count;
                 has_genuine_risk = true;
-                anomalous_features.push(format!("Rare file access: {}", sig.path));
+                anomalous_features.push(format!("Rare file access: {}", bucket.path));
             }
         }
 
