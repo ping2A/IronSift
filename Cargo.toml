@@ -16,6 +16,10 @@ path = "bin/generator.rs"
 name = "ironsift"
 path = "bin/main.rs"
 
+[[bin]]
+name = "ironsift-server"
+path = "bin/server.rs"
+
 [[example]]
 name = "simple"
 path = "examples/simple.rs"
@@ -54,6 +58,16 @@ regex = "1.10"
 log = "0.4"
 env_logger = "0.11"
 parking_lot = "0.12"
+axum = { version = "0.7", features = ["multipart"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "process"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+# In-process: [ping2A/anomark-rs](https://github.com/ping2A/anomark-rs) and [ping2A/sigmazero](https://github.com/ping2A/sigmazero).
+anomark = { git = "https://github.com/ping2A/anomark-rs", rev = "ed83dc3e80ccdc373ebd6591a12bb60f9fef5511" }
+sigma_zero = { package = "sigma-zero", git = "https://github.com/ping2A/sigmazero", rev = "fc89e597e5952e4df7f4d61a9eba5c26aaa74c25" }
+anyhow = "1.0"
+ahash = "0.8"
 
 [dev-dependencies]
 tempfile = "3.8"

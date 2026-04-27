@@ -319,6 +319,230 @@ cargo build --release
 
 ## 🔧 Quick Start
 
+### Web UI + API platform
+
+IronSift now includes a web server binary with REST API and a browser UI for:
+
+- ingesting process/file datasets
+- attaching tags for comparison cohorts
+- running suspicious host detection (IronSift + optional AnoMark)
+- visualizing fleet risk using a honeycomb-style grid
+
+Run:
+
+```bash
+cargo run --bin ironsift-server
+```
+
+Then open `http://localhost:8080`.
+
+API endpoints:
+
+- `GET /api/health`
+- `GET/POST /api/datasets`
+- `POST /api/datasets/purge` (delete all datasets and ingested events)
+- `POST /api/datasets/upload` (multipart `file`, optional query: `name`, `tags`)
+- `POST /api/datasets/:id/tags`
+- `GET/POST /api/runs`
+- `GET/POST /api/run-config` (manage default detection config used by new runs)
+- `GET /api/runs/:id`
+- `GET /api/runs/:id/detections`
+- `GET /api/fleet/honeycomb?run_id=<id>&min_score=<0..1>&severity=<LOW|MEDIUM|HIGH|CRITICAL>`
+- `POST /api/pipeline/auto` (one-shot full automation)
+- `GET/POST /api/anomark/config` (set model/columns from UI or API)
+- `GET /api/anomark/availability` (which model files exist: platform config + saved trainings; used by “Runs & Findings” to enable AnoMark)
+- `POST /api/anomark/train` (train AnoMark model from uploaded/local training data)
+- `GET/POST /api/sigma-zero/config` ([sigmazero](https://github.com/ping2A/sigmazero) / `sigma_zero` crate in-process, rules directory, field map)
+- `POST /api/sigma-zero/check` (run Sigma rules on selected process datasets or a server log path; exports JSONL with `process_name` / `command_line` and evaluates in memory)
+
+AnoMark is included on a run when `enable_anomark=true` and a model file exists. Optionally set `anomark_train_id` to a saved training id to use that `model.bin` instead of the platform `model_path`. The Web UI **Runs & Findings** section loads `GET /api/anomark/availability`, pre-enables the checkbox when any model is on disk, and offers a model picker.
+Configure environment variables:
+
+- `ANOMARK_MODEL_PATH` (required to activate scoring)
+- `ANOMARK_BIN` (only if you use external tools; the server uses the `anomark` crate in-process for training and scoring)
+- `ANOMARK_COLUMN` (default: `command`)
+- `ANOMARK_MACHINE_FIELD` (default: `machine_id`)
+
+For osquery alignment, datasets can be tagged with the schema profile `osquery-5.22.1`.
+
+#### One-shot fully automatic pipeline
+
+Run server:
+
+```bash
+cargo run --bin ironsift-server
+```
+
+Then call:
+
+```bash
+curl -sS -X POST http://localhost:8080/api/pipeline/auto \
+  -H "Content-Type: application/json" \
+  -d '{
+    "directory": "./data",
+    "baseline_tag": "baseline",
+    "candidate_tag": "candidate",
+    "enable_anomark": true
+  }'
+```
+
+Run the shell helper script (requires server already running):
+
+```bash
+scripts/auto_pipeline.sh --dir ./data
+```
+
+With AnoMark:
+
+```bash
+ANOMARK_MODEL_PATH=./models/process_model.bin \
+scripts/auto_pipeline.sh --dir ./data --enable-anomark
+```
+
+Note: on first run, server startup can take time because Rust dependencies compile.  
+Start the server manually (for example `cargo run --bin ironsift-server`) before running the script.
+The script waits for `/api/health` and exits with guidance if server is not reachable.
+If the directory has no logs yet, the script exits cleanly and tells you to use the UI to upload logs.
+
+If no server is detected quickly (5s check), the script starts `ironsift-server` in foreground mode (no background/detached process).
+
+You can now configure AnoMark directly in the Web UI:
+
+- model path and column settings (AnoMark runs in-process, no `anomark-rs` binary)
+- model path
+- scoring column and machine field
+- train a model from a training dataset path
+
+Equivalent API example:
+
+```bash
+curl -sS -X POST http://localhost:8080/api/anomark/config \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model_path": "./models/process_model.bin",
+    "column": "command",
+    "machine_field": "machine_id"
+  }'
+```
+
+Train example. You can omit `output_model_path`: the model is always written to `.ironsift-platform/anomark-trains/<train_id>/model.bin` and is listed for download; set `output_model_path` only to copy the same file to another path on disk.
+
+```bash
+curl -sS -X POST http://localhost:8080/api/anomark/train \
+  -H "Content-Type: application/json" \
+  -d '{
+    "training_path": "./data/train.jsonl",
+    "column": "command",
+    "order": 4,
+    "output_model_path": "./models/process_model.bin"
+  }'
+```
+
+Train from already ingested datasets (no raw file path required; `output_model_path` can be `""`):
+
+```bash
+curl -sS -X POST http://localhost:8080/api/anomark/train \
+  -H "Content-Type: application/json" \
+  -d '{
+    "dataset_ids": ["<dataset-id-1>", "<dataset-id-2>"],
+    "tags": ["baseline", "prod-clean"],
+    "column": "command",
+    "order": 4,
+    "output_model_path": ""
+  }'
+```
+
+List past trainings: `GET /api/anomark/trains`. Download: `GET /api/anomark/trains/<id>/model` and `GET /api/anomark/trains/<id>/training-data`.
+
+**Sigma (sigmazero):** the server links the [sigmazero](https://github.com/ping2A/sigmazero) library (`sigma_zero` crate) at build time—no `sigma-zero` binary. Set `rules_dir` to a folder of `.yml` Sigma rules, then run checks from the **Sigma** tab or via API. IronSift converts process datasets to JSONL with `process_name`, `command_line`, `machine_id`, etc. Use `field_map` in config or the request if your rules use other field names (e.g. Windows `Image` → `process_name`).
+
+```bash
+curl -sS -X POST http://localhost:8080/api/sigma-zero/config \
+  -H "Content-Type: application/json" \
+  -d '{
+    "rules_dir": "/path/to/sigma-rules",
+    "field_map": "",
+    "workers": 8
+  }'
+
+curl -sS -X POST http://localhost:8080/api/sigma-zero/check \
+  -H "Content-Type: application/json" \
+  -d '{
+    "dataset_ids": ["<id>"],
+    "tags": [],
+    "log_path": "",
+    "filter_tags": [],
+    "filter_levels": ["high", "critical"]
+  }'
+```
+
+In the UI, AnoMark Training now supports:
+
+- training file path, or
+- dataset IDs, or
+- tags (it selects matching process datasets)
+- optional on-disk `output_model_path` (not required; use the “Saved AnoMark trainings” table to download the model and training JSONL)
+
+### Runs & Findings improvements
+
+The Runs tab now supports:
+
+- dataset picker checkboxes (plus optional manual ID input)
+- baseline/candidate tag filters for run creation
+- readable findings table (machine, severity, score, detectors, top reason)
+- selecting a run and propagating it automatically to Findings (including the hex fleet view)
+- editable default run config as full `DetectionConfig` JSON (all fields exposed)
+
+Behavior:
+
+1. Imports all `.csv`, `.json`, `.jsonl` files from the directory.
+2. Auto-detects dataset kind (process/file) from schema/header heuristics.
+3. Applies tags automatically (files containing `baseline` in the name get baseline tag).
+4. Runs IronSift detection and optional in-process AnoMark (`anomark` crate).
+5. Stores run output and exposes a honeycomb-ready fleet map via API.
+
+#### Upload + auto import (no manual path setup)
+
+```bash
+curl -sS -X POST "http://localhost:8080/api/datasets/upload?name=mylogs&tags=candidate,prod" \
+  -F "file=@./events.jsonl"
+```
+
+You can provide multiple files in one call:
+
+```bash
+curl -sS -X POST "http://localhost:8080/api/datasets/upload?tags=candidate" \
+  -F "file=@./proc_a.csv" \
+  -F "file=@./proc_b.jsonl" \
+  -F "file=@./files.json"
+```
+
+All imported data is persisted into a SQLite database using the platform schema:
+
+- `.ironsift-platform/events.db`
+- tables:
+  - `datasets`
+  - `dataset_tags`
+  - `process_events`
+  - `file_events`
+
+#### Honeycomb fleet map (Runs & Findings)
+
+On **Run Findings** (not a separate tab), the Web UI renders a hexagonal honeycomb map:
+
+- each hex cell = one machine
+- color encodes risk score/severity
+- tooltip shows host, severity, score
+- API filters supported:
+  - `min_score` for thresholding
+  - `severity` for severity-only views
+
+Example:
+
+```bash
+curl -sS "http://localhost:8080/api/fleet/honeycomb?run_id=<RUN_ID>&min_score=0.7&severity=HIGH"
+```
+
 ### 1. Generate Test Data
 
 Create a realistic dataset with 100 machines and embedded attack scenarios:

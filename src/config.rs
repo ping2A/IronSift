@@ -47,40 +47,57 @@ impl Default for FileRecentMtimeConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectionConfig {
+    // NOTE: persisted in `.ironsift-platform/db.json` as part of the platform `run_config`.
+    // This must be backwards-compatible: older/partial objects must still deserialize.
+    // `#[serde(default)]` for scalars/Vecs uses type default (0.0, empty) — wrong for us — so fields
+    // that must match `DetectionConfig::default()` use `default = "def_..."` helpers.
+
     /// Shannon entropy threshold for detecting obfuscated commands
+    #[serde(default = "def_entropy_threshold")]
     pub entropy_threshold: f64,
 
     /// Ratio below which a cluster is considered a minority (e.g., 0.10 = 10%)
+    #[serde(default = "def_minority_cluster_ratio")]
     pub minority_cluster_ratio: f64,
 
     /// DBSCAN tolerance (epsilon) - lower is stricter
+    #[serde(default = "def_dbscan_tolerance")]
     pub dbscan_tolerance: f64,
 
     /// Minimum samples for DBSCAN core point
+    #[serde(default = "def_dbscan_min_samples")]
     pub dbscan_min_samples: usize,
 
     /// Enable L2 normalization of feature vectors
+    #[serde(default = "def_normalize_features")]
     pub normalize_features: bool,
 
     /// Suspicious path patterns (regex)
+    #[serde(default = "def_suspicious_path_patterns")]
     pub suspicious_path_patterns: Vec<String>,
 
     /// Exclude Linux kernel threads (names starting with '[' and ending with ']')
+    #[serde(default = "def_exclude_kernel_threads")]
     pub exclude_kernel_threads: bool,
 
     /// Common system processes that legitimately run as root (UID 0)
+    #[serde(default = "def_common_root_processes")]
     pub common_root_processes: Vec<String>,
 
     /// Penalize root processes that are NOT in common_root_processes list
+    #[serde(default = "def_flag_unexpected_root")]
     pub flag_unexpected_root: bool,
 
     /// Enable debug output for detailed process information
+    #[serde(default = "def_debug_display")]
     pub debug_display: bool,
 
     /// Exclude processes that are direct children of init/systemd (PPID = 1)
+    #[serde(default = "def_exclude_init_children")]
     pub exclude_init_children: bool,
 
     /// Path whitelist patterns (glob-style wildcards: * and ?)
+    #[serde(default = "def_whitelisted_path_patterns")]
     pub whitelisted_path_patterns: Vec<String>,
 
     /// **File analysis only:** Rust regex patterns matched against the full file path. Matching
@@ -175,6 +192,56 @@ impl Default for DetectionConfig {
             file_rare_signature_includes_recent_mtime: false,
         }
     }
+}
+
+// Serde per-field defaults for partial persisted configs.
+// These must match `DetectionConfig::default()` to avoid surprise behavior.
+fn def_entropy_threshold() -> f64 {
+    DetectionConfig::default().entropy_threshold
+}
+
+fn def_minority_cluster_ratio() -> f64 {
+    DetectionConfig::default().minority_cluster_ratio
+}
+
+fn def_dbscan_tolerance() -> f64 {
+    DetectionConfig::default().dbscan_tolerance
+}
+
+fn def_dbscan_min_samples() -> usize {
+    DetectionConfig::default().dbscan_min_samples
+}
+
+fn def_normalize_features() -> bool {
+    DetectionConfig::default().normalize_features
+}
+
+fn def_suspicious_path_patterns() -> Vec<String> {
+    DetectionConfig::default().suspicious_path_patterns
+}
+
+fn def_exclude_kernel_threads() -> bool {
+    DetectionConfig::default().exclude_kernel_threads
+}
+
+fn def_common_root_processes() -> Vec<String> {
+    DetectionConfig::default().common_root_processes
+}
+
+fn def_flag_unexpected_root() -> bool {
+    DetectionConfig::default().flag_unexpected_root
+}
+
+fn def_debug_display() -> bool {
+    DetectionConfig::default().debug_display
+}
+
+fn def_exclude_init_children() -> bool {
+    DetectionConfig::default().exclude_init_children
+}
+
+fn def_whitelisted_path_patterns() -> Vec<String> {
+    DetectionConfig::default().whitelisted_path_patterns
 }
 
 impl DetectionConfig {

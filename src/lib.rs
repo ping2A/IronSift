@@ -11,6 +11,10 @@ mod analysis;
 mod file_analysis;
 mod temporal;
 mod loaders;
+mod osquery;
+mod platform;
+mod sigma_log_export;
+mod event_db;
 
 // Re-export public API
 pub use config::{DetectionConfig, FileRecentMtimeConfig};
@@ -42,6 +46,16 @@ pub use loaders::{
     build_profiles_simple, generate_mock_data, load_csv_data, load_files_csv_data,
     load_files_json_data, load_files_jsonl_data, load_json_data, load_jsonl_data,
 };
+pub use osquery::{normalize_osquery_file_row, normalize_osquery_process_row};
+pub use platform::{
+    AnoMarkAvailability, AnoMarkSettings, AnoMarkTrainRecord, AnoMarkTrainRequest, AnoMarkTrainResult,
+    AnoMarkTrainingAvailability,
+    AutoPipelineRequest, AutoPipelineResult, CreateDatasetRequest, CreateRunRequest, DatasetKind,
+    DatasetRecord, DetectionFinding, DetectionRunRecord, HoneycombCell, PlatformStore,
+    SigmaZeroCheckRequest, SigmaZeroCheckResult, SigmaZeroSettings,
+};
+pub use event_db::EventDb;
+pub use event_db::DatasetInspection;
 
 #[cfg(test)]
 mod tests;

@@ -1,0 +1,1609 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>IronSift Web UI</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 24px; background: #0f172a; color: #e2e8f0; }
+    h1, h2, h3 { margin-bottom: 8px; }
+    .top { margin-bottom: 16px; }
+    .tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+    .tab-btn { padding: 8px 12px; border-radius: 999px; border: 1px solid #334155; background: #0b1220; color: #cbd5e1; cursor: pointer; }
+    .tab-btn.active { background: #1d4ed8; color: #eff6ff; border-color: #1d4ed8; }
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+    .card { background: #111827; border: 1px solid #334155; border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+    input, select, button, textarea { padding: 8px; border-radius: 8px; border: 1px solid #475569; background: #0b1220; color: #e2e8f0; }
+    button { cursor: pointer; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #1e293b; margin-right: 6px; font-size: 12px; }
+    .kpis { display: grid; grid-template-columns: repeat(auto-fit,minmax(180px,1fr)); gap: 8px; }
+    .kpi { background: #0b1220; border: 1px solid #334155; border-radius: 10px; padding: 10px; }
+    .kpi .label { font-size: 12px; color: #94a3b8; }
+    .kpi .value { font-size: 24px; font-weight: 700; margin-top: 4px; }
+    .sev-badge { padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+    .sev-low { background:#14532d; color:#dcfce7; }
+    .sev-medium { background:#78350f; color:#fef3c7; }
+    .sev-high { background:#7f1d1d; color:#fee2e2; }
+    .sev-critical { background:#450a0a; color:#fecaca; border:1px solid #991b1b; }
+    .score-wrap { width: 120px; height: 8px; background:#0f172a; border:1px solid #334155; border-radius:99px; overflow:hidden; }
+    .score-bar { height:100%; }
+    .honey-wrap { margin-top: 12px; }
+    .honey-clip {
+      position: relative;
+      border: 1px solid #334155;
+      border-radius: 10px;
+      background: #020617;
+      overflow: hidden;
+      touch-action: none;
+    }
+    .honey-toolbar { margin-bottom: 8px; align-items: center; }
+    .honey-toolbar .muted { font-size: 12px; max-width: 50%; }
+    .honey-ui .honey-svg { display: block; width: 100%; min-height: 360px; max-height: 560px; cursor: crosshair; }
+    .honey-svg--compact { min-height: 200px; max-height: 300px; }
+    .honey-hex { cursor: help; }
+    .honey-hex--infected { cursor: pointer; }
+    .honey-hex--infected:hover { filter: brightness(1.12); }
+    .honey-hover-hint { min-height: 1.3em; font-size: 12px; color: #cbd5e1; margin-top: 6px; padding: 0 2px; font-family: ui-monospace, Menlo, monospace; }
+    .honey-hex--dim { opacity: 0.4; }
+    .honey-panel { margin-top: 10px; padding: 12px; border: 1px solid #334155; border-radius: 10px; background: #0b1220; }
+    .honey-panel h4 { margin: 0 0 8px; font-size: 15px; }
+    .honey-panel .pill { font-size: 11px; }
+    .honey-panel ul { margin: 0; padding-left: 18px; }
+    .honey-panel .det-list { color: #cbd5e1; font-size: 13px; line-height: 1.45; }
+    .legend { margin-top: 8px; font-size: 12px; color: #94a3b8; display: flex; gap: 12px; flex-wrap: wrap; }
+    .legend span { display: inline-flex; align-items: center; gap: 6px; }
+    .legend i { width: 12px; height: 12px; border-radius: 2px; display: inline-block; }
+    .section-collapse { border: 0; padding: 0; }
+    .section-collapse > summary {
+      list-style: none; cursor: pointer; display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      font-size: 1.5em; font-weight: 600; margin: 0 0 0; user-select: none; color: #e2e8f0;
+    }
+    .section-collapse > summary::-webkit-details-marker { display: none; }
+    .section-collapse > summary::marker { content: none; }
+    .section-collapse .section-caret { display: inline-block; font-size: 0.65em; color: #94a3b8; transition: transform 0.15s ease; }
+    .section-collapse[open] .section-caret { transform: rotate(0deg); }
+    .section-collapse:not([open]) .section-caret { transform: rotate(-90deg); }
+    .section-collapse > .section-body { margin-top: 8px; }
+    .muted { color: #94a3b8; }
+    pre { overflow: auto; background: #020617; border: 1px solid #334155; padding: 8px; border-radius: 8px; }
+    .run-cfg-hint { font-size: 13px; line-height: 1.4; margin: 0 0 10px; }
+    .run-cfg-editor { max-height: 65vh; overflow: auto; padding-right: 6px; margin-bottom: 10px; }
+    .run-cfg-sec {
+      border: 1px solid #334155; border-radius: 8px; padding: 10px 12px; margin-bottom: 10px;
+      background: #0b1220;
+    }
+    .run-cfg-sec > summary { cursor: pointer; font-weight: 600; color: #e2e8f0; list-style: none; }
+    .run-cfg-sec > summary::-webkit-details-marker { display: none; }
+    .run-cfg-sec[open] > summary { margin-bottom: 10px; }
+    .run-cfg-sec h4 { margin: 12px 0 6px; font-size: 13px; color: #94a3b8; font-weight: 600; }
+    .run-cfg-sec h4:first-child { margin-top: 0; }
+    .run-cfg-grid { display: grid; grid-template-columns: minmax(200px, 0.9fr) minmax(200px, 1.1fr); gap: 6px 12px; align-items: center; }
+    @media (max-width: 720px) { .run-cfg-grid { grid-template-columns: 1fr; } }
+    .run-cfg-grid label, .run-cfg-grid .cfg-fld-lbl { font-size: 13px; color: #94a3b8; }
+    .run-cfg-ck-row { display: flex; flex-wrap: wrap; gap: 10px 20px; align-items: center; }
+    .run-cfg-ck-row label { display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 13px; }
+    .str-list { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
+    .str-list__row { display: flex; align-items: stretch; gap: 6px; width: 100%; }
+    .str-list__input { flex: 1; min-width: 0; }
+    .str-list__add { font-size: 12px; padding: 5px 10px; margin-top: 2px; align-self: flex-start; }
+    .str-list__rm { flex-shrink: 0; font-size: 12px; padding: 5px 8px; white-space: nowrap; border-color: #5b2c2c; color: #fecaca; }
+    .run-cfg-raw { margin-top: 12px; }
+    .run-cfg-raw pre, .run-cfg-raw textarea { font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div class="top">
+    <h1>IronSift Platform</h1>
+    <p class="muted">Clear workflows: ingest data, run detection, visualize fleet anomalies, and tune AnoMark.</p>
+  </div>
+
+  <div class="tabs">
+    <button class="tab-btn active" data-tab="dashboard" onclick="switchTab('dashboard', this)">Dashboard</button>
+    <button class="tab-btn" data-tab="ingestion" onclick="switchTab('ingestion', this)">Ingestion</button>
+    <button class="tab-btn" data-tab="runs" onclick="switchTab('runs', this)">Runs & Findings</button>
+    <button class="tab-btn" data-tab="anomark-tab" onclick="switchTab('anomark-tab', this)">AnoMark</button>
+    <button class="tab-btn" data-tab="sigma-tab" onclick="switchTab('sigma-tab', this)">Sigma</button>
+    <button class="tab-btn" data-tab="automation" onclick="switchTab('automation', this)">Auto Pipeline</button>
+  </div>
+
+  <section id="dashboard" class="tab-content active">
+    <div class="card">
+      <h2>Overview</h2>
+      <div class="kpis">
+        <div class="kpi"><div class="label">Datasets</div><div class="value" id="kpiDatasets">0</div></div>
+        <div class="kpi"><div class="label">Runs</div><div class="value" id="kpiRuns">0</div></div>
+        <div class="kpi"><div class="label">Latest Findings</div><div class="value" id="kpiFindings">0</div></div>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Quick Actions</h3>
+      <div class="row">
+        <button onclick="switchTab('ingestion', document.querySelector('[data-tab=ingestion]'))">Go to Ingestion</button>
+        <button onclick="switchTab('runs', document.querySelector('[data-tab=runs]'))">Go to Runs &amp; Findings (fleet view)</button>
+      </div>
+    </div>
+  </section>
+
+  <section id="ingestion" class="tab-content">
+    <div class="card">
+      <h2>Import by File Path</h2>
+      <div class="row">
+        <input id="name" placeholder="Dataset name" />
+        <input id="path" placeholder="Source path (csv/json/jsonl)" style="min-width: 340px;" />
+        <select id="kind"><option value="process">process</option><option value="file">file</option></select>
+        <input id="tags" placeholder="tags comma-separated" />
+        <button onclick="importDataset()">Import</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Upload Files</h2>
+      <div class="row">
+        <input id="uploadFile" type="file" accept=".csv,.json,.jsonl" multiple />
+        <input id="uploadName" placeholder="upload dataset name (optional)" />
+        <input id="uploadTags" placeholder="upload tags comma-separated" />
+        <button onclick="uploadDataset()">Upload & Import to DB</button>
+      </div>
+      <p class="muted">Accepted: CSV, JSON, JSONL. Saved in SQLite tables: `datasets`, `dataset_tags`, `process_events`, `file_events`.</p>
+    </div>
+    <div class="card">
+      <h2>Datasets</h2>
+      <div class="row" style="margin-bottom:8px;">
+        <button onclick="loadDatasets()">Refresh datasets</button>
+        <button onclick="purgeDatasets()" style="border-color:#7f1d1d;color:#fecaca;">Delete all datasets</button>
+      </div>
+      <div id="datasets"></div>
+      <pre id="datasetInspection" style="margin-top:10px;"></pre>
+    </div>
+  </section>
+
+  <section id="runs" class="tab-content">
+    <div class="card">
+      <details class="section-collapse" id="runsConfigSection" open>
+        <summary>Run Configuration (Default) <span class="section-caret" aria-hidden="true">▼</span></summary>
+        <div class="section-body">
+      <p class="run-cfg-hint muted">Detection settings used as the default for new runs. Edit the structured form below, or use raw JSON. <strong>Save</strong> always serializes the form—after changing raw JSON, click <strong>Apply raw JSON to form</strong> first.</p>
+      <div class="run-cfg-editor" id="runCfgFormRoot">
+        <details class="run-cfg-sec" open>
+          <summary>Clustering &amp; entropy</summary>
+          <div class="run-cfg-grid">
+            <span class="cfg-fld-lbl">entropy_threshold</span>
+            <input type="number" id="cfg-entropy_threshold" step="0.01" min="0" />
+            <span class="cfg-fld-lbl">minority_cluster_ratio</span>
+            <input type="number" id="cfg-minority_cluster_ratio" step="0.01" min="0" max="1" />
+            <span class="cfg-fld-lbl">dbscan_tolerance</span>
+            <input type="number" id="cfg-dbscan_tolerance" step="0.01" min="0" />
+            <span class="cfg-fld-lbl">dbscan_min_samples</span>
+            <input type="number" id="cfg-dbscan_min_samples" step="1" min="0" />
+            <span class="cfg-fld-lbl">normalize_features</span>
+            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;"><input type="checkbox" id="cfg-normalize_features" /> Enable L2 normalization</label>
+          </div>
+        </details>
+        <details class="run-cfg-sec" open>
+          <summary>Process flags</summary>
+          <div class="run-cfg-ck-row">
+            <label><input type="checkbox" id="cfg-exclude_kernel_threads" /> exclude_kernel_threads</label>
+            <label><input type="checkbox" id="cfg-flag_unexpected_root" /> flag_unexpected_root</label>
+            <label><input type="checkbox" id="cfg-debug_display" /> debug_display</label>
+            <label><input type="checkbox" id="cfg-exclude_init_children" /> exclude_init_children</label>
+            <label><input type="checkbox" id="cfg-quiet" /> quiet</label>
+          </div>
+        </details>
+        <details class="run-cfg-sec" open>
+          <summary>suspicious_path_patterns (regex, one per line)</summary>
+          <div id="strList-suspicious_path_patterns" class="str-list"></div>
+          <button type="button" class="str-list__add" onclick="strListAdd('strList-suspicious_path_patterns')">+ Add pattern</button>
+        </details>
+        <details class="run-cfg-sec" open>
+          <summary>common_root_processes</summary>
+          <div id="strList-common_root_processes" class="str-list"></div>
+          <button type="button" class="str-list__add" onclick="strListAdd('strList-common_root_processes')">+ Add name</button>
+        </details>
+        <details class="run-cfg-sec" open>
+          <summary>whitelisted_path_patterns (globs: * and ?)</summary>
+          <div id="strList-whitelisted_path_patterns" class="str-list"></div>
+          <button type="button" class="str-list__add" onclick="strListAdd('strList-whitelisted_path_patterns')">+ Add pattern</button>
+        </details>
+        <details class="run-cfg-sec" open>
+          <summary>File analysis — exclusions (Rust regex)</summary>
+          <h4>file_excluded_path_regexes (full path)</h4>
+          <div id="strList-file_excluded_path_regexes" class="str-list"></div>
+          <button type="button" class="str-list__add" onclick="strListAdd('strList-file_excluded_path_regexes')">+ Add path regex</button>
+          <h4>file_excluded_filename_regexes (basename only)</h4>
+          <div id="strList-file_excluded_filename_regexes" class="str-list"></div>
+          <button type="button" class="str-list__add" onclick="strListAdd('strList-file_excluded_filename_regexes')">+ Add name regex</button>
+        </details>
+        <details class="run-cfg-sec" open>
+          <summary>file_recent_mtime (recent mtime heuristics)</summary>
+          <div class="run-cfg-grid">
+            <span class="cfg-fld-lbl">clock_skew_minutes</span>
+            <input type="number" id="cfg-frmt-clock_skew_minutes" step="1" />
+            <span class="cfg-fld-lbl">max_hours_critical_paths</span>
+            <input type="number" id="cfg-frmt-max_hours_critical_paths" step="1" min="0" />
+            <span class="cfg-fld-lbl">max_hours_system_elevated</span>
+            <input type="number" id="cfg-frmt-max_hours_system_elevated" step="1" min="0" />
+            <span class="cfg-fld-lbl">max_hours_suspicious_only</span>
+            <input type="number" id="cfg-frmt-max_hours_suspicious_only" step="1" min="0" />
+          </div>
+          <h4>volatile_path_prefixes</h4>
+          <div id="strList-volatile_path_prefixes" class="str-list"></div>
+          <button type="button" class="str-list__add" onclick="strListAdd('strList-volatile_path_prefixes')">+ Add prefix</button>
+        </details>
+        <details class="run-cfg-sec" open>
+          <summary>File fleet signature (equivalence)</summary>
+          <div class="run-cfg-ck-row">
+            <label><input type="checkbox" id="cfg-file_rare_signature_includes_size" /> file_rare_signature_includes_size</label>
+            <label><input type="checkbox" id="cfg-file_rare_signature_includes_metadata" /> file_rare_signature_includes_metadata</label>
+            <label><input type="checkbox" id="cfg-file_rare_signature_includes_recent_mtime" /> file_rare_signature_includes_recent_mtime</label>
+          </div>
+        </details>
+      </div>
+      <div class="row" style="margin-top:4px; flex-wrap:wrap;">
+        <button type="button" onclick="saveRunConfig()">Save to server</button>
+        <button type="button" onclick="loadRunConfig()">Reload from server</button>
+        <span class="muted" style="font-size:12px; align-self:center;">Or</span>
+        <button type="button" onclick="applyRunConfigRawJson()">Apply raw JSON to form</button>
+      </div>
+      <div class="run-cfg-raw" id="runCfgRawWrap">
+        <p class="muted" style="font-size:12px; margin:0 0 6px;">Raw JSON (synced on load and after save; paste or edit, then <strong>Apply raw JSON to form</strong> before <strong>Save to server</strong>)</p>
+        <textarea id="cfgJson" style="width:100%; min-height: 180px; font-family: ui-monospace, Menlo, monospace; box-sizing: border-box;" spellcheck="false" placeholder="{}"></textarea>
+      </div>
+        </div>
+      </details>
+    </div>
+    <div class="card">
+      <details class="section-collapse" id="runsCreateSection" open>
+        <summary>Create Detection Run <span class="section-caret" aria-hidden="true">▼</span></summary>
+        <div class="section-body">
+      <div id="runDatasetPicker" style="max-height:180px; overflow:auto; border:1px solid #334155; border-radius:8px; padding:8px; margin-bottom:8px;"></div>
+      <div class="row" style="flex-wrap:wrap;">
+        <input id="datasetIds" placeholder="dataset ids (comma-separated, optional if selected above)" style="min-width: 420px;" />
+        <input id="baselineTags" placeholder="baseline tags (optional)" />
+        <input id="candidateTags" placeholder="candidate tags" />
+        <button type="button" onclick="createRun()">Run</button>
+      </div>
+      <div class="row" id="runAnomarkBlock" style="flex-wrap:wrap; margin-top:10px; align-items:center; gap:10px;">
+        <label id="runAnomarkLabel" style="display:flex;align-items:center;gap:6px;cursor:pointer">
+          <input type="checkbox" id="runAnomark" /> <span>Include AnoMark (command-line Markov) on process data</span>
+        </label>
+        <div class="row" id="runAnomarkModelRow" style="align-items:center; gap:6px; display:none;">
+          <span class="muted" style="font-size:12px">Model</span>
+          <select id="runAnomarkModel" aria-label="AnoMark model" style="min-width: 240px;"></select>
+        </div>
+      </div>
+      <p class="muted" id="runAnomarkHint" style="font-size:12px; margin:6px 0 0; max-width: 900px;"></p>
+      <p class="muted">Use checkboxes and/or <strong>dataset ids</strong>. <strong>Baseline</strong> and <strong>candidate</strong> tag fields both restrict which datasets are included (a dataset is included if any of its tags match any tag you list in either field). If nothing matches, the server returns 400—check tag spelling and that datasets are tagged in Ingestion.</p>
+        </div>
+      </details>
+    </div>
+    <div class="card">
+      <details class="section-collapse" id="runsListSection" open>
+        <summary>Runs <span class="section-caret" aria-hidden="true">▼</span></summary>
+        <div class="section-body">
+          <div class="row" style="margin-bottom:8px; flex-wrap:wrap; align-items:center; gap:8px;">
+            <button type="button" onclick="loadRuns()">Refresh runs</button>
+            <button type="button" onclick="deleteAllRuns()" style="border-color:#7f1d1d;color:#fecaca;">Delete all runs</button>
+          </div>
+          <div id="runsList"></div>
+        </div>
+      </details>
+    </div>
+    <div class="card">
+      <details class="section-collapse" id="runsFindingsSection" open>
+        <summary>Run Findings <span class="section-caret" aria-hidden="true">▼</span></summary>
+        <div class="section-body">
+      <div class="row">
+        <input id="runIdFindings" placeholder="Run id" style="min-width: 320px;" />
+        <button onclick="loadFindings()">Load findings</button>
+      </div>
+      <div class="kpis" style="margin-top:8px;">
+        <div class="kpi"><div class="label">Critical</div><div class="value" id="rfCritical">0</div></div>
+        <div class="kpi"><div class="label">High</div><div class="value" id="rfHigh">0</div></div>
+        <div class="kpi"><div class="label">Medium</div><div class="value" id="rfMedium">0</div></div>
+        <div class="kpi"><div class="label">Low</div><div class="value" id="rfLow">0</div></div>
+      </div>
+      <div class="honey-ui">
+        <div class="honey-toolbar row" style="margin-top:4px;">
+          <button type="button" class="honey-zin" data-honey="findingsHoneycomb" title="Zoom in">+</button>
+          <button type="button" class="honey-zout" data-honey="findingsHoneycomb" title="Zoom out">−</button>
+          <button type="button" class="honey-zreset" data-honey="findingsHoneycomb" title="Reset view">Reset</button>
+          <span class="muted">Drag to pan · wheel to zoom. Hover a hex for the host name; click for details.</span>
+        </div>
+        <div class="honey-clip" style="min-height: 200px; max-height: 320px;">
+          <svg id="findingsHoneycomb" class="honey-svg honey-svg--compact" preserveAspectRatio="xMidYMid meet"></svg>
+        </div>
+        <div id="findingsHoneyHoverHint" class="honey-hover-hint muted" aria-live="polite"></div>
+        <div id="findingsHoneyPanel" class="honey-panel" style="display:none" hidden></div>
+        <div class="legend" style="margin-top:6px">
+          <span><i style="background:#166534"></i>Clean (no finding)</span>
+          <span><i style="background:#16a34a"></i>Low</span>
+          <span><i style="background:#f59e0b"></i>Medium</span>
+          <span><i style="background:#dc2626"></i>High</span>
+          <span><i style="background:#b91c1c"></i>Critical</span>
+        </div>
+      </div>
+      <div id="findingsTable" style="margin-top:8px;"></div>
+      <pre id="findings"></pre>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <section id="anomark-tab" class="tab-content">
+    <div class="card">
+      <h2>AnoMark Settings</h2>
+      <div class="row">
+        <input id="anomarkModel" placeholder="model path" style="min-width: 260px;" />
+        <input id="anomarkColumn" placeholder="column (default: command)" />
+        <input id="anomarkMachineField" placeholder="machine field (default: machine_id)" />
+        <button onclick="saveAnoMarkConfig()">Save config</button>
+        <button onclick="loadAnoMarkConfig()">Reload config</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>AnoMark Training</h2>
+      <p class="muted" style="margin:0 0 8px; max-width: 960px">
+        Training uses <strong>process</strong> datasets only. Check the datasets to include, or set a <strong>training file path</strong> to bypass the list (path wins).
+        Dataset IDs in the text field and tags are combined with checkboxes: every filter must match (intersection).
+      </p>
+      <div class="row" style="margin-bottom:8px;">
+        <button type="button" onclick="anomarkSelectAllProcess()">Select all process</button>
+        <button type="button" onclick="anomarkClearDatasetCheckboxes()">Clear checkboxes</button>
+        <button type="button" onclick="loadDatasets()">Refresh dataset list</button>
+      </div>
+      <div id="anomarkDatasetPicker" style="max-height:200px; overflow:auto; border:1px solid #334155; border-radius:8px; padding:8px; margin-bottom:12px;"></div>
+      <div class="row" style="align-items:flex-end;">
+        <div style="display:flex; flex-direction:column; gap:4px;">
+          <span class="muted" style="font-size:12px">Training file (optional, overrides checkboxes/IDs below)</span>
+          <input id="anomarkTrainPath" placeholder="path to .jsonl / .json / .csv" style="min-width: 320px;" />
+        </div>
+        <div style="display:flex; flex-direction:column; gap:4px;">
+          <span class="muted" style="font-size:12px">Extra dataset ids (optional)</span>
+          <input id="anomarkTrainDatasetIds" placeholder="comma-separated ids (add to any checked above)" style="min-width: 280px;" />
+        </div>
+        <div style="display:flex; flex-direction:column; gap:4px;">
+          <span class="muted" style="font-size:12px">Tags filter (optional)</span>
+          <input id="anomarkTrainTags" placeholder="datasets must have one of these tags" style="min-width: 220px;" />
+        </div>
+      </div>
+      <div class="row" style="margin-top:10px;">
+        <input id="anomarkTrainColumn" placeholder="training column" value="command" />
+        <input id="anomarkTrainOrder" placeholder="order" value="4" style="width:5rem" />
+        <button onclick="trainAnoMark()">Train model</button>
+      </div>
+      <p class="muted" style="font-size:12px; margin:6px 0 4px">The model is always stored under <code>.ironsift-platform/anomark-trains/&lt;id&gt;/model.bin</code> and can be downloaded from the table below. Training uses the in-process <strong>anomark</strong> library (no external binary).</p>
+      <div class="row">
+        <div style="display:flex; flex-direction:column; gap:4px; min-width: 280px;">
+          <span class="muted" style="font-size:12px">Optional: also copy the model to a file on disk</span>
+          <input id="anomarkTrainOut" placeholder="(optional) path to a .bin file" style="min-width: 280px;" />
+        </div>
+      </div>
+      <pre id="anomarkStatus"></pre>
+    </div>
+    <div class="card">
+      <h2>Saved AnoMark trainings</h2>
+      <p class="muted" style="margin:0 0 8px; max-width: 960px">
+        Each successful train is recorded in the platform database. A copy of the <strong>model</strong> and the exact
+        <strong>training_input.jsonl</strong> (plus the request payload) is stored under
+        <code>.ironsift-platform/anomark-trains/&lt;id&gt;/</code>.
+      </p>
+      <div class="row" style="margin-bottom:8px">
+        <button type="button" onclick="loadAnomarkTrainings()">Refresh list</button>
+      </div>
+      <div id="anomarkTrainingsList" style="overflow-x:auto"></div>
+    </div>
+  </section>
+
+  <section id="sigma-tab" class="tab-content">
+    <div class="card">
+      <h2>Sigma (sigmazero)</h2>
+      <p class="muted" style="margin:0 0 10px; max-width: 960px">
+        Evaluate <a href="https://github.com/SigmaHQ/sigma" target="_blank" rel="noopener">Sigma</a> rules on your process logs using the in-process
+        <a href="https://github.com/ping2A/sigmazero" target="_blank" rel="noopener">sigmazero</a> (<code>sigma_zero</code>) engine. Set the rules directory below. IronSift exports selected process datasets to JSONL (with <code>process_name</code> / <code>command_line</code>) and evaluates them in memory.
+      </p>
+      <div class="row" style="margin-bottom:8px">
+        <input id="sigmaRulesDir" placeholder="rules directory (Sigma .yml files)" style="min-width: 320px;" />
+        <input id="sigmaFieldMap" placeholder="optional --field-map (e.g. ImagePath:path)" style="min-width: 240px;" />
+        <input id="sigmaWorkers" placeholder="workers" style="width:5rem" />
+        <button type="button" onclick="saveSigmaConfig()">Save config</button>
+        <button type="button" onclick="loadSigmaConfig()">Reload</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Run rules on datasets</h2>
+      <p class="muted" style="margin:0 0 8px; max-width: 960px">
+        Uses <strong>process</strong> datasets only. Check boxes and/or set ids and tags, or set a <strong>log file path</strong> on the server to bypass (path wins, must be JSON/JSONL the CLI accepts).
+      </p>
+      <div class="row" style="margin-bottom:8px">
+        <button type="button" onclick="sigmaSelectAllProcess()">Select all process</button>
+        <button type="button" onclick="sigmaClearDatasetCheckboxes()">Clear checkboxes</button>
+        <button type="button" onclick="loadDatasets()">Refresh dataset list</button>
+      </div>
+      <div id="sigmaDatasetPicker" style="max-height:200px; overflow:auto; border:1px solid #334155; border-radius:8px; padding:8px; margin-bottom:12px;"></div>
+      <div class="row" style="align-items:flex-end; flex-wrap:wrap; gap:8px;">
+        <div style="display:flex; flex-direction:column; gap:4px;">
+          <span class="muted" style="font-size:12px">Log file (optional, server path; overrides checkboxes)</span>
+          <input id="sigmaLogPath" placeholder="/path/to/logs.jsonl" style="min-width: 300px;" />
+        </div>
+        <div style="display:flex; flex-direction:column; gap:4px;">
+          <span class="muted" style="font-size:12px">Dataset ids (optional)</span>
+          <input id="sigmaDatasetIds" placeholder="comma-separated" style="min-width: 220px;" />
+        </div>
+        <div style="display:flex; flex-direction:column; gap:4px;">
+          <span class="muted" style="font-size:12px">Tags (optional)</span>
+          <input id="sigmaTags" placeholder="match any" style="min-width: 180px;" />
+        </div>
+        <div style="display:flex; flex-direction:column; gap:4px;">
+          <span class="muted" style="font-size:12px">Override rules_dir (optional)</span>
+          <input id="sigmaRulesOverride" placeholder="(uses config if empty)" style="min-width: 200px;" />
+        </div>
+        <div style="display:flex; flex-direction:column; gap:4px;">
+          <span class="muted" style="font-size:12px">Filter: tags / levels (comma, optional)</span>
+          <input id="sigmaFilterTags" placeholder="e.g. attack.execution" style="min-width: 160px;" />
+          <input id="sigmaFilterLevels" placeholder="e.g. high" style="min-width: 120px;" />
+        </div>
+      </div>
+      <div class="row" style="margin-top:10px;">
+        <button type="button" onclick="runSigmaCheck()">Check with Sigma</button>
+      </div>
+      <pre id="sigmaStatus" style="margin-top:8px; max-height: 420px;"></pre>
+    </div>
+  </section>
+
+  <section id="automation" class="tab-content">
+    <div class="card">
+      <h2>One-shot Auto Pipeline</h2>
+      <div class="row">
+        <input id="autoDir" placeholder="directory with csv/json/jsonl" style="min-width: 420px;" />
+        <input id="autoBaseline" placeholder="baseline tag (optional)" />
+        <input id="autoCandidate" placeholder="candidate tag (optional)" />
+        <label><input id="autoAnomark" type="checkbox" /> enable anomark-rs</label>
+        <button onclick="runAutoPipeline()">Run auto pipeline</button>
+      </div>
+      <pre id="autoResult"></pre>
+    </div>
+  </section>
+
+  <script>
+    function escapeForHtml(s) {
+      return String(s == null ? "" : s)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    /** Fetches JSON from the API. Never throws on parse: body is always a plain object with _ok / _httpStatus, or _jsonParseError. */
+    async function api(path, opts = {}) {
+      const r = await fetch(path, { headers: { "Content-Type": "application/json" }, ...opts });
+      const t = await r.text();
+      if (t == null || t.length === 0) {
+        const o = { _ok: r.ok, _httpStatus: r.status };
+        if (!r.ok) o.error = "HTTP " + r.status;
+        return o;
+      }
+      const t0 = t.replace(/^\uFEFF/, "");
+      let j;
+      try {
+        j = JSON.parse(t0);
+      } catch (e) {
+        return {
+          _jsonParseError: (e && e.message) || String(e),
+          _rawPreview: t0.slice(0, 320),
+          _ok: false,
+          _httpStatus: r.status,
+          error: "Response was not valid JSON. Check the server is IronSift on the right port (HTML/proxy error pages look like this).",
+        };
+      }
+      if (j == null || typeof j !== "object" || Array.isArray(j)) {
+        return { _ok: r.ok, _httpStatus: r.status, _nonObject: true, _value: j };
+      }
+      j._ok = r.ok;
+      j._httpStatus = r.status;
+      if (!r.ok && j.error == null) {
+        j.error = "HTTP " + r.status;
+      }
+      return j;
+    }
+
+    function tryParseResponseJson(text) {
+      if (text == null) return { ok: true, value: {} };
+      const s0 = String(text).replace(/^\uFEFF/, "");
+      const s = s0.trim();
+      if (!s) return { ok: true, value: {} };
+      try {
+        return { ok: true, value: JSON.parse(s) };
+      } catch (e) {
+        return { ok: false, err: (e && e.message) || String(e), rawPreview: s0.slice(0, 400) };
+      }
+    }
+
+    /** Newest run is the last item (server appends to `db.json` runs). */
+    async function resolveRunFromListAfterCreate() {
+      const data = await api("/api/runs");
+      if (data._jsonParseError || data._ok === false) return null;
+      const runs = data.runs || [];
+      return runs.length ? runs[runs.length - 1] : null;
+    }
+
+    function switchTab(tabId, btn) {
+      document.querySelectorAll(".tab-content").forEach(el => el.classList.remove("active"));
+      document.querySelectorAll(".tab-btn").forEach(el => el.classList.remove("active"));
+      const tab = document.getElementById(tabId);
+      if (tab) tab.classList.add("active");
+      if (btn) btn.classList.add("active");
+    }
+
+    function severityColor(v) {
+      if (v >= 0.9) return "#b91c1c";
+      if (v >= 0.7) return "#dc2626";
+      if (v >= 0.4) return "#f59e0b";
+      return "#16a34a";
+    }
+
+    function cellFill(c) {
+      if (c && c.infected === false) return "#166534";
+      return severityColor(Number(c && c.value != null ? c.value : 0));
+    }
+
+    const HONEY_HINTS = { findingsHoneycomb: "findingsHoneyHoverHint" };
+    function honeyGetHintEl(svg) {
+      const i = HONEY_HINTS[svg && svg.id];
+      return i ? document.getElementById(i) : null;
+    }
+
+    /** One line for the hover strip + SVG &lt;title&gt; (native tooltip on pause). */
+    function honeyStatusLine(c) {
+      if (!c) return "";
+      const name = c.name != null && c.name !== "" ? String(c.name) : "(unknown host)";
+      if (c.infected === false) return name + " — clean (no finding)";
+      const sev = (c.severity || "").toUpperCase();
+      const v = c.value != null ? Number(c.value) : 0;
+      return `${name} — ${sev || "UNKNOWN"} (score ${v.toFixed(2)}). Click for full details.`;
+    }
+
+    const honeyView = {};
+
+    function hexPoints(cx, cy, r) {
+      const pts = [];
+      for (let i = 0; i < 6; i++) {
+        const a = (Math.PI / 180) * (60 * i - 30);
+        pts.push(`${(cx + r * Math.cos(a)).toFixed(2)},${(cy + r * Math.sin(a)).toFixed(2)}`);
+      }
+      return pts.join(" ");
+    }
+
+    function applyHoneyTransform(svg) {
+      const st = honeyView[svg.id];
+      if (!st) return;
+      const g = svg.querySelector(".honey-pan");
+      if (!g) return;
+      const { k, panX, panY, cx, cy } = st;
+      g.setAttribute(
+        "transform",
+        `translate(${panX} ${panY}) translate(${cx} ${cy}) scale(${k}) translate(${-cx} ${-cy})`
+      );
+    }
+
+    function escHtml(s) {
+      return String(s)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    function openHoneyPanel(panelId, cell, idx, toggle) {
+      const panel = document.getElementById(panelId);
+      if (!panel) return;
+      if (!cell) {
+        panel.style.display = "none";
+        panel.setAttribute("hidden", "");
+        return;
+      }
+      if (toggle && panel.dataset.selectedIdx === String(idx) && panel.style.display !== "none") {
+        panel.style.display = "none";
+        panel.setAttribute("hidden", "");
+        delete panel.dataset.selectedIdx;
+        return;
+      }
+      panel.dataset.selectedIdx = String(idx);
+      panel.removeAttribute("hidden");
+      panel.style.display = "block";
+      if (cell.infected === false) {
+        const nm = cell.name != null && cell.name !== "" ? String(cell.name) : "(unknown host)";
+        panel.innerHTML = `
+          <h4><code>${escHtml(nm)}</code> <span class="pill" style="background:#14532d;color:#dcfce7">Clean</span></h4>
+          <p class="muted" style="margin:0; font-size: 13px;">No finding for this host. Move the pointer over a hex to see the host in the line below the chart, or the browser tooltip.</p>
+        `;
+        return;
+      }
+      const sev = (cell.severity || "").toUpperCase();
+      const reasons = (cell.reasons || [])
+        .map((r) => "<li>" + escHtml(r) + "</li>")
+        .join("");
+      const dets = (cell.detectors || []).map((d) => `<span class="pill">${escHtml(d)}</span>`).join(" ");
+      panel.innerHTML = `
+        <h4><code>${escHtml(cell.name || "")}</code> <span class="sev-badge ${severityClass(sev)}">${escHtml(sev)}</span></h4>
+        <p class="muted" style="margin:0 0 6px">Score: <strong>${Number(cell.value).toFixed(3)}</strong></p>
+        <p class="muted" style="margin:0 0 4px; font-size: 12px;">Detectors: ${dets || "—"}</p>
+        <p class="muted" style="margin:0 0 4px; font-size: 12px;">Reasons:</p>
+        <ul class="det-list">${reasons || '<li class="muted">(none)</li>'}</ul>
+      `;
+    }
+
+    function installHoneyView(svg, panelId, cells, hasFilter) {
+      const id = svg.id;
+      {
+        const hi = honeyGetHintEl(svg);
+        if (hi) hi.textContent = "";
+      }
+      if (!honeyView[id]) {
+        const onMove = (e) => {
+          const s = honeyView[id];
+          if (!s || !s.drag) return;
+          const w = svg.viewBox && svg.viewBox.baseVal ? svg.viewBox.baseVal.width : 1;
+          const h = svg.viewBox && svg.viewBox.baseVal ? svg.viewBox.baseVal.height : 1;
+          const cw = svg.clientWidth || 1;
+          const ch = svg.clientHeight || 1;
+          s.panX += ((e.clientX - s.lastX) * w) / cw;
+          s.panY += ((e.clientY - s.lastY) * h) / ch;
+          s.lastX = e.clientX;
+          s.lastY = e.clientY;
+          s.moved = true;
+          applyHoneyTransform(svg);
+        };
+        const onUp = () => {
+          const s = honeyView[id];
+          if (s) {
+            if (s.moved) s.suppressClickOnce = true;
+            s.drag = false;
+            s.moved = false;
+          }
+          window.removeEventListener("pointermove", onMove);
+          window.removeEventListener("pointerup", onUp);
+        };
+        svg.addEventListener("pointerdown", (e) => {
+          if (e.button !== 0) return;
+          if (e.target && e.target.closest && e.target.closest("polygon[data-idx]")) return;
+          const s = honeyView[id];
+          if (!s) return;
+          s.drag = true;
+          s.moved = false;
+          s.lastX = e.clientX;
+          s.lastY = e.clientY;
+          try { svg.setPointerCapture(e.pointerId); } catch (_) {}
+          window.addEventListener("pointermove", onMove);
+          window.addEventListener("pointerup", onUp);
+        });
+        const hintMove = (e) => {
+          const s = honeyView[id];
+          const h = honeyGetHintEl(svg);
+          if (!h) return;
+          if (s && s.drag) {
+            h.textContent = "";
+            return;
+          }
+          if (!s || !s.cells) {
+            h.textContent = "";
+            return;
+          }
+          const el = document.elementFromPoint(e.clientX, e.clientY);
+          if (!el || !svg.contains(el)) {
+            h.textContent = "";
+            return;
+          }
+          const poly = el.closest && el.closest("polygon[data-idx]");
+          if (!poly) {
+            h.textContent = "";
+            return;
+          }
+          const j = parseInt(poly.getAttribute("data-idx"), 10);
+          const c = s.cells[j];
+          h.textContent = c ? honeyStatusLine(c) : "";
+        };
+        const hintLeave = () => {
+          const h = honeyGetHintEl(svg);
+          if (h) h.textContent = "";
+        };
+        svg.addEventListener("pointermove", hintMove, { passive: true });
+        svg.addEventListener("pointerleave", hintLeave);
+        svg.addEventListener("click", (e) => {
+          const s = honeyView[id];
+          if (s && s.suppressClickOnce) {
+            s.suppressClickOnce = false;
+            return;
+          }
+          const poly = e.target && e.target.closest && e.target.closest("polygon[data-idx]");
+          if (!poly) return;
+          if (!s) return;
+          const i = parseInt(poly.getAttribute("data-idx"), 10);
+          const c = s.cells && s.cells[i];
+          if (!c) return;
+          openHoneyPanel(s.panelId, c, i, true);
+        });
+        svg.addEventListener("wheel", (e) => {
+          const s = honeyView[id];
+          if (!s) return;
+          e.preventDefault();
+          const f = e.deltaY > 0 ? 0.9 : 1.11;
+          s.k = Math.min(4, Math.max(0.2, s.k * f));
+          applyHoneyTransform(svg);
+        }, { passive: false });
+      }
+      const layout = (function buildLayout(cells) {
+        if (!cells.length) {
+          return { vbW: 240, vbH: 200, inner: "<text x='120' y='100' text-anchor='middle' fill='#94a3b8' font-size='13'>No machine data for this run</text>", cx: 120, cy: 100 };
+        }
+        const n = cells.length;
+        const r = Math.max(8, Math.min(26, 300 / Math.sqrt(n + 2)));
+        const dx = Math.sqrt(3) * r;
+        const dy = 1.5 * r;
+        const cols = Math.max(1, Math.ceil(Math.sqrt(n * 1.15)));
+        const rows = Math.ceil(n / cols);
+        const pad = 28;
+        const vbW = Math.max(240, pad * 2 + (cols - 0.5) * dx + r * 2);
+        const vbH = Math.max(200, pad * 2 + rows * dy + r * 1.2);
+        const cx = vbW / 2;
+        const cy = (pad * 2 + rows * dy) / 2;
+        const dim = (c) => c && c.infected && hasFilter && c.matches_filter === false;
+        const hintEsc = (t) => String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        let g = "";
+        cells.forEach((c, i) => {
+          const col = i % cols;
+          const row = Math.floor(i / cols);
+          const x = pad + col * dx + (row % 2 ? dx / 2 : 0);
+          const y = pad + row * dy;
+          const color = cellFill(c);
+          const cl =
+            "honey-hex " + (c && c.infected ? "honey-hex--infected " : "") + (dim(c) ? "honey-hex--dim" : "");
+          const tip = hintEsc(honeyStatusLine(c));
+          g += `<g>
+            <polygon class="${cl}" data-idx="${i}" points="${hexPoints(x, y, r)}" fill="${color}" stroke="#0f172a" stroke-width="${Math.max(1, r * 0.04)}">
+              <title>${tip}</title>
+            </polygon>
+          </g>`;
+        });
+        return { vbW, vbH, inner: g, cx, cy };
+      })(cells);
+      honeyView[id] = {
+        k: 1,
+        panX: 0,
+        panY: 0,
+        cx: layout.cx,
+        cy: layout.cy,
+        cells: cells,
+        hasFilter: !!hasFilter,
+        panelId: panelId,
+        drag: false,
+        moved: false,
+      };
+      svg.setAttribute("viewBox", `0 0 ${layout.vbW} ${layout.vbH}`);
+      svg.setAttribute("preserveAspectRatio", "xMidYMid meet");
+      svg.innerHTML = `<rect class="honey-bg" x="0" y="0" width="${layout.vbW}" height="${layout.vbH}" fill="#020617" />
+        <g class="honey-pan">${layout.inner}</g>`;
+      applyHoneyTransform(svg);
+    }
+
+    async function importDataset() {
+      const body = {
+        name: document.getElementById("name").value,
+        source_path: document.getElementById("path").value,
+        kind: document.getElementById("kind").value,
+        tags: document.getElementById("tags").value.split(",").map(s => s.trim()).filter(Boolean),
+        schema_profile: "osquery-5.22.1"
+      };
+      await api("/api/datasets", { method: "POST", body: JSON.stringify(body) });
+      await loadDatasets();
+    }
+
+    async function uploadDataset() {
+      const files = Array.from(document.getElementById("uploadFile").files || []);
+      if (!files.length) return;
+      const form = new FormData();
+      files.forEach(f => form.append("file", f));
+      const qp = new URLSearchParams();
+      const name = document.getElementById("uploadName").value.trim();
+      const tags = document.getElementById("uploadTags").value.trim();
+      if (name) qp.set("name", name);
+      if (tags) qp.set("tags", tags);
+      await fetch(`/api/datasets/upload?${qp.toString()}`, { method: "POST", body: form });
+      await loadDatasets();
+    }
+
+    function anomarkPickerHtml(datasets) {
+      return (datasets || []).map(d => {
+        const isProcess = (d.kind || "").toString().toLowerCase() === "process";
+        const op = isProcess
+          ? `<input type="checkbox" class="anomark-ds" value="${d.id}" />`
+          : "<input type=\"checkbox\" disabled />";
+        return `<label style="display:block; margin-bottom:4px;${isProcess ? "" : " color:#94a3b8;"}">
+            ${op}
+            <code>${d.id}</code> ${d.name} <span class="muted">(${d.kind}/${d.format})</span>
+            ${(d.tags || []).map(t => `<span class="pill">${t}</span>`).join(" ")}
+            ${!isProcess ? ' <em class="muted">not used for process training</em>' : ""}
+          </label>`;
+      }).join("");
+    }
+
+    function sigmaPickerHtml(datasets) {
+      return (datasets || []).map(d => {
+        const isProcess = (d.kind || "").toString().toLowerCase() === "process";
+        const op = isProcess
+          ? `<input type="checkbox" class="sigma-ds" value="${d.id}" />`
+          : "<input type=\"checkbox\" disabled />";
+        return `<label style="display:block; margin-bottom:4px;${isProcess ? "" : " color:#94a3b8;"}">
+            ${op}
+            <code>${d.id}</code> ${d.name} <span class="muted">(${d.kind}/${d.format})</span>
+            ${(d.tags || []).map(t => `<span class="pill">${t}</span>`).join(" ")}
+            ${!isProcess ? ' <em class="muted">(file datasets are skipped)</em>' : ""}
+          </label>`;
+      }).join("");
+    }
+
+    function anomarkSelectAllProcess() {
+      document.querySelectorAll("input.anomark-ds").forEach((c) => { c.checked = true; });
+    }
+
+    function anomarkClearDatasetCheckboxes() {
+      document.querySelectorAll("input.anomark-ds").forEach(c => { if (!c.disabled) c.checked = false; });
+    }
+
+    function sigmaSelectAllProcess() {
+      document.querySelectorAll("input.sigma-ds").forEach((c) => { c.checked = true; });
+    }
+
+    function sigmaClearDatasetCheckboxes() {
+      document.querySelectorAll("input.sigma-ds").forEach(c => { if (!c.disabled) c.checked = false; });
+    }
+
+    async function loadDatasets() {
+      const data = await api("/api/datasets");
+      const el = document.getElementById("datasets");
+      const picker = document.getElementById("runDatasetPicker");
+      const anomarkPicker = document.getElementById("anomarkDatasetPicker");
+      const sigmaPicker = document.getElementById("sigmaDatasetPicker");
+      el.innerHTML = (data.datasets || []).map(d => `
+        <div style="margin-bottom:12px; border:1px solid #334155; border-radius:8px; padding:8px;">
+          <div style="margin-bottom:6px;">
+            <code>${d.id}</code> - ${d.name} (${d.kind}/${d.format}) <span class="pill">schema: ${d.schema_profile || "n/a"}</span>
+            ${(d.tags || []).map(t => `<span class="pill">${t}</span>`).join("")}
+          </div>
+          <div class="row">
+            <input id="tag-input-${d.id}" placeholder="add tags (comma-separated)" style="min-width:260px;" />
+            <button onclick="addDatasetTags('${d.id}')">Add tags</button>
+            <button onclick="inspectDataset('${d.id}')">View elements</button>
+          </div>
+        </div>
+      `).join("");
+      if (picker) {
+        picker.innerHTML = (data.datasets || []).map(d => `
+          <label style="display:block; margin-bottom:4px;">
+            <input type="checkbox" class="run-ds" value="${d.id}" />
+            <code>${d.id}</code> ${d.name} <span class="muted">(${d.kind}/${d.format})</span>
+          </label>
+        `).join("");
+      }
+      if (anomarkPicker) {
+        anomarkPicker.innerHTML = (data.datasets || []).length
+          ? anomarkPickerHtml(data.datasets)
+          : `<p class="muted" style="margin:0">No datasets yet. Import on the Ingestion tab, then refresh.</p>`;
+      }
+      if (sigmaPicker) {
+        sigmaPicker.innerHTML = (data.datasets || []).length
+          ? sigmaPickerHtml(data.datasets)
+          : `<p class="muted" style="margin:0">No datasets yet. Import on the Ingestion tab, then refresh.</p>`;
+      }
+      document.getElementById("kpiDatasets").textContent = (data.datasets || []).length;
+      loadRunAnomarkAvailability();
+    }
+
+    async function addDatasetTags(datasetId) {
+      const input = document.getElementById(`tag-input-${datasetId}`);
+      if (!input) return;
+      const tags = input.value.split(",").map(s => s.trim()).filter(Boolean);
+      if (!tags.length) return;
+      await api(`/api/datasets/${encodeURIComponent(datasetId)}/tags`, {
+        method: "POST",
+        body: JSON.stringify({ tags })
+      });
+      input.value = "";
+      await loadDatasets();
+    }
+
+    async function inspectDataset(datasetId) {
+      const data = await api(`/api/datasets/${encodeURIComponent(datasetId)}/inspect`);
+      const inspection = data.inspection || {};
+      document.getElementById("datasetInspection").textContent = JSON.stringify(inspection, null, 2);
+    }
+
+    async function purgeDatasets() {
+      const ok = confirm("Delete ALL datasets and ingested events from the database?");
+      if (!ok) return;
+      await api("/api/datasets/purge", { method: "POST", body: JSON.stringify({}) });
+      document.getElementById("datasetInspection").textContent = "";
+      await loadDatasets();
+    }
+
+    async function loadRunAnomarkAvailability() {
+      const hint = document.getElementById("runAnomarkHint");
+      const box = document.getElementById("runAnomark");
+      const row = document.getElementById("runAnomarkModelRow");
+      const sel = document.getElementById("runAnomarkModel");
+      if (!hint || !box || !row || !sel) return;
+      let data;
+      try {
+        data = await api("/api/anomark/availability");
+      } catch (e) {
+        hint.textContent = "Could not load AnoMark availability.";
+        return;
+      }
+      const a = data.availability || {};
+      const any = !!a.any_available;
+      box.disabled = !any;
+      if (!any) {
+        box.checked = false;
+        row.style.display = "none";
+        sel.innerHTML = "";
+        hint.textContent = "No AnoMark model on disk. Train a model or set a model path on the AnoMark tab, then refresh datasets.";
+        return;
+      }
+      box.checked = true;
+      hint.textContent = "A model file is available. AnoMark is enabled for this run by default; change the model below if you have several.";
+      sel.innerHTML = "";
+      if (a.config_available) {
+        const o = document.createElement("option");
+        o.value = "";
+        const base = (a.config_path || "").split("/").pop() || a.config_path;
+        o.textContent = "Platform config: " + (base || "model.bin");
+        sel.appendChild(o);
+      }
+      (a.trainings || []).forEach((t) => {
+        if (!t.available) return;
+        const o = document.createElement("option");
+        o.value = t.id;
+        const short = t.id && t.id.length > 10 ? t.id.slice(0, 8) + "…" : t.id;
+        o.textContent = "Training " + short + " — " + (t.created_at || "").slice(0, 10);
+        sel.appendChild(o);
+      });
+      row.style.display = sel.options.length > 0 ? "flex" : "none";
+      if (sel.options.length) sel.selectedIndex = 0;
+    }
+
+    async function createRun() {
+      const selectedFromPicker = Array.from(document.querySelectorAll(".run-ds:checked")).map(x => x.value);
+      const typedIds = document.getElementById("datasetIds").value.split(",").map(s => s.trim()).filter(Boolean);
+      const dataset_ids = Array.from(new Set([...selectedFromPicker, ...typedIds]));
+      const msel = document.getElementById("runAnomarkModel");
+      const wantAnomark = document.getElementById("runAnomark");
+      const trainId = msel && msel.value && msel.value.length ? msel.value : null;
+      const body = {
+        dataset_ids,
+        baseline_tags: document.getElementById("baselineTags").value.split(",").map(s => s.trim()).filter(Boolean),
+        candidate_tags: document.getElementById("candidateTags").value.split(",").map(s => s.trim()).filter(Boolean),
+        enable_anomark: wantAnomark && !wantAnomark.disabled && wantAnomark.checked,
+        anomark_train_id: trainId
+      };
+      const res = await fetch("/api/runs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const t = await res.text();
+      const parsed = tryParseResponseJson(t);
+      const out = parsed.ok ? parsed.value : {};
+      if (!parsed.ok) {
+        if (res.ok) {
+          const run = await resolveRunFromListAfterCreate();
+          if (run && run.id) {
+            document.getElementById("runIdFindings").value = run.id;
+            await loadRuns();
+            await loadFindings();
+            console.warn("Run created; response body was not JSON — using latest run from list.", parsed.err, t && t.slice(0, 80));
+            return;
+          }
+        }
+        if (!res.ok) {
+          const plain = t
+            ? t.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, " ").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim()
+            : "";
+          alert("Run failed (" + res.status + "). " + (plain ? plain.slice(0, 500) : (parsed.err || "Non-JSON error body.")));
+        } else {
+          alert("Could not read run response as JSON. " + (parsed.err || "") + (parsed.rawPreview ? " — " + String(parsed.rawPreview).slice(0, 120) : ""));
+          await loadRuns();
+        }
+        return;
+      }
+      if (!res.ok) {
+        alert((out && out.error) ? out.error : "Run failed (" + res.status + ").");
+        return;
+      }
+      let run = (out && out.run) ? out.run : null;
+      if (!run || !run.id) {
+        const fromList = await resolveRunFromListAfterCreate();
+        if (fromList && fromList.id) {
+          run = fromList;
+          console.warn("Run id missing in POST body; using latest run from list.");
+        }
+      }
+      if (run && run.id) {
+        document.getElementById("runIdFindings").value = run.id;
+      }
+      await loadRuns();
+      if (run && run.id) await loadFindings();
+    }
+
+    async function loadRuns() {
+      const data = await api("/api/runs");
+      const el = document.getElementById("runsList");
+      if (data._jsonParseError) {
+        el.innerHTML = `<p class="muted" style="color:#fecaca">${escapeForHtml(data.error || "Invalid response")} — <code style="word-break:break-all;font-size:11px;">${escapeForHtml(data._rawPreview || "")}</code></p>`;
+        return;
+      }
+      if (data._ok === false) {
+        el.innerHTML = `<p class="muted" style="color:#fecaca">${escapeForHtml(data.error || "Failed to load runs")} (${data._httpStatus != null ? data._httpStatus : "?"})</p>`;
+        return;
+      }
+      el.innerHTML = (data.runs || []).map((r) => {
+        const rid = String((r && r.id) != null ? r.id : "");
+        return `
+        <div style="margin-bottom:8px; border:1px solid #334155; border-radius:8px; padding:8px;">
+          <code>${escapeForHtml(rid)}</code> - ${escapeForHtml(r.summary || "")} <span class="muted">(${escapeForHtml(r.created_at || "")})</span>
+          <div class="row" style="margin-top:6px; align-items:center; gap:8px;">
+            <button type="button" onclick="selectRun(${JSON.stringify(rid)})">Use this run</button>
+            <button type="button" class="str-list__rm" style="margin:0" onclick="deleteRun(${JSON.stringify(rid)})">Delete</button>
+            <span class="muted">datasets: ${(r.dataset_ids || []).length}</span>
+          </div>
+        </div>
+      `;
+      }).join("");
+      document.getElementById("kpiRuns").textContent = (data.runs || []).length;
+      const latestFindings = (data.runs || [])[0]?.findings?.length || 0;
+      document.getElementById("kpiFindings").textContent = latestFindings;
+    }
+
+    async function deleteRun(runId) {
+      if (!runId) return;
+      if (!confirm("Delete this detection run? This cannot be undone.")) return;
+      const res = await fetch("/api/runs/" + encodeURIComponent(runId), { method: "DELETE" });
+      const t = await res.text();
+      let o = {};
+      if (t && t.trim()) {
+        try { o = JSON.parse(t.replace(/^\uFEFF/, "")); } catch (e) { alert("Invalid response from server: " + (e && e.message)); return; }
+      }
+      if (!res.ok) { alert((o && o.error) || ("Delete failed (" + res.status + ")")); return; }
+      if (document.getElementById("runIdFindings").value === runId) {
+        document.getElementById("runIdFindings").value = "";
+        document.getElementById("findings").textContent = "";
+        document.getElementById("findingsTable").innerHTML = "<p class=\"muted\">Run removed. Enter a run id to load findings.</p>";
+        const fhc = document.getElementById("findingsHoneycomb");
+        if (fhc) installHoneyView(fhc, "findingsHoneyPanel", [], false);
+      }
+      await loadRuns();
+    }
+
+    async function deleteAllRuns() {
+      if (!confirm("Delete ALL detection runs? This cannot be undone.")) return;
+      if (!confirm("All saved runs on this server will be removed. Continue?")) return;
+      const res = await fetch("/api/runs/purge", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+      const t = await res.text();
+      let o = {};
+      if (t && t.trim()) {
+        try { o = JSON.parse(t.replace(/^\uFEFF/, "")); } catch (e) { alert("Invalid response: " + (e && e.message)); return; }
+      }
+      if (!res.ok) { alert((o && o.error) || ("Purge failed (" + res.status + ")")); return; }
+      document.getElementById("runIdFindings").value = "";
+      document.getElementById("findings").textContent = "";
+      document.getElementById("findingsTable").innerHTML = "<p class=\"muted\">All runs removed.</p>";
+      const fhc = document.getElementById("findingsHoneycomb");
+      if (fhc) installHoneyView(fhc, "findingsHoneyPanel", [], false);
+      await loadRuns();
+    }
+
+    async function loadFindings() {
+      const runId = document.getElementById("runIdFindings").value.trim();
+      if (!runId) {
+        const fhc = document.getElementById("findingsHoneycomb");
+        if (fhc) installHoneyView(fhc, "findingsHoneyPanel", [], false);
+        document.getElementById("findings").textContent = "";
+        document.getElementById("findingsTable").innerHTML = "<p class=\"muted\">Enter a run id, then load findings.</p>";
+        return;
+      }
+      const [data, hon] = await Promise.all([
+        api(`/api/runs/${encodeURIComponent(runId)}/detections`),
+        api(`/api/fleet/honeycomb?${new URLSearchParams({ run_id: runId }).toString()}`)
+      ]);
+      if (data._jsonParseError) {
+        document.getElementById("findings").textContent = "Run findings: " + (data.error || data._jsonParseError) + (data._rawPreview ? "\n" + data._rawPreview : "");
+        return;
+      }
+      if (data._ok === false) {
+        document.getElementById("findings").textContent = "Run findings: " + (data.error || "Error") + " (HTTP " + (data._httpStatus || "") + ")";
+        if (hon && !hon._ok && !hon._jsonParseError) {
+          document.getElementById("findings").textContent += "\nHoneycomb: " + (hon.error || "");
+        }
+        const fhc = document.getElementById("findingsHoneycomb");
+        if (fhc) installHoneyView(fhc, "findingsHoneyPanel", [], false);
+        return;
+      }
+      const findings = data.findings || [];
+      let rawJson = JSON.stringify(findings, null, 2);
+      if (hon && hon._jsonParseError) {
+        rawJson = "[Note: honeycomb request failed or returned non-JSON; map below may be empty. " + (hon._rawPreview ? "Preview: " + hon._rawPreview.slice(0, 200) : hon._jsonParseError) + "]\n\n" + rawJson;
+      }
+      document.getElementById("findings").textContent = rawJson;
+      const counts = {CRITICAL:0, HIGH:0, MEDIUM:0, LOW:0};
+      findings.forEach(f => {
+        const s = (f.severity || "LOW").toUpperCase();
+        if (counts[s] != null) counts[s] += 1;
+      });
+      document.getElementById("rfCritical").textContent = counts.CRITICAL;
+      document.getElementById("rfHigh").textContent = counts.HIGH;
+      document.getElementById("rfMedium").textContent = counts.MEDIUM;
+      document.getElementById("rfLow").textContent = counts.LOW;
+      const table = document.getElementById("findingsTable");
+      {
+        const fhc = document.getElementById("findingsHoneycomb");
+        if (fhc) installHoneyView(fhc, "findingsHoneyPanel", hon && hon.cells ? hon.cells : [], false);
+      }
+      table.innerHTML = findings.length ? `
+        <table style="width:100%; border-collapse: collapse; font-size: 13px;">
+          <thead>
+            <tr>
+              <th style="text-align:left; border-bottom:1px solid #334155; padding:6px;">Machine</th>
+              <th style="text-align:left; border-bottom:1px solid #334155; padding:6px;">Severity</th>
+              <th style="text-align:left; border-bottom:1px solid #334155; padding:6px;">Score</th>
+              <th style="text-align:left; border-bottom:1px solid #334155; padding:6px;">Risk</th>
+              <th style="text-align:left; border-bottom:1px solid #334155; padding:6px;">Detectors</th>
+              <th style="text-align:left; border-bottom:1px solid #334155; padding:6px;">Top reason</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${findings.map(f => `
+              <tr>
+                <td style="border-bottom:1px solid #1e293b; padding:6px;">${f.machine_id}</td>
+                <td style="border-bottom:1px solid #1e293b; padding:6px;">
+                  <span class="sev-badge ${severityClass(f.severity)}">${f.severity}</span>
+                </td>
+                <td style="border-bottom:1px solid #1e293b; padding:6px;">${Number(f.score || 0).toFixed(3)}</td>
+                <td style="border-bottom:1px solid #1e293b; padding:6px;">
+                  <div class="score-wrap"><div class="score-bar" style="width:${Math.max(0, Math.min(100, (Number(f.score || 0)*100)))}%; background:${severityColor(Number(f.score || 0))};"></div></div>
+                </td>
+                <td style="border-bottom:1px solid #1e293b; padding:6px;">${(f.detectors || []).join(", ")}</td>
+                <td style="border-bottom:1px solid #1e293b; padding:6px;">${(f.reasons || [])[0] || ""}</td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      ` : `<p class="muted">No findings for this run.</p>`;
+    }
+
+    function severityClass(sev) {
+      const s = String(sev || "").toUpperCase();
+      if (s === "CLEAN" || s === "NONE") return "sev-low";
+      if (s === "CRITICAL") return "sev-critical";
+      if (s === "HIGH") return "sev-high";
+      if (s === "MEDIUM") return "sev-medium";
+      return "sev-low";
+    }
+
+    function selectRun(runId) {
+      document.getElementById("runIdFindings").value = runId;
+      loadFindings();
+    }
+
+    const _RUN_DEFAULT_SUSP = [
+      "/tmp/", "/dev/shm/", "/var/tmp/", "/home/[^/]+/\\.[^/]+", "^\\./", "/(?:bin|sbin|usr/bin|usr/sbin)/\\.[^/]+"
+    ];
+    const _RUN_DEFAULT_ROOT = [
+      "systemd", "init", "sshd", "cron", "crond", "rsyslogd", "dockerd", "containerd", "kubelet",
+      "networkd", "systemd-networkd", "systemd-resolved", "systemd-journald", "systemd-logind",
+      "systemd-udevd", "dbus-daemon", "polkitd", "snapd", "unattended-upgr", "accounts-daemon",
+      "rtkit-daemon", "cups-browsed", "cupsd", "avahi-daemon"
+    ];
+    const _RUN_DEFAULT_VOLATILE = [
+      "/var/log/", "/var/cache/", "/var/lib/dpkg/", "/var/lib/apt/", "/var/tmp/", "/tmp/", "/run/", "/proc/", "/sys/", "/dev/"
+    ];
+
+    function mergeRunConfig(loaded) {
+      const s = (loaded && typeof loaded === "object") ? loaded : {};
+      const fr = (s.file_recent_mtime && typeof s.file_recent_mtime === "object")
+        ? s.file_recent_mtime : {};
+      return {
+        entropy_threshold: s.entropy_threshold != null ? Number(s.entropy_threshold) : 4.5,
+        minority_cluster_ratio: s.minority_cluster_ratio != null ? Number(s.minority_cluster_ratio) : 0.1,
+        dbscan_tolerance: s.dbscan_tolerance != null ? Number(s.dbscan_tolerance) : 0.35,
+        dbscan_min_samples: s.dbscan_min_samples != null ? parseInt(String(s.dbscan_min_samples), 10) : 2,
+        normalize_features: s.normalize_features != null ? Boolean(s.normalize_features) : true,
+        suspicious_path_patterns: Array.isArray(s.suspicious_path_patterns) ? s.suspicious_path_patterns : _RUN_DEFAULT_SUSP.slice(),
+        exclude_kernel_threads: s.exclude_kernel_threads != null ? Boolean(s.exclude_kernel_threads) : true,
+        common_root_processes: Array.isArray(s.common_root_processes) ? s.common_root_processes : _RUN_DEFAULT_ROOT.slice(),
+        flag_unexpected_root: s.flag_unexpected_root != null ? Boolean(s.flag_unexpected_root) : true,
+        debug_display: s.debug_display != null ? Boolean(s.debug_display) : false,
+        exclude_init_children: s.exclude_init_children != null ? Boolean(s.exclude_init_children) : false,
+        whitelisted_path_patterns: Array.isArray(s.whitelisted_path_patterns) ? s.whitelisted_path_patterns : [],
+        file_excluded_path_regexes: Array.isArray(s.file_excluded_path_regexes) ? s.file_excluded_path_regexes : [],
+        file_excluded_filename_regexes: Array.isArray(s.file_excluded_filename_regexes) ? s.file_excluded_filename_regexes : [],
+        quiet: s.quiet != null ? Boolean(s.quiet) : false,
+        file_recent_mtime: {
+          clock_skew_minutes: fr.clock_skew_minutes != null ? parseInt(String(fr.clock_skew_minutes), 10) : 5,
+          max_hours_critical_paths: fr.max_hours_critical_paths != null ? parseInt(String(fr.max_hours_critical_paths), 10) : 12,
+          max_hours_system_elevated: fr.max_hours_system_elevated != null ? parseInt(String(fr.max_hours_system_elevated), 10) : 6,
+          max_hours_suspicious_only: fr.max_hours_suspicious_only != null ? parseInt(String(fr.max_hours_suspicious_only), 10) : 3,
+          volatile_path_prefixes: Array.isArray(fr.volatile_path_prefixes)
+            ? fr.volatile_path_prefixes : _RUN_DEFAULT_VOLATILE.slice(),
+        },
+        file_rare_signature_includes_size: Boolean(s.file_rare_signature_includes_size),
+        file_rare_signature_includes_metadata: Boolean(s.file_rare_signature_includes_metadata),
+        file_rare_signature_includes_recent_mtime: Boolean(s.file_rare_signature_includes_recent_mtime),
+      };
+    }
+
+    function strListAdd(wrapId) {
+      if (wrapId.indexOf("strList-") !== 0) wrapId = "strList-" + wrapId;
+      addStrListRow(wrapId, "");
+    }
+
+    function addStrListRow(wrapId, value) {
+      const w = document.getElementById(wrapId);
+      if (!w) return;
+      const row = document.createElement("div");
+      row.className = "str-list__row row";
+      const inp = document.createElement("input");
+      inp.type = "text";
+      inp.className = "str-list__input";
+      inp.value = value != null ? String(value) : "";
+      const rm = document.createElement("button");
+      rm.type = "button";
+      rm.className = "str-list__rm";
+      rm.textContent = "Remove";
+      rm.onclick = () => { row.remove(); };
+      row.appendChild(inp);
+      row.appendChild(rm);
+      w.appendChild(row);
+    }
+
+    function renderStrList(wrapId, list) {
+      if (wrapId.indexOf("strList-") !== 0) wrapId = "strList-" + wrapId;
+      const w = document.getElementById(wrapId);
+      if (!w) return;
+      w.textContent = "";
+      const a = Array.isArray(list) ? list : [];
+      a.forEach((s) => addStrListRow(wrapId, s));
+    }
+
+    function collectStrListByWrapId(wrapId) {
+      if (wrapId.indexOf("strList-") !== 0) wrapId = "strList-" + wrapId;
+      const w = document.getElementById(wrapId);
+      if (!w) return [];
+      return Array.from(w.querySelectorAll(".str-list__input"))
+        .map((el) => (el && el.value) ? el.value.trim() : "")
+        .filter((s) => s.length > 0);
+    }
+
+    function applyRunConfigToForm(c) {
+      const x = mergeRunConfig(c);
+      const setN = (id, v) => { const e = document.getElementById(id); if (e) e.value = v; };
+      const setCk = (id, v) => { const e = document.getElementById(id); if (e) e.checked = v; };
+      setN("cfg-entropy_threshold", x.entropy_threshold);
+      setN("cfg-minority_cluster_ratio", x.minority_cluster_ratio);
+      setN("cfg-dbscan_tolerance", x.dbscan_tolerance);
+      setN("cfg-dbscan_min_samples", x.dbscan_min_samples);
+      setCk("cfg-normalize_features", x.normalize_features);
+      setCk("cfg-exclude_kernel_threads", x.exclude_kernel_threads);
+      setCk("cfg-flag_unexpected_root", x.flag_unexpected_root);
+      setCk("cfg-debug_display", x.debug_display);
+      setCk("cfg-exclude_init_children", x.exclude_init_children);
+      setCk("cfg-quiet", x.quiet);
+      setN("cfg-frmt-clock_skew_minutes", x.file_recent_mtime.clock_skew_minutes);
+      setN("cfg-frmt-max_hours_critical_paths", x.file_recent_mtime.max_hours_critical_paths);
+      setN("cfg-frmt-max_hours_system_elevated", x.file_recent_mtime.max_hours_system_elevated);
+      setN("cfg-frmt-max_hours_suspicious_only", x.file_recent_mtime.max_hours_suspicious_only);
+      setCk("cfg-file_rare_signature_includes_size", x.file_rare_signature_includes_size);
+      setCk("cfg-file_rare_signature_includes_metadata", x.file_rare_signature_includes_metadata);
+      setCk("cfg-file_rare_signature_includes_recent_mtime", x.file_rare_signature_includes_recent_mtime);
+      renderStrList("strList-suspicious_path_patterns", x.suspicious_path_patterns);
+      renderStrList("strList-common_root_processes", x.common_root_processes);
+      renderStrList("strList-whitelisted_path_patterns", x.whitelisted_path_patterns);
+      renderStrList("strList-file_excluded_path_regexes", x.file_excluded_path_regexes);
+      renderStrList("strList-file_excluded_filename_regexes", x.file_excluded_filename_regexes);
+      renderStrList("strList-volatile_path_prefixes", x.file_recent_mtime.volatile_path_prefixes);
+    }
+
+    function buildConfigFromForm() {
+      return {
+        entropy_threshold: numField("cfg-entropy_threshold", 4.5),
+        minority_cluster_ratio: numField("cfg-minority_cluster_ratio", 0.1),
+        dbscan_tolerance: numField("cfg-dbscan_tolerance", 0.35),
+        dbscan_min_samples: intField("cfg-dbscan_min_samples", 2),
+        normalize_features: elCk("cfg-normalize_features", true),
+        suspicious_path_patterns: collectStrListByWrapId("strList-suspicious_path_patterns"),
+        exclude_kernel_threads: elCk("cfg-exclude_kernel_threads", true),
+        common_root_processes: collectStrListByWrapId("strList-common_root_processes"),
+        flag_unexpected_root: elCk("cfg-flag_unexpected_root", true),
+        debug_display: elCk("cfg-debug_display", false),
+        exclude_init_children: elCk("cfg-exclude_init_children", false),
+        whitelisted_path_patterns: collectStrListByWrapId("strList-whitelisted_path_patterns"),
+        file_excluded_path_regexes: collectStrListByWrapId("strList-file_excluded_path_regexes"),
+        file_excluded_filename_regexes: collectStrListByWrapId("strList-file_excluded_filename_regexes"),
+        quiet: elCk("cfg-quiet", false),
+        file_recent_mtime: {
+          clock_skew_minutes: intField("cfg-frmt-clock_skew_minutes", 5),
+          max_hours_critical_paths: intField("cfg-frmt-max_hours_critical_paths", 12),
+          max_hours_system_elevated: intField("cfg-frmt-max_hours_system_elevated", 6),
+          max_hours_suspicious_only: intField("cfg-frmt-max_hours_suspicious_only", 3),
+          volatile_path_prefixes: collectStrListByWrapId("strList-volatile_path_prefixes"),
+        },
+        file_rare_signature_includes_size: elCk("cfg-file_rare_signature_includes_size", false),
+        file_rare_signature_includes_metadata: elCk("cfg-file_rare_signature_includes_metadata", false),
+        file_rare_signature_includes_recent_mtime: elCk("cfg-file_rare_signature_includes_recent_mtime", false),
+      };
+    }
+
+    function elCk(id, dflt) {
+      const e = document.getElementById(id);
+      if (!e) return dflt;
+      return e.checked;
+    }
+
+    function numField(id, dflt) {
+      const e = document.getElementById(id);
+      if (!e || e.value === "") return dflt;
+      const n = parseFloat(e.value);
+      return Number.isFinite(n) ? n : dflt;
+    }
+
+    function intField(id, dflt) {
+      const e = document.getElementById(id);
+      if (!e || e.value === "") return dflt;
+      const n = parseInt(e.value, 10);
+      return Number.isFinite(n) ? n : dflt;
+    }
+
+    function syncRunConfigTextarea(merged) {
+      document.getElementById("cfgJson").value = JSON.stringify(merged, null, 2);
+    }
+
+    function applyRunConfigRawJson() {
+      const raw0 = document.getElementById("cfgJson").value;
+      const raw = raw0.replace(/^\uFEFF/, "").trim();
+      let p;
+      try {
+        p = raw ? JSON.parse(raw) : {};
+      } catch (e) {
+        const tip = (raw0.length && /[<>]/.test(raw0)) ? " This looks like HTML, not config JSON — copy from the run-config JSON or fix the file." : "";
+        alert("Invalid JSON in the raw run-config field: " + (e && e.message ? e.message : e) + "." + tip);
+        return;
+      }
+      const m = mergeRunConfig(p);
+      applyRunConfigToForm(m);
+      syncRunConfigTextarea(m);
+    }
+
+    async function loadRunConfig() {
+      const data = await api("/api/run-config");
+      if (data._jsonParseError) {
+        alert("Could not read run config from the server. " + (data.error || data._jsonParseError));
+        return;
+      }
+      if (data._ok === false) {
+        alert("Run config: " + (data.error || "load failed") + " (" + (data._httpStatus || "") + ")");
+        return;
+      }
+      const c = data.config || {};
+      const m = mergeRunConfig(c);
+      applyRunConfigToForm(m);
+      syncRunConfigTextarea(m);
+    }
+
+    async function saveRunConfig() {
+      const body = buildConfigFromForm();
+      const data = await api("/api/run-config", { method: "POST", body: JSON.stringify(body) });
+      if (data._jsonParseError) {
+        alert("Save failed: server did not return JSON. " + (data._rawPreview || "").slice(0, 120));
+        return;
+      }
+      if (data._ok === false) {
+        alert("Save run config: " + (data.error || "failed") + " (" + (data._httpStatus || "") + ")");
+        return;
+      }
+      await loadRunConfig();
+    }
+
+    async function runAutoPipeline() {
+      const body = {
+        directory: document.getElementById("autoDir").value.trim(),
+        baseline_tag: document.getElementById("autoBaseline").value.trim(),
+        candidate_tag: document.getElementById("autoCandidate").value.trim(),
+        enable_anomark: document.getElementById("autoAnomark").checked
+      };
+      const data = await api("/api/pipeline/auto", { method: "POST", body: JSON.stringify(body) });
+      document.getElementById("autoResult").textContent = JSON.stringify(data, null, 2);
+      await loadDatasets();
+      await loadRuns();
+    }
+
+    async function loadAnoMarkConfig() {
+      const data = await api("/api/anomark/config");
+      const cfg = data.config || {};
+      document.getElementById("anomarkModel").value = cfg.model_path || "";
+      document.getElementById("anomarkColumn").value = cfg.column || "command";
+      document.getElementById("anomarkMachineField").value = cfg.machine_field || "machine_id";
+    }
+
+    async function saveAnoMarkConfig() {
+      const body = {
+        model_path: document.getElementById("anomarkModel").value.trim(),
+        column: document.getElementById("anomarkColumn").value.trim() || "command",
+        machine_field: document.getElementById("anomarkMachineField").value.trim() || "machine_id"
+      };
+      const data = await api("/api/anomark/config", { method: "POST", body: JSON.stringify(body) });
+      document.getElementById("anomarkStatus").textContent = JSON.stringify(data, null, 2);
+      await loadRunAnomarkAvailability();
+    }
+
+    async function loadSigmaConfig() {
+      const data = await api("/api/sigma-zero/config");
+      const c = data.config || {};
+      document.getElementById("sigmaRulesDir").value = c.rules_dir || "";
+      document.getElementById("sigmaFieldMap").value = c.field_map || "";
+      const w = c.workers;
+      document.getElementById("sigmaWorkers").value = w != null && w !== "" ? String(w) : "";
+    }
+
+    async function saveSigmaConfig() {
+      const w = document.getElementById("sigmaWorkers").value.trim();
+      const body = {
+        rules_dir: document.getElementById("sigmaRulesDir").value.trim(),
+        field_map: document.getElementById("sigmaFieldMap").value.trim(),
+        workers: w ? parseInt(w, 10) : null
+      };
+      const data = await api("/api/sigma-zero/config", { method: "POST", body: JSON.stringify(body) });
+      document.getElementById("sigmaStatus").textContent = JSON.stringify(data, null, 2);
+    }
+
+    async function runSigmaCheck() {
+      const logPath = document.getElementById("sigmaLogPath").value.trim();
+      const fromCb = Array.from(document.querySelectorAll(".sigma-ds:checked")).map((x) => x.value);
+      const typedIds = document.getElementById("sigmaDatasetIds").value.split(",").map(s => s.trim()).filter(Boolean);
+      const tags = document.getElementById("sigmaTags").value.split(",").map(s => s.trim()).filter(Boolean);
+      const dataset_ids = Array.from(new Set([...fromCb, ...typedIds]));
+      if (!logPath) {
+        if (dataset_ids.length === 0 && tags.length === 0) {
+          alert("Select process datasets, set tags/ids, or set a log file path on the server.");
+          return;
+        }
+      }
+      const ro = document.getElementById("sigmaRulesOverride").value.trim();
+      const ft = document.getElementById("sigmaFilterTags").value.split(",").map(s => s.trim()).filter(Boolean);
+      const fl = document.getElementById("sigmaFilterLevels").value.split(",").map(s => s.trim()).filter(Boolean);
+      const body = {
+        log_path: logPath,
+        dataset_ids,
+        tags,
+        rules_dir: ro || null,
+        filter_tags: ft,
+        filter_levels: fl
+      };
+      const data = await api("/api/sigma-zero/check", { method: "POST", body: JSON.stringify(body) });
+      const el = document.getElementById("sigmaStatus");
+      if (el) el.textContent = JSON.stringify(data, null, 2);
+    }
+
+    async function loadAnomarkTrainings() {
+      const el = document.getElementById("anomarkTrainingsList");
+      if (!el) return;
+      let data;
+      try {
+        data = await api("/api/anomark/trains");
+      } catch (e) {
+        el.innerHTML = "<p class=\"muted\">Could not load trainings.</p>";
+        return;
+      }
+      const list = data.trainings || [];
+      if (!list.length) {
+        el.innerHTML = "<p class=\"muted\">No completed trainings yet.</p>";
+        return;
+      }
+      const rows = list
+        .map((t) => {
+          const src = t.from_user_file
+            ? "file: " + ((t.request && t.request.training_path) || "—")
+            : t.source_dataset_ids && t.source_dataset_ids.length
+              ? t.source_dataset_ids.join(", ")
+              : "—";
+          const reqS = escHtml(JSON.stringify(t.request || {}));
+          const idS = escHtml(t.id || "");
+          const timeS = escHtml(t.created_at || "");
+          const lineS = t.training_line_count != null ? String(t.training_line_count) : "—";
+          const srcE = escHtml(String(src));
+          const tid = encodeURIComponent(t.id || "");
+          return `<tr>
+            <td style="border-bottom:1px solid #1e293b; padding:6px; white-space:nowrap">${timeS}</td>
+            <td style="border-bottom:1px solid #1e293b; padding:6px"><code style="font-size:11px">${idS}</code></td>
+            <td style="border-bottom:1px solid #1e293b; padding:6px; max-width:220px; word-break:break-all">${srcE}</td>
+            <td style="border-bottom:1px solid #1e293b; padding:6px; text-align:right">${lineS}</td>
+            <td style="border-bottom:1px solid #1e293b; padding:6px"><pre style="margin:0; max-width:320px; max-height:100px; overflow:auto; font-size:10px; white-space:pre-wrap;">${reqS}</pre></td>
+            <td style="border-bottom:1px solid #1e293b; padding:6px; white-space:nowrap">
+              <a href="/api/anomark/trains/${tid}/model" download>model</a>
+              ·
+              <a href="/api/anomark/trains/${tid}/training-data" download>data</a>
+            </td>
+          </tr>`;
+        })
+        .join("");
+      el.innerHTML = `<table style="width:100%; border-collapse: collapse; font-size: 13px;">
+        <thead>
+          <tr>
+            <th style="text-align:left; border-bottom:1px solid #334155; padding:6px;">When</th>
+            <th style="text-align:left; border-bottom:1px solid #334155; padding:6px;">Id</th>
+            <th style="text-align:left; border-bottom:1px solid #334155; padding:6px;">Source</th>
+            <th style="text-align:right; border-bottom:1px solid #334155; padding:6px;">Lines</th>
+            <th style="text-align:left; border-bottom:1px solid #334155; padding:6px;">Request (JSON)</th>
+            <th style="text-align:left; border-bottom:1px solid #334155; padding:6px;">Download</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+    }
+
+    async function trainAnoMark() {
+      const outPath = document.getElementById("anomarkTrainOut").value.trim();
+      const trainingPath = document.getElementById("anomarkTrainPath").value.trim();
+      const fromCheckboxes = Array.from(document.querySelectorAll(".anomark-ds:checked")).map((x) => x.value);
+      const typedIds = document.getElementById("anomarkTrainDatasetIds").value.split(",").map(s => s.trim()).filter(Boolean);
+      const tags = document.getElementById("anomarkTrainTags").value.split(",").map(s => s.trim()).filter(Boolean);
+      const dataset_ids = Array.from(new Set([...fromCheckboxes, ...typedIds]));
+      if (!trainingPath) {
+        if (dataset_ids.length === 0 && tags.length === 0) {
+          alert("Select one or more process datasets (checkboxes) or set dataset ids / tags, or provide a training file path.");
+          return;
+        }
+      }
+      const body = {
+        training_path: trainingPath,
+        dataset_ids,
+        tags,
+        column: document.getElementById("anomarkTrainColumn").value.trim() || "command",
+        order: parseInt(document.getElementById("anomarkTrainOrder").value.trim() || "4", 10),
+        output_model_path: outPath || ""
+      };
+      const data = await api("/api/anomark/train", { method: "POST", body: JSON.stringify(body) });
+      document.getElementById("anomarkStatus").textContent = JSON.stringify(data, null, 2);
+      await loadAnoMarkConfig();
+      await loadAnomarkTrainings();
+      await loadRunAnomarkAvailability();
+    }
+
+    document.addEventListener("click", (e) => {
+      const b = e.target;
+      if (!b || !b.classList) return;
+      if (!b.classList.contains("honey-zin") && !b.classList.contains("honey-zout") && !b.classList.contains("honey-zreset")) {
+        return;
+      }
+      const chartId = b.getAttribute("data-honey");
+      if (!chartId) return;
+      const svg = document.getElementById(chartId);
+      const st = honeyView[chartId];
+      if (!svg || !st) return;
+      if (b.classList.contains("honey-zin")) st.k = Math.min(4, st.k * 1.25);
+      if (b.classList.contains("honey-zout")) st.k = Math.max(0.2, st.k * 0.8);
+      if (b.classList.contains("honey-zreset")) {
+        st.k = 1;
+        st.panX = 0;
+        st.panY = 0;
+      }
+      applyHoneyTransform(svg);
+    });
+
+    loadDatasets();
+    loadRuns();
+    loadAnoMarkConfig();
+    loadAnomarkTrainings();
+    loadRunAnomarkAvailability();
+    loadSigmaConfig();
+    loadRunConfig();
+  </script>
+</body>
+</html>
