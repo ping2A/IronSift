@@ -17,7 +17,8 @@ pub struct RawLogEntry {
     pub uid: u32,
     pub path: String,
     pub args: String,
-    #[serde(default)]
+    /// RFC3339 / epoch text; osquery `processes.start_time` accepted as alias.
+    #[serde(default, alias = "start_time")]
     pub timestamp: Option<String>,
 }
 
@@ -33,10 +34,11 @@ pub struct RawFileEntry {
     pub uid: u32,
     #[serde(default)]
     pub timestamp: Option<String>,
-    /// Last modification time (`mtime` in IronSift CSV/JSON; JSON may use `date`).
+    /// Last modification time (IronSift `mtime` column; JSON may use `date` as alias).
     #[serde(default, alias = "date")]
     pub mtime: Option<String>,
-    #[serde(default)]
+    /// Permission bits as text; osquery `file.mode`.
+    #[serde(default, alias = "mode")]
     pub permissions: Option<String>,
     #[serde(default)]
     pub owner: Option<String>,

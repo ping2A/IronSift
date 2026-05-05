@@ -3,22 +3,28 @@ use std::path::PathBuf;
 
 use axum::body::Body;
 use axum::extract::{Multipart, Path, Query, State};
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
-use axum::routing::post;
+use axum::routing::{delete, get, post, put};
 use axum::Json;
 use axum::Router;
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
+use tracing::info;
+use tracing::warn;
+use tracing_subscriber::EnvFilter;
 
 use ironsift::{
-    AnoMarkSettings, AnoMarkTrainRequest, AutoPipelineRequest, CreateDatasetRequest,
-    CreateRunRequest, DetectionConfig, PlatformStore, SigmaZeroCheckRequest, SigmaZeroSettings,
+    AnoMarkSettings, AnoMarkTrainRequest, CreateDatasetRequest, CreateDetectionConfigRequest,
+    CreateRunRequest, DeleteDatasetEventsRequest, DetectionConfig, DATASET_INSPECT_MAX_SAMPLE,
+    PlatformStore, RunUserTriage, SelectDetectionConfigRequest, SigmaZeroCheckRequest,
+    SigmaZeroSettings, UpdateDetectionConfigRequest,
 };
 
 const UI_HTML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/web/index.html"));
+const LOGO_PNG: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/.github/logo.png"));
 
 #[derive(Clone)]
 struct AppState {
@@ -36,6 +42,16 @@ struct TagRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct PutRunTriageRequest {
+    user_triage: RunUserTriage,
+}
+
+#[derive(Debug, Deserialize)]
+struct PutAnomarkTrainFavoriteRequest {
+    favorite: bool,
+}
+
+#[derive(Debug, Deserialize)]
 struct HoneycombQuery {
     run_id: String,
     min_score: Option<f64>,
@@ -48,19 +64,109 @@ struct UploadQuery {
     tags: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DatasetInspectQuery {
+    #[serde(default)]
+    process_limit: Option<u32>,
+    #[serde(default)]
+    file_limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AppendTestBody {
+    ndjson: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScoreAnomarkCommandBody {
+    command: String,
+    /// Hostname / machine_id prefix — same rule as detection runs (`"{machine} {command}"` scored).
+    #[serde(default)]
+    machine_name: Option<String>,
+    #[serde(default)]
+    train_id: Option<String>,
+    /// Percent of ln(prior) for threshold (55–99.999); lower = flag more commands. Default 95 (matches fleet scoring).
+    #[serde(default = "default_anomark_suspect_percent")]
+    suspect_percent: f64,
+}
+
+fn default_anomark_suspect_percent() -> f64 {
+    95.0
+}
+
+fn clamp_inspect_limit(x: Option<u32>) -> u32 {
+    let d = x.unwrap_or(200);
+    d.clamp(1, DATASET_INSPECT_MAX_SAMPLE)
+}
+
+/// Default `RUST_LOG` when unset: info for app + HTTP request/response tracing.
+fn init_logging() {
+    let fallback: EnvFilter = "info,tower_http=info,tower=info,axum::rejection=warn"
+        .parse()
+        .expect("built-in tracing filter");
+    let filter = match std::env::var("RUST_LOG") {
+        Ok(s) if !s.trim().is_empty() => match s.parse::<EnvFilter>() {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("IronSift: invalid RUST_LOG ({e}); using built-in default");
+                fallback
+            }
+        },
+        _ => fallback,
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .init();
+}
+
+fn log_platform_storage(store: &PlatformStore) {
+    println!("IronSift platform storage:");
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|e| format!("(unavailable: {})", e));
+    println!("  working directory: {}", cwd);
+
+    let db = store.db_json_path();
+    let sql = store.events_sqlite_path();
+    println!("  platform metadata (JSON): {}", db);
+    println!("  ingested events (SQLite): {}", sql);
+
+    if let Ok(abs) = std::path::Path::new(db).canonicalize() {
+        println!("  metadata (absolute): {}", abs.display());
+    }
+    if let Ok(abs) = std::path::Path::new(sql).canonicalize() {
+        println!("  SQLite (absolute): {}", abs.display());
+    }
+
+    if let Some(parent) = std::path::Path::new(db).parent() {
+        let trains = parent.join("anomark-trains");
+        println!("  AnoMark trainings dir: {}/", trains.display());
+        if let Ok(abs) = trains.canonicalize() {
+            println!("  AnoMark trainings dir (absolute): {}/", abs.display());
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    init_logging();
     let store = PlatformStore::load_or_create(".ironsift-platform/db.json")?;
+    log_platform_storage(&store);
     let state = AppState { store };
 
     let app = Router::new()
         .route("/", get(ui))
+        .route("/logo.png", get(logo_png))
         .route("/api/health", get(health))
         .route("/api/datasets", get(list_datasets).post(create_dataset))
         .route("/api/datasets/purge", post(purge_datasets))
         .route("/api/datasets/:id/inspect", get(inspect_dataset))
+        .route("/api/datasets/:id/append-test-data", post(append_dataset_test_data))
+        .route("/api/datasets/:id/delete-events", post(delete_dataset_events))
         .route("/api/datasets/upload", post(upload_dataset))
         .route("/api/datasets/:id/tags", post(add_tags))
+        .route("/api/datasets/:id/tags/remove", post(remove_tags))
         .route("/api/runs/purge", post(purge_runs))
         .route("/api/runs", get(list_runs).post(create_run))
         .route(
@@ -68,12 +174,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(get_run).delete(delete_run),
         )
         .route("/api/runs/:id/detections", get(get_run_detections))
+        .route("/api/runs/:id/triage", put(put_run_triage))
         .route("/api/fleet/honeycomb", get(get_honeycomb))
-        .route("/api/pipeline/auto", post(run_auto_pipeline))
         .route("/api/anomark/config", get(get_anomark_config).post(set_anomark_config))
         .route("/api/anomark/availability", get(get_anomark_availability))
+        .route("/api/anomark/inspect", get(inspect_anomark_configured_model))
         .route("/api/anomark/train", post(train_anomark))
         .route("/api/anomark/trains", get(list_anomark_trains))
+        .route("/api/anomark/trains/purge", post(purge_anomark_trains))
+        .route("/api/anomark/score-command", post(score_anomark_command))
+        .route(
+            "/api/anomark/trains/:id",
+            delete(delete_anomark_train),
+        )
+        .route(
+            "/api/anomark/trains/:id/favorite",
+            put(put_anomark_train_favorite),
+        )
+        .route(
+            "/api/anomark/trains/:id/inspect",
+            get(inspect_anomark_training_model),
+        )
         .route(
             "/api/anomark/trains/:id/model",
             get(download_anomark_model),
@@ -83,7 +204,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(download_anomark_training_data),
         )
         .route("/api/run-config", get(get_run_config).post(set_run_config))
+        .route(
+            "/api/detection-configs",
+            get(list_detection_configs).post(create_detection_config),
+        )
+        .route("/api/detection-configs/select", post(select_detection_config))
+        .route(
+            "/api/detection-configs/:id",
+            get(get_detection_config_detail)
+                .put(update_detection_config)
+                .delete(delete_detection_config),
+        )
         .route("/api/sigma-zero/config", get(get_sigma_config).post(set_sigma_config))
+        .route("/api/sigma-zero/rule-templates", get(get_sigma_rule_templates))
         .route("/api/sigma-zero/check", post(check_sigma_zero))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
@@ -98,6 +231,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn ui() -> Html<&'static str> {
     Html(UI_HTML)
+}
+
+async fn logo_png() -> Response {
+    Response::builder()
+        .header(CONTENT_TYPE, "image/png")
+        .header(CACHE_CONTROL, "public, max-age=86400")
+        .body(Body::from(LOGO_PNG))
+        .unwrap()
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -117,7 +258,11 @@ async fn create_dataset(
     Json(req): Json<CreateDatasetRequest>,
 ) -> impl IntoResponse {
     match state.store.create_dataset(req) {
-        Ok(ds) => (StatusCode::CREATED, Json(serde_json::json!({ "dataset": ds }))).into_response(),
+        Ok((ds, ingest_summary)) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "dataset": ds, "ingest_summary": ingest_summary })),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::to_value(ApiError {
@@ -134,7 +279,32 @@ async fn add_tags(
     Json(req): Json<TagRequest>,
 ) -> impl IntoResponse {
     match state.store.add_dataset_tags(&id, &req.tags) {
-        Ok(ds) => (StatusCode::OK, Json(serde_json::json!({ "dataset": ds }))).into_response(),
+        Ok((ds, ingest_summary)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "dataset": ds, "ingest_summary": ingest_summary })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError {
+                error: e.to_string(),
+            }).unwrap_or_default()),
+        )
+            .into_response(),
+    }
+}
+
+async fn remove_tags(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    Json(req): Json<TagRequest>,
+) -> impl IntoResponse {
+    match state.store.remove_dataset_tags(&id, &req.tags) {
+        Ok((ds, ingest_summary)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "dataset": ds, "ingest_summary": ingest_summary })),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::to_value(ApiError {
@@ -147,10 +317,20 @@ async fn add_tags(
 
 async fn inspect_dataset(
     Path(id): Path<String>,
+    Query(q): Query<DatasetInspectQuery>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    match state.store.inspect_dataset(&id) {
-        Ok(info) => (StatusCode::OK, Json(serde_json::json!({ "inspection": info }))).into_response(),
+    let pl = clamp_inspect_limit(q.process_limit);
+    let fl = clamp_inspect_limit(q.file_limit);
+    match state.store.inspect_dataset(&id, pl, fl) {
+        Ok(info) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "inspection": info,
+                "inspect_limits": { "process_limit": pl, "file_limit": fl, "max_per_kind": DATASET_INSPECT_MAX_SAMPLE }
+            })),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::to_value(ApiError {
@@ -158,6 +338,58 @@ async fn inspect_dataset(
             }).unwrap_or_default()),
         )
             .into_response(),
+    }
+}
+
+async fn append_dataset_test_data(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    Json(body): Json<AppendTestBody>,
+) -> impl IntoResponse {
+    match state.store.append_dataset_test_ndjson(&id, &body.ndjson) {
+        Ok(summary) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "summary": summary })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError {
+                error: e.to_string(),
+            })
+            .unwrap_or_default()),
+        )
+            .into_response(),
+    }
+}
+
+async fn delete_dataset_events(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    Json(body): Json<DeleteDatasetEventsRequest>,
+) -> impl IntoResponse {
+    match state.store.delete_dataset_events(&id, body) {
+        Ok((deleted_process, deleted_file)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "deleted_process": deleted_process,
+                "deleted_file": deleted_file,
+            })),
+        )
+            .into_response(),
+        Err(e) => {
+            let msg = e.to_string();
+            let status = if msg.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (
+                status,
+                Json(serde_json::to_value(ApiError { error: msg }).unwrap_or_default()),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -178,15 +410,32 @@ async fn create_run(
     State(state): State<AppState>,
     Json(req): Json<CreateRunRequest>,
 ) -> impl IntoResponse {
+    let dataset_count = req.dataset_ids.len();
+    let enable_anomark = req.enable_anomark;
+    let detection_focus = req.detection_focus;
+    let detector_mode = req.detector_mode;
     match state.store.run_detection(req) {
-        Ok(run) => (StatusCode::CREATED, Json(serde_json::json!({ "run": run }))).into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::to_value(ApiError {
-                error: e.to_string(),
-            }).unwrap_or_default()),
-        )
-            .into_response(),
+        Ok(run) => {
+            info!(
+                run_id = %run.id,
+                datasets = dataset_count,
+                enable_anomark = enable_anomark,
+                ?detection_focus,
+                ?detector_mode,
+                "POST /api/runs — detection run completed"
+            );
+            (StatusCode::CREATED, Json(serde_json::json!({ "run": run }))).into_response()
+        }
+        Err(e) => {
+            warn!(error = %e, "POST /api/runs — failed");
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::to_value(ApiError {
+                    error: e.to_string(),
+                }).unwrap_or_default()),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -221,22 +470,6 @@ async fn purge_runs(State(state): State<AppState>) -> impl IntoResponse {
                 error: e.to_string(),
             })
             .unwrap_or_default()),
-        )
-            .into_response(),
-    }
-}
-
-async fn run_auto_pipeline(
-    State(state): State<AppState>,
-    Json(req): Json<AutoPipelineRequest>,
-) -> impl IntoResponse {
-    match state.store.run_auto_pipeline(req) {
-        Ok(res) => (StatusCode::CREATED, Json(serde_json::json!({ "result": res }))).into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::to_value(ApiError {
-                error: e.to_string(),
-            }).unwrap_or_default()),
         )
             .into_response(),
     }
@@ -284,9 +517,239 @@ async fn train_anomark(
 }
 
 async fn list_anomark_trains(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let mut trainings = state.store.list_anomark_trainings();
-    trainings.reverse();
+    let trainings = state.store.list_anomark_trainings_for_display();
     Json(serde_json::json!({ "trainings": trainings }))
+}
+
+async fn put_anomark_train_favorite(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    Json(body): Json<PutAnomarkTrainFavoriteRequest>,
+) -> impl IntoResponse {
+    match state
+        .store
+        .set_anomark_training_favorite(&id, body.favorite)
+    {
+        Ok(()) => {
+            info!(
+                target: "ironsift::anomark",
+                train_id = %id,
+                favorite = body.favorite,
+                "AnoMark training favorite updated"
+            );
+            (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response()
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            warn!(
+                target: "ironsift::anomark",
+                train_id = %id,
+                error = %msg,
+                "AnoMark training favorite update failed"
+            );
+            let code = if msg.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (
+                code,
+                Json(serde_json::to_value(ApiError { error: msg }).unwrap_or_default()),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn delete_anomark_train(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    match state.store.delete_anomark_training(&id) {
+        Ok(()) => {
+            info!(
+                target: "ironsift::anomark",
+                train_id = %id,
+                "AnoMark training deleted"
+            );
+            (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response()
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            warn!(
+                target: "ironsift::anomark",
+                train_id = %id,
+                error = %msg,
+                "AnoMark training delete failed"
+            );
+            let code = if msg.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (
+                code,
+                Json(serde_json::to_value(ApiError { error: msg }).unwrap_or_default()),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn purge_anomark_trains(State(state): State<AppState>) -> impl IntoResponse {
+    match state.store.delete_all_anomark_trainings() {
+        Ok(removed) => {
+            info!(
+                target: "ironsift::anomark",
+                removed,
+                "AnoMark trainings purged"
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "status": "ok", "removed": removed })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::to_value(ApiError {
+                    error: e.to_string(),
+                })
+                .unwrap_or_default(),
+            ),
+        )
+            .into_response(),
+    }
+}
+
+async fn score_anomark_command(
+    State(state): State<AppState>,
+    Json(body): Json<ScoreAnomarkCommandBody>,
+) -> impl IntoResponse {
+    let tid = body
+        .train_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let cmd_bytes = body.command.len();
+    let machine = body
+        .machine_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match state
+        .store
+        .score_anomark_command(&body.command, machine, tid, body.suspect_percent)
+    {
+        Ok(score) => {
+            info!(
+                target: "ironsift::anomark",
+                train_id = ?score.train_id,
+                source = %score.source,
+                cmd_bytes,
+                order = score.order,
+                is_suspect = score.is_suspect,
+                suspect_percent_used = score.suspect_percent_used,
+                margin_ln = score.margin_ln,
+                log_likelihood = score.log_likelihood,
+                suspect_threshold_ln = score.suspect_threshold_ln,
+                model_path = %score.model_path,
+                "AnoMark score-command OK"
+            );
+            (StatusCode::OK, Json(serde_json::json!({ "score": score }))).into_response()
+        }
+        Err(e) => {
+            warn!(
+                target: "ironsift::anomark",
+                requested_train_id = ?tid,
+                cmd_bytes,
+                error = %e,
+                "AnoMark score-command failed"
+            );
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::to_value(ApiError {
+                    error: e.to_string(),
+                })
+                .unwrap_or_default()),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn inspect_anomark_configured_model(State(state): State<AppState>) -> impl IntoResponse {
+    match state.store.inspect_anomark_configured_model() {
+        Ok(inspection) => {
+            info!(
+                target: "ironsift::anomark",
+                model_path = %inspection.model_path,
+                file_size_bytes = inspection.file_size_bytes,
+                order = inspection.order,
+                is_trained = inspection.is_trained,
+                num_contexts = inspection.num_contexts,
+                num_transitions = inspection.num_transitions,
+                alphabet_len = inspection.alphabet_len,
+                suspect_threshold_ln = inspection.suspect_threshold_ln,
+                "AnoMark inspect configured model OK"
+            );
+            (StatusCode::OK, Json(serde_json::json!({ "inspection": inspection }))).into_response()
+        }
+        Err(e) => {
+            warn!(
+                target: "ironsift::anomark",
+                error = %e,
+                "AnoMark inspect configured model failed"
+            );
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::to_value(ApiError {
+                    error: e.to_string(),
+                })
+                .unwrap_or_default()),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn inspect_anomark_training_model(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    match state.store.inspect_anomark_training_model(&id) {
+        Ok(inspection) => {
+            info!(
+                target: "ironsift::anomark",
+                train_id = %id,
+                model_path = %inspection.model_path,
+                file_size_bytes = inspection.file_size_bytes,
+                order = inspection.order,
+                is_trained = inspection.is_trained,
+                num_contexts = inspection.num_contexts,
+                suspect_threshold_ln = inspection.suspect_threshold_ln,
+                "AnoMark inspect training model OK"
+            );
+            (StatusCode::OK, Json(serde_json::json!({ "inspection": inspection }))).into_response()
+        }
+        Err(e) => {
+            warn!(
+                target: "ironsift::anomark",
+                train_id = %id,
+                error = %e,
+                "AnoMark inspect training model failed"
+            );
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::to_value(ApiError {
+                    error: e.to_string(),
+                })
+                .unwrap_or_default()),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn download_anomark_model(
@@ -378,8 +841,170 @@ fn file_download_response(
         .map_err(|e| e.to_string())
 }
 
-async fn get_run_config(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "config": state.store.get_run_config() }))
+async fn get_run_config(State(state): State<AppState>) -> impl IntoResponse {
+    match state.store.run_config_with_profiles() {
+        Ok((config, profiles, selected_id)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "config": config,
+                "profiles": profiles,
+                "selected_id": selected_id,
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::to_value(ApiError {
+                error: e.to_string(),
+            })
+            .unwrap_or_default()),
+        )
+            .into_response(),
+    }
+}
+
+async fn list_detection_configs(State(state): State<AppState>) -> impl IntoResponse {
+    match state.store.run_config_with_profiles() {
+        Ok((config, profiles, selected_id)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "config": config,
+                "profiles": profiles,
+                "selected_id": selected_id,
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::to_value(ApiError {
+                error: e.to_string(),
+            })
+            .unwrap_or_default()),
+        )
+            .into_response(),
+    }
+}
+
+async fn get_detection_config_detail(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    match state.store.get_detection_config_profile_detail(&id) {
+        Ok((profile, config)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "profile": profile, "config": config })),
+        )
+            .into_response(),
+        Err(e) => {
+            let msg = e.to_string();
+            let status = if msg.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (
+                status,
+                Json(serde_json::to_value(ApiError { error: msg }).unwrap_or_default()),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn create_detection_config(
+    State(state): State<AppState>,
+    Json(req): Json<CreateDetectionConfigRequest>,
+) -> impl IntoResponse {
+    match state.store.create_detection_config_profile(req) {
+        Ok((id, profile)) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "id": id, "profile": profile })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError {
+                error: e.to_string(),
+            })
+            .unwrap_or_default()),
+        )
+            .into_response(),
+    }
+}
+
+async fn update_detection_config(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    Json(req): Json<UpdateDetectionConfigRequest>,
+) -> impl IntoResponse {
+    match state.store.update_detection_config_profile(&id, req) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError {
+                error: e.to_string(),
+            })
+            .unwrap_or_default()),
+        )
+            .into_response(),
+    }
+}
+
+async fn delete_detection_config(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    match state.store.delete_detection_config_profile(&id) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError {
+                error: e.to_string(),
+            })
+            .unwrap_or_default()),
+        )
+            .into_response(),
+    }
+}
+
+async fn select_detection_config(
+    State(state): State<AppState>,
+    Json(req): Json<SelectDetectionConfigRequest>,
+) -> impl IntoResponse {
+    let id = req.id.trim();
+    if id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError {
+                error: "id is required".to_string(),
+            })
+            .unwrap_or_default()),
+        )
+            .into_response();
+    }
+    match state.store.select_detection_config_profile(id) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError {
+                error: e.to_string(),
+            })
+            .unwrap_or_default()),
+        )
+            .into_response(),
+    }
 }
 
 async fn set_run_config(
@@ -418,19 +1043,51 @@ async fn set_sigma_config(
     }
 }
 
+async fn get_sigma_rule_templates() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "templates": PlatformStore::default_sigma_rule_templates()
+    }))
+}
+
 async fn check_sigma_zero(
     State(state): State<AppState>,
     Json(req): Json<SigmaZeroCheckRequest>,
 ) -> impl IntoResponse {
+    let uses_log_path = !req.log_path.trim().is_empty();
+    let n_dataset_ids = req.dataset_ids.len();
     match state.store.check_sigma_zero(req) {
-        Ok(result) => (StatusCode::OK, Json(serde_json::json!({ "result": result }))).into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::to_value(ApiError {
-                error: e.to_string(),
-            }).unwrap_or_default()),
-        )
-            .into_response(),
+        Ok(result) => {
+            info!(
+                target: "ironsift::sigma",
+                status = %result.status,
+                rules_match_count = result.rules_match_count,
+                line_count = result.line_count,
+                rules_source = %result.rules_source,
+                process_log_source = %result.process_log_source,
+                file_log_source = %result.file_log_source,
+                source_datasets = result.source_dataset_ids.len(),
+                uses_log_path,
+                request_dataset_ids = n_dataset_ids,
+                "POST /api/sigma-zero/check OK"
+            );
+            (StatusCode::OK, Json(serde_json::json!({ "result": result }))).into_response()
+        }
+        Err(e) => {
+            warn!(
+                target: "ironsift::sigma",
+                error = %e,
+                uses_log_path,
+                request_dataset_ids = n_dataset_ids,
+                "POST /api/sigma-zero/check failed"
+            );
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::to_value(ApiError {
+                    error: e.to_string(),
+                }).unwrap_or_default()),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -452,18 +1109,59 @@ async fn get_run_detections(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     match state.store.get_run(&id) {
-        Some(run) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "findings": run.findings })),
-        )
-            .into_response(),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::to_value(ApiError {
-                error: "run not found".to_string(),
-            }).unwrap_or_default()),
-        )
-            .into_response(),
+        Some(run) => {
+            let findings = state
+                .store
+                .findings_for_run_detections_api(&id)
+                .unwrap_or_else(|| run.findings.clone());
+            info!(
+                run_id = %id,
+                findings = findings.len(),
+                "GET /api/runs/:id/detections"
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "findings": findings,
+                    "dataset_ids": run.dataset_ids,
+                    "user_triage": run.user_triage.without_excluded_reason_decisions(),
+                })),
+            )
+                .into_response()
+        }
+        None => {
+            warn!(run_id = %id, "GET /api/runs/:id/detections — run not found");
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::to_value(ApiError {
+                    error: "run not found".to_string(),
+                }).unwrap_or_default()),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn put_run_triage(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    Json(req): Json<PutRunTriageRequest>,
+) -> impl IntoResponse {
+    match state.store.update_run_user_triage(&id, req.user_triage) {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
+        Err(e) => {
+            let msg = e.to_string();
+            let status = if msg.contains("run not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (
+                status,
+                Json(serde_json::to_value(ApiError { error: msg }).unwrap_or_default()),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -475,14 +1173,26 @@ async fn get_honeycomb(
         .store
         .honeycomb_for_run_filtered(&q.run_id, q.min_score, q.severity.as_deref())
     {
-        Some(cells) => (StatusCode::OK, Json(serde_json::json!({ "cells": cells }))).into_response(),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::to_value(ApiError {
-                error: "run not found".to_string(),
-            }).unwrap_or_default()),
-        )
-            .into_response(),
+        Some(cells) => {
+            info!(
+                run_id = %q.run_id,
+                cells = cells.len(),
+                min_score = ?q.min_score,
+                severity = ?q.severity,
+                "GET /api/fleet/honeycomb"
+            );
+            (StatusCode::OK, Json(serde_json::json!({ "cells": cells }))).into_response()
+        }
+        None => {
+            warn!(run_id = %q.run_id, "GET /api/fleet/honeycomb — run not found");
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::to_value(ApiError {
+                    error: "run not found".to_string(),
+                }).unwrap_or_default()),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -555,13 +1265,17 @@ async fn upload_dataset(
         .filter(|s| !s.is_empty())
         .collect();
     let mut imported = Vec::new();
+    let mut ingest_summaries = Vec::new();
     for (idx, path) in saved_paths.iter().enumerate() {
         let name = if idx == 0 { q.name.clone() } else { None };
         match state
             .store
-            .import_file_auto(path.to_str().unwrap_or_default(), name, tags.clone())
+            .import_file_auto(path.to_str().unwrap_or_default(), name, tags.clone(), None, None)
         {
-            Ok(ds) => imported.push(ds),
+            Ok((ds, summary)) => {
+                imported.push(ds);
+                ingest_summaries.push(summary);
+            }
             Err(e) => {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -573,5 +1287,12 @@ async fn upload_dataset(
             }
         }
     }
-    (StatusCode::CREATED, Json(serde_json::json!({ "datasets": imported }))).into_response()
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "datasets": imported,
+            "ingest_summaries": ingest_summaries
+        })),
+    )
+        .into_response()
 }

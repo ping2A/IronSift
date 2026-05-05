@@ -1,11 +1,12 @@
 //! API/Web platform state and orchestration for ingestion and runs.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use ahash::AHashMap;
 use anomark::{
@@ -13,33 +14,195 @@ use anomark::{
     validate_train_file_kinds, LoadedCharTrainingData, ModelHandler, TrainFileKind, resolve_column_name,
 };
 use sigma_zero::engine::SigmaEngine;
-use sigma_zero::models::LogEntry;
+use sigma_zero::models::{LogEntry, SigmaRule};
 use sigma_zero::parser::{filter_rules, load_rules_from_directory};
 
 use chrono::Utc;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use crate::event_db::EventDb;
+use crate::event_db::{
+    DetectionConfigProfileMeta, EventDb, IngestSummary, DELETE_DATASET_EVENTS_MAX_IDS,
+};
+
+fn dataset_kind_from_ingest_summary(summary: &IngestSummary) -> DatasetKind {
+    match summary.kind.as_str() {
+        "mixed" => DatasetKind::Mixed,
+        "file" => DatasetKind::File,
+        _ => DatasetKind::Process,
+    }
+}
 
 use crate::analysis::analyze_fleet;
 use crate::config::DetectionConfig;
 use crate::file_analysis::analyze_files_fleet;
-use crate::json_parse::parse_json_logs;
+use crate::json_parse::{default_machine_fallback_for_source_file, parse_json_logs};
+use crate::builder::build_profiles;
+use crate::file_analysis::build_file_profiles_from_grouped;
 use crate::loaders::{
     load_csv_data, load_files_csv_data, load_files_json_data, load_files_jsonl_data, load_json_data,
     load_jsonl_data,
 };
 use crate::report::{AnomalyLevel, AnalysisType};
-use crate::sigma_log_export::export_process_sources_to_sigma_jsonl;
-use crate::types::{MachineFileProfile, MachineProfile, RawLogEntry};
+use crate::types::{MachineFileProfile, MachineProfile, ProcessSignature, RawLogEntry};
 use crate::event_db::DatasetInspection;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DatasetKind {
     Process,
     File,
+    /// NDJSON (or sniffed JSON) contains both process and file-inventory rows; ingest fills both tables.
+    Mixed,
+}
+
+/// Which detection arms to run for [`DatasetKind::Mixed`] datasets in a [`CreateRunRequest`].
+/// Pure process / file datasets always use their matching arm only.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RunDetectionFocus {
+    /// Mixed datasets feed both process and file analysis (legacy behavior).
+    #[default]
+    Auto,
+    /// Mixed datasets feed **process** analysis only for this run (skip file arm for mixed).
+    ProcessOnly,
+    /// Mixed datasets feed **file** analysis only for this run (skip process arm for mixed).
+    FileOnly,
+}
+
+/// Whether to run IronSift fleet clustering, AnoMark command scoring, or both.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RunDetectorMode {
+    /// Fleet TF-IDF / DBSCAN (and file fleet) plus optional AnoMark when `enable_anomark` is true.
+    #[default]
+    Both,
+    /// IronSift process + file detection only; never runs AnoMark for this request.
+    IronsiftOnly,
+    /// AnoMark suspicious-command ratios only; skips `analyze_fleet` / `analyze_files_fleet`.
+    /// Requires process-capable datasets and a readable model (or chosen training).
+    AnomarkOnly,
+}
+
+#[inline]
+fn run_fleet_detection(mode: RunDetectorMode) -> bool {
+    matches!(
+        mode,
+        RunDetectorMode::Both | RunDetectorMode::IronsiftOnly
+    )
+}
+
+#[inline]
+fn run_anomark_detection(mode: RunDetectorMode, enable_anomark: bool) -> bool {
+    match mode {
+        RunDetectorMode::IronsiftOnly => false,
+        RunDetectorMode::AnomarkOnly => true,
+        RunDetectorMode::Both => enable_anomark,
+    }
+}
+
+/// Suspect threshold (% of ln prior) for fleet AnoMark and quick score; lower = more sensitive.
+#[inline]
+fn clamp_anomark_suspect_percent(pct: f64) -> f64 {
+    if pct.is_finite() && pct > 0.0 {
+        pct.clamp(55.0, 99.999)
+    } else {
+        95.0
+    }
+}
+
+fn default_anomark_run_suspect_percent() -> f64 {
+    95.0
+}
+
+/// Returns `(use_process_arm, use_file_arm)` for this dataset kind and run focus.
+fn run_detection_arms(kind: DatasetKind, focus: RunDetectionFocus) -> (bool, bool) {
+    let process = match focus {
+        RunDetectionFocus::Auto | RunDetectionFocus::ProcessOnly => {
+            matches!(kind, DatasetKind::Process | DatasetKind::Mixed)
+        }
+        RunDetectionFocus::FileOnly => matches!(kind, DatasetKind::Process),
+    };
+    let file = match focus {
+        RunDetectionFocus::Auto | RunDetectionFocus::FileOnly => {
+            matches!(kind, DatasetKind::File | DatasetKind::Mixed)
+        }
+        RunDetectionFocus::ProcessOnly => matches!(kind, DatasetKind::File),
+    };
+    (process, file)
+}
+
+fn dataset_tag_map_for_run(
+    datasets: &[DatasetRecord],
+    run_dataset_ids: &[String],
+) -> HashMap<String, Vec<String>> {
+    run_dataset_ids
+        .iter()
+        .filter_map(|rid| {
+            datasets
+                .iter()
+                .find(|d| &d.id == rid)
+                .map(|d| (d.id.clone(), d.tags.clone()))
+        })
+        .collect()
+}
+
+fn union_dataset_tags_for_ids(ids: &[String], ds_tags: &HashMap<String, Vec<String>>) -> Vec<String> {
+    let mut out: Vec<String> = ids
+        .iter()
+        .filter_map(|id| ds_tags.get(id))
+        .flatten()
+        .cloned()
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Dataset ingestion tags for a machine id in this run (`dataset_id/host` when multi-dataset).
+fn resolve_machine_dataset_tags_for_run(
+    machine_id: &str,
+    run_dataset_ids: &[String],
+    focus: RunDetectionFocus,
+    datasets: &[DatasetRecord],
+) -> Vec<String> {
+    let ds_tags = dataset_tag_map_for_run(datasets, run_dataset_ids);
+    if let Some((prefix, _rest)) = machine_id.split_once('/') {
+        if run_dataset_ids.iter().any(|id| id == prefix) {
+            return ds_tags.get(prefix).cloned().unwrap_or_default();
+        }
+    }
+    let process_ds_ids: Vec<&String> = run_dataset_ids
+        .iter()
+        .filter(|id| {
+            datasets
+                .iter()
+                .find(|d| &d.id == *id)
+                .map(|d| run_detection_arms(d.kind, focus).0)
+                .unwrap_or(false)
+        })
+        .collect();
+    let file_ds_ids: Vec<&String> = run_dataset_ids
+        .iter()
+        .filter(|id| {
+            datasets
+                .iter()
+                .find(|d| &d.id == *id)
+                .map(|d| run_detection_arms(d.kind, focus).1)
+                .unwrap_or(false)
+        })
+        .collect();
+
+    let picked: Vec<String> = if process_ds_ids.len() == 1 {
+        vec![process_ds_ids[0].clone()]
+    } else if process_ds_ids.is_empty() && file_ds_ids.len() == 1 {
+        vec![file_ds_ids[0].clone()]
+    } else if run_dataset_ids.len() == 1 {
+        vec![run_dataset_ids[0].clone()]
+    } else {
+        return union_dataset_tags_for_ids(run_dataset_ids, &ds_tags);
+    };
+    union_dataset_tags_for_ids(&picked, &ds_tags)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +215,79 @@ pub struct DatasetRecord {
     pub tags: Vec<String>,
     pub schema_profile: String,
     pub imported_at: String,
+    /// When set, JSONL/JSON rows without host fields use this instead of the source file stem
+    /// (e.g. parent-folder segment from `ironsift --ingest-parent-tag-field`).
+    #[serde(default)]
+    pub ingest_default_machine_id: Option<String>,
+}
+
+/// Group of reasons attributed to a single detector (e.g. `ironsift-process`, `anomark-rs`,
+/// `ironsift-file`). Lets the UI render reasons grouped by where they came from instead of one
+/// flat sorted blob.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DetectorReasons {
+    pub detector: String,
+    pub reasons: Vec<String>,
+}
+
+/// Analyst triage verdict for a single reason line or a host-level decision.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TriageVerdict {
+    #[default]
+    Unset,
+    FalsePositive,
+    Malicious,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReasonTriageEntry {
+    pub detector: String,
+    pub reason: String,
+    #[serde(default)]
+    pub verdict: TriageVerdict,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MachineTriageEntry {
+    pub machine_id: String,
+    #[serde(default)]
+    pub reason_decisions: Vec<ReasonTriageEntry>,
+    #[serde(default)]
+    pub final_verdict: TriageVerdict,
+}
+
+/// Saved analyst review for a detection run (per machine, per reason + final call).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RunUserTriage {
+    #[serde(default)]
+    pub machines: Vec<MachineTriageEntry>,
+}
+
+fn reason_excluded_from_per_reason_triage(reason: &str) -> bool {
+    reason.trim_start().starts_with("Process row:")
+}
+
+impl RunUserTriage {
+    /// Removes per-reason rows that are not meaningful to triage (e.g. raw `Process row: …` context).
+    pub fn without_excluded_reason_decisions(&self) -> RunUserTriage {
+        RunUserTriage {
+            machines: self
+                .machines
+                .iter()
+                .map(|m| MachineTriageEntry {
+                    machine_id: m.machine_id.clone(),
+                    reason_decisions: m
+                        .reason_decisions
+                        .iter()
+                        .filter(|e| !reason_excluded_from_per_reason_triage(&e.reason))
+                        .cloned()
+                        .collect(),
+                    final_verdict: m.final_verdict,
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,8 +295,20 @@ pub struct DetectionFinding {
     pub machine_id: String,
     pub severity: String,
     pub score: f64,
+    /// Flat list of every reason from every detector (sorted/deduped). Kept for backwards
+    /// compatibility with older runs in `db.json` and external consumers; new UIs should prefer
+    /// [`Self::reasons_by_detector`] for grouped rendering.
     pub reasons: Vec<String>,
     pub detectors: Vec<String>,
+    /// Dataset ingestion tags for the host’s source dataset(s) at run time (empty if unknown / legacy runs).
+    #[serde(default)]
+    pub dataset_tags: Vec<String>,
+    /// Reasons grouped per detector in the order they were emitted (within each bucket reasons are
+    /// deduped while preserving insertion order so high-level summaries stay above details).
+    /// Empty on legacy runs that pre-date this field; UIs should fall back to prefix heuristics on
+    /// [`Self::reasons`] in that case.
+    #[serde(default)]
+    pub reasons_by_detector: Vec<DetectorReasons>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +324,27 @@ pub struct DetectionRunRecord {
     #[serde(default)]
     pub candidate_finding_count: usize,
     pub summary: String,
+    /// SQLite [`DetectionConfig`] profile id used for this run (if known).
+    #[serde(default)]
+    pub detection_config_id: Option<String>,
+    /// Profile display name at run time (if known).
+    #[serde(default)]
+    pub detection_config_name: Option<String>,
+    /// How mixed datasets were analyzed for this run (`auto` if omitted in older saved runs).
+    #[serde(default)]
+    pub detection_focus: RunDetectionFocus,
+    /// Fleet vs AnoMark vs both (`both` if omitted in older saved runs).
+    #[serde(default)]
+    pub detector_mode: RunDetectorMode,
+    /// AnoMark suspect threshold actually used for this run (`95` if omitted in older saved runs).
+    #[serde(default = "default_anomark_run_suspect_percent")]
+    pub anomark_suspect_percent: f64,
+    /// Full run request parameters as sent to the server (empty on runs saved before this field existed).
+    #[serde(default)]
+    pub request: DetectionRunRequestSnapshot,
+    /// Analyst triage (false positive / malicious) per reason and final decision per machine.
+    #[serde(default)]
+    pub user_triage: RunUserTriage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -109,6 +378,8 @@ pub struct HoneycombCell {
     pub reasons: Vec<String>,
     #[serde(default)]
     pub detectors: Vec<String>,
+    #[serde(default)]
+    pub dataset_tags: Vec<String>,
 }
 
 fn honey_infected_default() -> bool {
@@ -144,6 +415,36 @@ pub struct PlatformStore {
     db: Arc<RwLock<PlatformDb>>,
 }
 
+/// When ingesting JSONL under a tree, add an automatic tag per file from the **immediate parent**
+/// directory name: split by `delimiter`, take the `field`-th segment (**1-based**, e.g. `4` for the
+/// fourth `-`-separated part of `RemoteAccess-…-HOSTEXAMPLE01-…`). The same segment is stored as
+/// [`DatasetRecord::ingest_default_machine_id`] so host-less log lines use it as `machine_id`.
+#[derive(Clone, Debug)]
+pub struct ParentDirTagRule {
+    pub field: usize,
+    pub delimiter: char,
+}
+
+/// Returns the `field`-th segment (1-based) of `parent_dir_name` split by `delimiter`, trimmed.
+pub fn parent_dir_segment_tag(parent_dir_name: &str, field: usize, delimiter: char) -> Option<String> {
+    if field < 1 {
+        return None;
+    }
+    let idx = field - 1;
+    let parts: Vec<&str> = parent_dir_name.split(delimiter).collect();
+    parts
+        .get(idx)
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn parent_dir_tag_from_path(path: &Path, rule: &ParentDirTagRule) -> Option<String> {
+    let parent = path.parent()?;
+    let name = parent.file_name()?.to_str()?;
+    parent_dir_segment_tag(name, rule.field, rule.delimiter)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateDatasetRequest {
     pub name: String,
@@ -153,6 +454,17 @@ pub struct CreateDatasetRequest {
     pub tags: Vec<String>,
     #[serde(default = "default_schema_profile")]
     pub schema_profile: String,
+    #[serde(default)]
+    pub ingest_default_machine_id: Option<String>,
+}
+
+/// Remove ingested SQLite rows from inspect (`DELETE` by primary key, scoped to dataset).
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeleteDatasetEventsRequest {
+    #[serde(default)]
+    pub process_ids: Vec<i64>,
+    #[serde(default)]
+    pub file_ids: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,6 +479,55 @@ pub struct CreateRunRequest {
     /// When set, score with this training job’s `model.bin` instead of `anomark.model_path`.
     #[serde(default)]
     pub anomark_train_id: Option<String>,
+    /// Suspect threshold as percent of ln(prior) for fleet AnoMark (55–99.999); lower = more sensitive.
+    #[serde(default = "default_anomark_run_suspect_percent")]
+    pub anomark_suspect_percent: f64,
+    /// Optional IronSift detection profile id (`events.db`); when omitted, uses the platform-selected profile.
+    #[serde(default)]
+    pub detection_config_id: Option<String>,
+    /// When datasets are [`DatasetKind::Mixed`], restrict this run to process-only or file-only analysis.
+    #[serde(default)]
+    pub detection_focus: RunDetectionFocus,
+    #[serde(default)]
+    pub detector_mode: RunDetectorMode,
+}
+
+/// Snapshot of the request body used to start a detection run (persisted for history / reproducibility).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct DetectionRunRequestSnapshot {
+    pub dataset_ids: Vec<String>,
+    pub baseline_tags: Vec<String>,
+    pub candidate_tags: Vec<String>,
+    pub enable_anomark: bool,
+    pub anomark_train_id: Option<String>,
+    #[serde(default = "default_anomark_run_suspect_percent")]
+    pub anomark_suspect_percent: f64,
+    pub detection_config_id: Option<String>,
+    pub detection_focus: RunDetectionFocus,
+    pub detector_mode: RunDetectorMode,
+}
+
+/// Create a named detection configuration profile in SQLite.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateDetectionConfigRequest {
+    pub name: String,
+    pub config: DetectionConfig,
+}
+
+/// Update a stored detection profile (name and/or JSON body).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateDetectionConfigRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub config: Option<DetectionConfig>,
+}
+
+/// Set which profile is used for new runs when `detection_config_id` is not passed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectDetectionConfigRequest {
+    pub id: String,
 }
 
 /// Which AnoMark model files exist on disk (for the Runs & Findings UI).
@@ -177,6 +538,8 @@ pub struct AnoMarkTrainingAvailability {
     /// Absolute path the server will use.
     pub model_path: String,
     pub available: bool,
+    #[serde(default)]
+    pub favorite: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,28 +551,12 @@ pub struct AnoMarkAvailability {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AutoPipelineRequest {
-    pub directory: String,
-    #[serde(default)]
-    pub baseline_tag: String,
-    #[serde(default)]
-    pub candidate_tag: String,
-    #[serde(default)]
-    pub enable_anomark: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AutoPipelineResult {
-    pub imported_dataset_ids: Vec<String>,
-    pub run_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnoMarkSettings {
     /// Ignored; AnoMark runs in-process via the `anomark` crate. Kept for older `db.json` files.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub bin_path: String,
     pub model_path: String,
+    /// JSON/CSV column name for the full command line per row (default `cmdline`, matching osquery `processes.cmdline`).
     pub column: String,
     pub machine_field: String,
 }
@@ -219,10 +566,48 @@ impl Default for AnoMarkSettings {
         Self {
             bin_path: String::new(),
             model_path: String::new(),
-            column: "command".to_string(),
+            column: "cmdline".to_string(),
             machine_field: "machine_id".to_string(),
         }
     }
+}
+
+fn sigma_rule_enabled_default() -> bool {
+    true
+}
+
+fn merge_inline_tags_into_rule(rule: &mut SigmaRule, inline: &[String]) {
+    for t in inline {
+        let tt = t.trim();
+        if tt.is_empty() {
+            continue;
+        }
+        if !rule
+            .tags
+            .iter()
+            .any(|x| x.eq_ignore_ascii_case(tt))
+        {
+            rule.tags.push(tt.to_string());
+        }
+    }
+}
+
+/// One Sigma rule stored in the platform database (`sigma_zero.rules_inline` in `db.json`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SigmaRuleInline {
+    /// Stable id for the UI (e.g. uuid).
+    pub id: String,
+    /// Optional short label in the UI (does not affect evaluation).
+    #[serde(default)]
+    pub title: String,
+    /// Full YAML for a single Sigma rule document.
+    pub yaml: String,
+    /// When false, the rule is kept on disk but not loaded for Sigma checks.
+    #[serde(default = "sigma_rule_enabled_default")]
+    pub enabled: bool,
+    /// UI / library tags; merged into the parsed rule’s `tags` for Sigma (and `filter_tags` on check).
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// Settings for [sigmazero](https://github.com/ping2A/sigmazero) (`sigma_zero` crate) against exported process logs
@@ -232,7 +617,8 @@ pub struct SigmaZeroSettings {
     /// Ignored; Sigma runs in-process via the `sigma_zero` crate. Kept for older `db.json` files.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub bin_path: String,
-    /// Directory of Sigma rule YAML files.
+    /// Directory of Sigma rule YAML files (used when no entry in [`Self::rules_inline`] is enabled with non-empty YAML, or `rules_inline` is empty).
+    #[serde(default)]
     pub rules_dir: String,
     /// Optional default `--field-map` (e.g. `ImagePath:process_name,CommandLine:command_line` for Windows rules).
     #[serde(default)]
@@ -240,6 +626,9 @@ pub struct SigmaZeroSettings {
     /// Optional default parallel worker count (`-w`).
     #[serde(default)]
     pub workers: Option<usize>,
+    /// Stored rules (enabled entries with YAML win over [`Self::rules_dir`]).
+    #[serde(default)]
+    pub rules_inline: Vec<SigmaRuleInline>,
 }
 
 impl Default for SigmaZeroSettings {
@@ -249,6 +638,7 @@ impl Default for SigmaZeroSettings {
             rules_dir: String::new(),
             field_map: String::new(),
             workers: None,
+            rules_inline: Vec::new(),
         }
     }
 }
@@ -275,8 +665,28 @@ pub struct SigmaZeroCheckRequest {
     pub filter_levels: Vec<String>,
     #[serde(default)]
     pub filter_rule_ids: Vec<String>,
+    /// When using stored `rules_inline`, restrict evaluation to these `SigmaRuleInline.id` values (non-empty = subset).
+    #[serde(default)]
+    pub inline_rule_ids: Vec<String>,
     #[serde(default)]
     pub workers: Option<usize>,
+}
+
+/// Throughput and timing for one Sigma check (helps validate that evaluation ran; Rust/Rayon can be very fast).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SigmaZeroEvaluationStats {
+    /// Rules after filters, compiled into the engine.
+    pub rules_compiled: usize,
+    /// JSONL lines successfully parsed as [`sigma_zero::models::LogEntry`].
+    pub log_entries_evaluated: usize,
+    /// Approximate scalar work: `rules_compiled × log_entries_evaluated` (sigmazero evaluates per rule × log in parallel for typical detections).
+    pub approx_scalar_checks: u64,
+    #[serde(default)]
+    pub engine_build_ms: u64,
+    #[serde(default)]
+    pub jsonl_parse_ms: u64,
+    #[serde(default)]
+    pub evaluate_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -284,13 +694,26 @@ pub struct SigmaZeroCheckResult {
     pub status: String,
     pub line_count: u64,
     pub source_dataset_ids: Vec<String>,
+    /// Directory path when rules were loaded from disk; empty when using [`Self::rules_source`] `database`.
+    #[serde(default)]
     pub rules_dir: String,
+    /// `database` | `directory` | `embedded-defaults` (bundled demo when nothing is saved).
+    #[serde(default)]
+    pub rules_source: String,
     pub rules_match_count: usize,
     /// Serialized [`sigma_zero::models::RuleMatch`] (one per detection).
     pub matches: Vec<serde_json::Value>,
     #[serde(default)]
     /// Reserved; in-process engine does not use stderr. Empty string.
     pub stderr: String,
+    /// For dataset-based checks: `ingested` (SQLite `processes`), `source_files` (original upload), or empty if `log_path` was used.
+    #[serde(default)]
+    pub process_log_source: String,
+    /// For dataset-based checks: same semantics as [`Self::process_log_source`] but for SQLite `"file"` / file inventory export.
+    #[serde(default)]
+    pub file_log_source: String,
+    #[serde(default)]
+    pub evaluation: SigmaZeroEvaluationStats,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -329,6 +752,18 @@ pub struct AnoMarkTrainRecord {
     pub rel_training_data_path: String,
     pub training_line_count: u64,
     pub bin_path_used: String,
+    /// User-pinned trainings sort first in list and model pickers.
+    #[serde(default)]
+    pub favorite: bool,
+}
+
+fn cmp_anomark_train_record_display(a: &AnoMarkTrainRecord, b: &AnoMarkTrainRecord) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a.favorite, b.favorite) {
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        _ => b.created_at.cmp(&a.created_at),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -341,6 +776,165 @@ pub struct AnoMarkTrainResult {
     pub record: AnoMarkTrainRecord,
 }
 
+/// Loaded Markov model stats plus optional provenance when the file came from an IronSift training job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnoMarkModelInspection {
+    pub model_path: String,
+    pub file_size_bytes: u64,
+    pub order: usize,
+    pub is_trained: bool,
+    pub prior: f64,
+    pub num_contexts: usize,
+    pub num_transitions: usize,
+    pub alphabet_len: usize,
+    pub raw_markov_entries: usize,
+    /// Same rule as detection runs: suspect if command score is below this (95% of prior ln).
+    pub suspect_threshold_ln: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub where_generated: Option<AnoMarkWhereGenerated>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub config_origin_note: String,
+}
+
+/// CLI-friendly summary returned by [`PlatformStore::test_anomark_cli`].
+#[derive(Debug, Clone, Serialize)]
+pub struct AnoMarkTestResult {
+    pub model_path: String,
+    /// `"platform"`, `"training"`, or `"explicit-path"` depending on how the model was resolved.
+    pub model_source: String,
+    pub model_order: usize,
+    pub model_prior_ln: f64,
+    /// Percent of `ln(prior)` actually used as suspect threshold (clamped to AnoMark range).
+    pub suspect_percent_used: f64,
+    pub suspect_threshold_ln: f64,
+    /// Present when the caller asked to score one command line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_score: Option<AnoMarkCommandScore>,
+    /// Per-dataset suspect-command ratios for the selected ingested process datasets.
+    #[serde(default)]
+    pub datasets: Vec<AnoMarkTestDatasetSummary>,
+    /// Datasets that matched ids/tags but were skipped (e.g. `kind=file`).
+    #[serde(default)]
+    pub datasets_skipped: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AnoMarkTestDatasetSummary {
+    pub dataset_id: String,
+    pub dataset_name: String,
+    pub commands_scored: u64,
+    pub suspect_commands: u64,
+    pub host_stats: Vec<AnoMarkTestDatasetHostStat>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AnoMarkTestDatasetHostStat {
+    pub host: String,
+    pub commands: u64,
+    pub suspect: u64,
+    pub ratio: f64,
+}
+
+fn score_one_command_against_model(
+    model_path: &Path,
+    source: &str,
+    train_id: Option<String>,
+    command: &str,
+    machine_name: Option<&str>,
+    suspect_percent: f64,
+) -> Result<AnoMarkCommandScore, Box<dyn Error>> {
+    const MAX_CMD: usize = 32 * 1024;
+    if command.len() > MAX_CMD {
+        return Err(format!("command exceeds {} characters", MAX_CMD).into());
+    }
+    let trimmed = command.trim();
+    let machine_trim = machine_name
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("");
+    let scored_line = anomark_score_line(machine_trim, trimmed);
+    if scored_line.is_empty() {
+        return Err("command is empty".into());
+    }
+    if scored_line.len() > MAX_CMD {
+        return Err(format!("scored line exceeds {} characters", MAX_CMD).into());
+    }
+    if !model_path.is_file() {
+        return Err(format!("model file not found: {}", model_path.display()).into());
+    }
+    let path_str = model_path
+        .to_str()
+        .ok_or("model path is not valid UTF-8")?;
+    let mut model =
+        ModelHandler::load_model(path_str).map_err(|e: anyhow::Error| e.to_string())?;
+    if !model.is_trained() {
+        model.normalize_model_and_compute_prior();
+    }
+    let pct = clamp_anomark_suspect_percent(suspect_percent);
+    let threshold_ln = ModelHandler::compute_threshold(&model, pct);
+    let padded = format!("{}{}", "~".repeat(model.order), scored_line);
+    let log_likelihood = model.log_likelihood(&padded);
+    let is_suspect = ModelHandler::is_suspect_command(log_likelihood, threshold_ln);
+    let margin_ln = log_likelihood - threshold_ln;
+    let canonical = model_path
+        .canonicalize()
+        .unwrap_or_else(|_| model_path.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    Ok(AnoMarkCommandScore {
+        model_path: canonical,
+        source: source.to_string(),
+        train_id,
+        order: model.order,
+        log_likelihood,
+        suspect_threshold_ln: threshold_ln,
+        is_suspect,
+        margin_ln,
+        suspect_percent_used: pct,
+        line_scored: scored_line,
+    })
+}
+
+/// Score a single command line against an AnoMark model (same suspect rule as fleet scoring).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnoMarkCommandScore {
+    pub model_path: String,
+    /// `"platform"` = path from settings; `"training"` = saved training `model.bin`.
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub train_id: Option<String>,
+    pub order: usize,
+    pub log_likelihood: f64,
+    pub suspect_threshold_ln: f64,
+    pub is_suspect: bool,
+    /// `log_likelihood - suspect_threshold_ln` — negative means flagged at [`Self::suspect_percent_used`].
+    pub margin_ln: f64,
+    /// Percent of `ln(prior)` used as threshold (same semantics as [`ModelHandler::compute_threshold`]).
+    pub suspect_percent_used: f64,
+    /// Exact UTF-8 string scored by the Markov model (`machine cmd…` when host is known).
+    #[serde(default)]
+    pub line_scored: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnoMarkWhereGenerated {
+    pub train_id: String,
+    pub generated_at: String,
+    pub generation_engine: String,
+    /// Absolute path to the platform data directory (contains `anomark-trains/`).
+    pub platform_data_directory: String,
+    pub model_file_relative: String,
+    pub training_input_relative: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub optional_output_copy_path: String,
+    /// Short human summary of training input (file path vs dataset ids).
+    pub source_label: String,
+    pub training_line_count: u64,
+    pub request: AnoMarkTrainRequest,
+    pub source_dataset_ids: Vec<String>,
+    pub from_user_file: bool,
+}
+
 struct AnoMarkTrainingInputMeta {
     from_user_file: bool,
     source_dataset_ids: Vec<String>,
@@ -349,7 +943,7 @@ struct AnoMarkTrainingInputMeta {
 }
 
 fn default_anomark_column() -> String {
-    "command".to_string()
+    "cmdline".to_string()
 }
 
 fn default_anomark_order() -> u8 {
@@ -362,17 +956,37 @@ fn default_schema_profile() -> String {
 
 impl PlatformStore {
     pub fn load_or_create(db_path: &str) -> Result<Self, Box<dyn Error>> {
-        let db = if Path::new(db_path).exists() {
+        let db_file = Path::new(db_path);
+        let parent = db_file.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        let sql_path = parent.join("events.db").to_string_lossy().into_owned();
+        let mut db = if db_file.exists() {
             let content = fs::read_to_string(db_path)?;
             serde_json::from_str::<PlatformDb>(&content)?
         } else {
             PlatformDb::default()
         };
+        let event_db = EventDb::new(&sql_path)?;
+        let legacy = db_file.exists().then(|| db.run_config.clone());
+        event_db.ensure_detection_configs_initialized(legacy)?;
+        if let Ok(Some(cfg)) = event_db.get_selected_detection_config() {
+            db.run_config = cfg;
+        }
         Ok(Self {
             db_path: db_path.to_string(),
-            sql_path: ".ironsift-platform/events.db".to_string(),
+            sql_path,
             db: Arc::new(RwLock::new(db)),
         })
+    }
+
+    /// Path to the platform metadata JSON (e.g. `db.json`).
+    pub fn db_json_path(&self) -> &str {
+        &self.db_path
+    }
+
+    /// Path to the SQLite database for ingested events (`events.db`, alongside `db.json`).
+    pub fn events_sqlite_path(&self) -> &str {
+        &self.sql_path
     }
 
     fn save(&self) -> Result<(), Box<dyn Error>> {
@@ -403,7 +1017,7 @@ impl PlatformStore {
         let config_path = cfg.model_path.trim().to_string();
         let config_available = !config_path.is_empty() && Path::new(&config_path).is_file();
         let mut list = self.list_anomark_trainings();
-        list.reverse();
+        list.sort_by(cmp_anomark_train_record_display);
         let mut trainings: Vec<AnoMarkTrainingAvailability> = Vec::new();
         for t in list {
             let model_path = self
@@ -411,11 +1025,13 @@ impl PlatformStore {
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
             let available = !model_path.is_empty() && Path::new(&model_path).is_file();
+            let favorite = t.favorite;
             trainings.push(AnoMarkTrainingAvailability {
                 id: t.id,
                 created_at: t.created_at,
                 model_path,
                 available,
+                favorite,
             });
         }
         let any_available = config_available || trainings.iter().any(|x| x.available);
@@ -424,6 +1040,21 @@ impl PlatformStore {
             config_available,
             trainings,
             any_available,
+        }
+    }
+
+    /// Resolve a configured model path: absolute file, or relative to the platform data directory.
+    fn resolve_anomark_model_path(&self, trimmed: &str) -> Option<PathBuf> {
+        let path = Path::new(trimmed);
+        if path.is_file() {
+            return Some(path.to_path_buf());
+        }
+        let root = self.platform_root().ok()?;
+        let joined = root.join(trimmed);
+        if joined.is_file() {
+            Some(joined)
+        } else {
+            None
         }
     }
 
@@ -440,10 +1071,17 @@ impl PlatformStore {
                     if p.is_file() {
                         s.model_path = p.to_string_lossy().to_string();
                     } else {
-                        return None;
+                        log::warn!(
+                            "AnoMark: training '{}' model file missing at {:?}; using platform model path",
+                            t,
+                            p
+                        );
                     }
                 } else {
-                    return None;
+                    log::warn!(
+                        "AnoMark: unknown training id '{}'; using platform model path",
+                        t
+                    );
                 }
             }
         }
@@ -451,21 +1089,149 @@ impl PlatformStore {
         if p.is_empty() {
             return None;
         }
-        if !Path::new(p).is_file() {
-            return None;
-        }
-        s.model_path = p.to_string();
+        let resolved = self.resolve_anomark_model_path(p)?;
+        s.model_path = resolved.to_string_lossy().to_string();
         Some(s)
     }
 
     pub fn get_run_config(&self) -> DetectionConfig {
-        self.db.read().run_config.clone()
+        EventDb::new(&self.sql_path)
+            .ok()
+            .and_then(|edb| edb.get_selected_detection_config().ok().flatten())
+            .unwrap_or_else(|| self.db.read().run_config.clone())
+    }
+
+    /// Selected profile JSON, profile list, and selected id (SQLite-backed).
+    pub fn run_config_with_profiles(
+        &self,
+    ) -> Result<(DetectionConfig, Vec<DetectionConfigProfileMeta>, Option<String>), Box<dyn Error>>
+    {
+        let edb = EventDb::new(&self.sql_path)?;
+        edb.ensure_detection_configs_initialized(None)?;
+        let profiles = edb.list_detection_config_profiles()?;
+        let selected_id = edb.get_selected_detection_config_id()?;
+        let cfg = edb
+            .get_selected_detection_config()?
+            .unwrap_or_else(|| self.db.read().run_config.clone());
+        Ok((cfg, profiles, selected_id))
+    }
+
+    pub fn get_detection_config_profile_detail(
+        &self,
+        id: &str,
+    ) -> Result<(DetectionConfigProfileMeta, DetectionConfig), Box<dyn Error>> {
+        let edb = EventDb::new(&self.sql_path)?;
+        let profiles = edb.list_detection_config_profiles()?;
+        let meta = profiles
+            .into_iter()
+            .find(|m| m.id == id)
+            .ok_or_else(|| -> Box<dyn Error> { "detection config not found".into() })?;
+        let cfg = edb
+            .get_detection_config_by_id(id)?
+            .ok_or_else(|| -> Box<dyn Error> { "detection config not found".into() })?;
+        Ok((meta, cfg))
+    }
+
+    pub fn create_detection_config_profile(
+        &self,
+        req: CreateDetectionConfigRequest,
+    ) -> Result<(String, DetectionConfigProfileMeta), Box<dyn Error>> {
+        let edb = EventDb::new(&self.sql_path)?;
+        edb.ensure_detection_configs_initialized(None)?;
+        let name = req.name.trim();
+        if name.is_empty() {
+            return Err("profile name is required".into());
+        }
+        let id = edb.insert_detection_config(name, &req.config)?;
+        let profiles = edb.list_detection_config_profiles()?;
+        let meta = profiles
+            .into_iter()
+            .find(|m| m.id == id)
+            .ok_or_else(|| -> Box<dyn Error> { "failed to load new profile".into() })?;
+        Ok((id, meta))
+    }
+
+    pub fn update_detection_config_profile(
+        &self,
+        id: &str,
+        req: UpdateDetectionConfigRequest,
+    ) -> Result<(), Box<dyn Error>> {
+        let edb = EventDb::new(&self.sql_path)?;
+        if let Some(ref n) = req.name {
+            if n.trim().is_empty() {
+                return Err("profile name cannot be empty".into());
+            }
+        }
+        let name = req.name.as_ref().map(|s| s.trim().as_ref());
+        if req.name.is_none() && req.config.is_none() {
+            return Err("nothing to update (provide name and/or config)".into());
+        }
+        edb.update_detection_config_row(id, name, req.config.as_ref())?;
+        if edb.get_selected_detection_config_id()?.as_deref() == Some(id) {
+            if let Some(cfg) = edb.get_selected_detection_config()? {
+                self.db.write().run_config = cfg;
+                self.save()?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn delete_detection_config_profile(&self, id: &str) -> Result<(), Box<dyn Error>> {
+        let edb = EventDb::new(&self.sql_path)?;
+        edb.delete_detection_config_row(id)?;
+        if let Ok(Some(cfg)) = edb.get_selected_detection_config() {
+            self.db.write().run_config = cfg;
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    pub fn select_detection_config_profile(&self, id: &str) -> Result<(), Box<dyn Error>> {
+        let edb = EventDb::new(&self.sql_path)?;
+        edb.set_selected_detection_config_id(id)?;
+        if let Some(cfg) = edb.get_selected_detection_config()? {
+            self.db.write().run_config = cfg;
+            self.save()?;
+        }
+        Ok(())
     }
 
     pub fn set_run_config(&self, cfg: DetectionConfig) -> Result<DetectionConfig, Box<dyn Error>> {
+        let edb = EventDb::new(&self.sql_path)?;
+        edb.ensure_detection_configs_initialized(Some(cfg.clone()))?;
+        edb.update_selected_detection_config_json(&cfg)?;
         self.db.write().run_config = cfg.clone();
         self.save()?;
         Ok(cfg)
+    }
+
+    fn resolve_detection_config_for_run(
+        &self,
+        req: &CreateRunRequest,
+    ) -> Result<(DetectionConfig, Option<String>, Option<String>), Box<dyn Error>> {
+        let edb = EventDb::new(&self.sql_path)?;
+        let tid = req
+            .detection_config_id
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty());
+        if let Some(id) = tid {
+            return match edb.get_detection_config_by_id(id)? {
+                Some(cfg) => {
+                    let name = edb.get_detection_config_name(id)?;
+                    Ok((cfg, Some(id.to_string()), name))
+                }
+                None => Err(format!("detection config not found: {}", id).into()),
+            };
+        }
+        let cfg = edb
+            .get_selected_detection_config()?
+            .unwrap_or_else(|| self.db.read().run_config.clone());
+        let sid = edb.get_selected_detection_config_id()?;
+        let name = sid
+            .as_ref()
+            .and_then(|i| edb.get_detection_config_name(i).ok().flatten());
+        Ok((cfg, sid, name))
     }
 
     pub fn set_anomark_settings(
@@ -490,36 +1256,133 @@ impl PlatformStore {
         Ok(settings)
     }
 
+    /// Starter Sigma rules for the UI (not persisted until the user saves config).
+    pub fn default_sigma_rule_templates() -> Vec<SigmaRuleInline> {
+        const DEMO: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/sigma_demo_recon.yml"
+        ));
+        const FILE_DEMO: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/sigma_demo_suspicious_file.yml"
+        ));
+        vec![
+            SigmaRuleInline {
+                id: "ironsift-demo-recon-keywords".to_string(),
+                title: "Demo — recon keywords".to_string(),
+                yaml: DEMO.trim().to_string(),
+                enabled: true,
+                tags: vec!["demo".to_string(), "library".to_string()],
+            },
+            SigmaRuleInline {
+                id: "ironsift-suspicious-file-paths".to_string(),
+                title: "Demo — suspicious file paths".to_string(),
+                yaml: FILE_DEMO.trim().to_string(),
+                enabled: true,
+                tags: vec!["demo".to_string(), "library".to_string()],
+            },
+        ]
+    }
+
+    fn parse_stored_sigma_rules(entries: &[SigmaRuleInline]) -> Result<Vec<SigmaRule>, Box<dyn Error>> {
+        const MAX_RULES: usize = 64;
+        const MAX_YAML_PER_RULE: usize = 256 * 1024;
+        if entries.len() > MAX_RULES {
+            return Err(format!("too many stored Sigma rules (max {})", MAX_RULES).into());
+        }
+        let mut out = Vec::new();
+        for (i, e) in entries.iter().enumerate() {
+            if !e.enabled {
+                continue;
+            }
+            let y = e.yaml.trim();
+            if y.is_empty() {
+                continue;
+            }
+            if y.len() > MAX_YAML_PER_RULE {
+                return Err(format!(
+                    "Sigma rule #{} exceeds max size ({} bytes)",
+                    i + 1,
+                    MAX_YAML_PER_RULE
+                )
+                .into());
+            }
+            let mut rule: SigmaRule = serde_yaml::from_str(y).map_err(|err| {
+                format!(
+                    "invalid YAML in stored Sigma rule #{} ({}): {}",
+                    i + 1,
+                    e.id,
+                    err
+                )
+            })?;
+            merge_inline_tags_into_rule(&mut rule, &e.tags);
+            out.push(rule);
+        }
+        if out.is_empty() {
+            let has_nonempty_yaml = entries
+                .iter()
+                .any(|e| !e.yaml.trim().is_empty());
+            let has_enabled_with_yaml = entries
+                .iter()
+                .any(|e| e.enabled && !e.yaml.trim().is_empty());
+            return Err(
+                if has_nonempty_yaml && !has_enabled_with_yaml {
+                    "no enabled Sigma rules: turn on \"Use in checks\" for at least one rule with YAML, or remove stored rules to use rules_dir"
+                } else {
+                    "no Sigma rules to evaluate (enable at least one rule with non-empty YAML, or use rules_dir)"
+                }
+                .into(),
+            );
+        }
+        Ok(out)
+    }
+
     /// Run [sigmazero](https://github.com/ping2A/sigmazero) on a log file or exported process datasets.
     pub fn check_sigma_zero(
         &self,
         req: SigmaZeroCheckRequest,
     ) -> Result<SigmaZeroCheckResult, Box<dyn Error>> {
         let st = self.get_sigma_zero_settings();
-        let rules_dir: String = if let Some(r) = &req.rules_dir {
-            r.trim()
-        } else {
-            st.rules_dir.trim()
-        }
-        .to_string();
-        if rules_dir.is_empty() {
-            return Err(
-                "rules_dir not set: set sigma_zero.rules_dir in the API/DB, or pass rules_dir in the request (directory of Sigma .yml rules)"
-                    .into(),
-            );
-        }
-        let rpath = Path::new(&rules_dir);
-        if !rpath.is_dir() {
-            return Err(format!("Sigma rules_dir is not a directory: {}", rules_dir).into());
-        }
-        let (log_path, source_ids, cleanup_log, line_count) =
+        let has_enabled_inline = st
+            .rules_inline
+            .iter()
+            .any(|e| e.enabled && !e.yaml.trim().is_empty());
+
+        tracing::info!(
+            target: "ironsift::sigma",
+            log_path_set = !req.log_path.trim().is_empty(),
+            dataset_ids = req.dataset_ids.len(),
+            tags = req.tags.len(),
+            inline_rule_ids = req.inline_rule_ids.len(),
+            filter_tags = req.filter_tags.len(),
+            filter_levels = req.filter_levels.len(),
+            filter_rule_ids = req.filter_rule_ids.len(),
+            has_enabled_inline_rules = has_enabled_inline,
+            stored_rules_inline_count = st.rules_inline.len(),
+            rules_dir_config_nonempty = !st.rules_dir.trim().is_empty(),
+            "Sigma check: request received"
+        );
+
+        let (log_path, source_ids, cleanup_log, line_count, process_log_source, file_log_source) =
             if !req.log_path.trim().is_empty() {
                 let p = Path::new(req.log_path.trim());
                 if !p.is_file() {
+                    tracing::warn!(
+                        target: "ironsift::sigma",
+                        path = %req.log_path.trim(),
+                        "Sigma check failed: log_path is not a file"
+                    );
                     return Err(format!("log_path is not a file: {}", req.log_path).into());
                 }
                 let n = Self::count_file_lines(p)?;
-                (p.to_path_buf(), vec![], false, n)
+                (
+                    p.to_path_buf(),
+                    vec![],
+                    false,
+                    n,
+                    "log_file".to_string(),
+                    String::new(),
+                )
             } else {
                 let db = self.db.read();
                 let mut selected: Vec<DatasetRecord> = db.datasets.clone();
@@ -529,36 +1392,137 @@ impl PlatformStore {
                 if !req.tags.is_empty() {
                     selected.retain(|d| d.tags.iter().any(|t| req.tags.iter().any(|rt| rt == t)));
                 }
-                selected.retain(|d| d.kind == DatasetKind::Process);
+                selected.retain(|d| {
+                    matches!(
+                        d.kind,
+                        DatasetKind::Process | DatasetKind::Mixed | DatasetKind::File
+                    )
+                });
                 if selected.is_empty() {
+                    tracing::warn!(
+                        target: "ironsift::sigma",
+                        "Sigma check failed: no datasets match (need log_path or dataset_ids/tags → process, file, or mixed datasets)"
+                    );
                     return Err(
-                        "no process datasets selected (set log_path, or dataset_ids / tags for process datasets)"
+                        "no datasets selected (set log_path, or dataset_ids / tags for process, file, or mixed datasets)"
                             .into(),
                     );
                 }
-                for ds in &selected {
-                    let p = Path::new(&ds.source_path);
-                    if !p.is_file() {
-                        return Err(format!(
-                            "dataset {} source file is missing: {}",
-                            ds.id, ds.source_path
-                        )
-                        .into());
-                    }
-                }
                 let source_ids: Vec<String> = selected.iter().map(|d| d.id.clone()).collect();
-                let sources: Vec<(String, String)> = selected
-                    .iter()
-                    .map(|d| (d.source_path.clone(), d.format.clone()))
-                    .collect();
                 drop(db);
                 let tmp = std::env::temp_dir().join(format!("ironsift-sigma-in-{}.jsonl", Uuid::new_v4()));
-                let n = export_process_sources_to_sigma_jsonl(&sources, &tmp)?;
-                if n == 0 {
-                    return Err("exported zero process lines; nothing for Sigma to evaluate".into());
+                let edb = EventDb::new(&self.sql_path)?;
+                let mut out = std::fs::File::create(&tmp)?;
+                let mut total_lines: u64 = 0;
+                let mut proc_any_sqlite = false;
+                let mut proc_any_source_file = false;
+                let mut file_any_sqlite = false;
+                let mut file_any_source_file = false;
+                for ds in &selected {
+                    if matches!(ds.kind, DatasetKind::Process | DatasetKind::Mixed) {
+                        let (n, used_sqlite, used_file) =
+                            edb.append_sigma_process_lines_for_dataset(ds, &mut out)?;
+                        total_lines += n;
+                        proc_any_sqlite |= used_sqlite;
+                        proc_any_source_file |= used_file;
+                        if n == 0 && ds.kind == DatasetKind::Process {
+                            let p = Path::new(&ds.source_path);
+                            if !p.is_file() {
+                                tracing::warn!(
+                                    target: "ironsift::sigma",
+                                    dataset_id = %ds.id,
+                                    source_path = %ds.source_path,
+                                    "Sigma check failed: no process SQLite rows and source file missing"
+                                );
+                                return Err(format!(
+                                    "dataset {} has no ingested process rows in the event database and the original file is missing: {}",
+                                    ds.id, ds.source_path
+                                )
+                                .into());
+                            }
+                        }
+                    }
+                    if matches!(ds.kind, DatasetKind::File | DatasetKind::Mixed) {
+                        let (n, used_sqlite, used_file) =
+                            edb.append_sigma_file_lines_for_dataset(ds, &mut out)?;
+                        total_lines += n;
+                        file_any_sqlite |= used_sqlite;
+                        file_any_source_file |= used_file;
+                        if n == 0 && ds.kind == DatasetKind::File {
+                            let p = Path::new(&ds.source_path);
+                            if !p.is_file() {
+                                tracing::warn!(
+                                    target: "ironsift::sigma",
+                                    dataset_id = %ds.id,
+                                    source_path = %ds.source_path,
+                                    "Sigma check failed: no file SQLite rows and source file missing"
+                                );
+                                return Err(format!(
+                                    "dataset {} has no ingested file rows in the event database and the original file is missing: {}",
+                                    ds.id, ds.source_path
+                                )
+                                .into());
+                            }
+                        }
+                    }
                 }
-                (tmp, source_ids, true, n)
+                if total_lines == 0 {
+                    tracing::warn!(
+                        target: "ironsift::sigma",
+                        dataset_ids = %source_ids.join(","),
+                        "Sigma check failed: exported zero events from SQLite and source files"
+                    );
+                    return Err(format!(
+                        "exported zero events for dataset id(s): {}. \
+                         Ingest data (Ingestion tab), insert test rows under Inspect, or ensure source files contain parseable process and/or file inventory JSON/JSONL/CSV.",
+                        source_ids.join(", ")
+                    )
+                    .into());
+                }
+                let process_log_source =
+                    if proc_any_sqlite || proc_any_source_file {
+                        if proc_any_sqlite && !proc_any_source_file {
+                            "ingested".to_string()
+                        } else if !proc_any_sqlite && proc_any_source_file {
+                            "source_files".to_string()
+                        } else {
+                            "merged_sqlite_source".to_string()
+                        }
+                    } else {
+                        String::new()
+                    };
+                let file_log_source =
+                    if file_any_sqlite || file_any_source_file {
+                        if file_any_sqlite && !file_any_source_file {
+                            "ingested".to_string()
+                        } else if !file_any_sqlite && file_any_source_file {
+                            "source_files".to_string()
+                        } else {
+                            "merged_sqlite_source".to_string()
+                        }
+                    } else {
+                        String::new()
+                    };
+                (
+                    tmp,
+                    source_ids,
+                    true,
+                    total_lines,
+                    process_log_source,
+                    file_log_source,
+                )
             };
+
+        tracing::info!(
+            target: "ironsift::sigma",
+            process_log_source = %process_log_source,
+            file_log_source = %file_log_source,
+            source_dataset_ids = ?source_ids,
+            line_count_dataset_or_file = line_count,
+            cleanup_temp_log = cleanup_log,
+            log_path = %log_path.display(),
+            "Sigma check: exported/fixed log path"
+        );
 
         let field_map: String = req
             .field_map
@@ -576,8 +1540,96 @@ impl PlatformStore {
             .unwrap_or_default();
         let workers: Option<usize> = req.workers.or(st.workers);
 
-        let all_rules = load_rules_from_directory(Path::new(&rules_dir))
-            .map_err(|e: anyhow::Error| -> Box<dyn Error> { e.to_string().into() })?;
+        let rules_dir_override: String = req
+            .rules_dir
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| st.rules_dir.trim().to_string());
+
+        let apply_inline_rule_ids = |mut base: Vec<SigmaRuleInline>| -> Result<Vec<SigmaRuleInline>, Box<dyn Error>> {
+            if !req.inline_rule_ids.is_empty() {
+                let allow: HashSet<String> = req
+                    .inline_rule_ids
+                    .iter()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                base.retain(|e| allow.contains(&e.id));
+                if base.is_empty() {
+                    tracing::warn!(
+                        target: "ironsift::sigma",
+                        requested = ?req.inline_rule_ids,
+                        "Sigma check failed: inline_rule_ids matched no stored rules"
+                    );
+                    return Err(
+                        "no rules match inline_rule_ids (check which rules are selected for this run; bundled demo ids include ironsift-demo-recon-keywords and ironsift-suspicious-file-paths)"
+                            .into(),
+                    );
+                }
+            }
+            Ok(base)
+        };
+
+        // If the UI shows the demo but the user never saved, `rules_inline` in db.json is still
+        // empty — use the same embedded YAML as GET /api/sigma-zero/rule-templates.
+        let (all_rules, rules_dir_out, rules_source) = if has_enabled_inline {
+            let inline_for_parse = apply_inline_rule_ids(st.rules_inline.clone())?;
+            let parsed = Self::parse_stored_sigma_rules(&inline_for_parse).map_err(|e| {
+                tracing::warn!(
+                    target: "ironsift::sigma",
+                    error = %e,
+                    "Sigma check failed: parse stored Sigma rules (YAML)"
+                );
+                e
+            })?;
+            (parsed, String::new(), "database".to_string())
+        } else if !rules_dir_override.is_empty() {
+            let rpath = Path::new(&rules_dir_override);
+            if !rpath.is_dir() {
+                tracing::warn!(
+                    target: "ironsift::sigma",
+                    rules_dir = %rules_dir_override,
+                    "Sigma check failed: rules_dir is not a directory"
+                );
+                return Err(format!("Sigma rules_dir is not a directory: {}", rules_dir_override).into());
+            }
+            let all_rules = load_rules_from_directory(rpath).map_err(|e: anyhow::Error| -> Box<dyn Error> {
+                tracing::warn!(
+                    target: "ironsift::sigma",
+                    rules_dir = %rules_dir_override,
+                    error = %e,
+                    "Sigma check failed: load_rules_from_directory"
+                );
+                e.to_string().into()
+            })?;
+            (all_rules, rules_dir_override, "directory".to_string())
+        } else if st.rules_inline.is_empty() {
+            let inline_for_parse =
+                apply_inline_rule_ids(Self::default_sigma_rule_templates())?;
+            let parsed = Self::parse_stored_sigma_rules(&inline_for_parse).map_err(|e| {
+                tracing::warn!(
+                    target: "ironsift::sigma",
+                    error = %e,
+                    "Sigma check failed: parse embedded-default Sigma rules"
+                );
+                e
+            })?;
+            (parsed, String::new(), "embedded-defaults".to_string())
+        } else {
+            tracing::warn!(
+                target: "ironsift::sigma",
+                stored_inline_entries = st.rules_inline.len(),
+                "Sigma check failed: stored rules present but none enabled with YAML — cannot fall back"
+            );
+            return Err(
+                "no enabled Sigma rules: turn on \"Use in checks\" for at least one stored rule, set rules_dir to a directory of .yml files, or clear stored rules to use the bundled demo"
+                    .into(),
+            );
+        };
+
+        let rules_before_filters = all_rules.len();
         let filtered = filter_rules(
             all_rules,
             &req.filter_tags,
@@ -585,45 +1637,142 @@ impl PlatformStore {
             &req.filter_rule_ids,
         );
         let count_loaded = filtered.len();
+
+        tracing::info!(
+            target: "ironsift::sigma",
+            rules_source = %rules_source,
+            rules_dir = %rules_dir_out,
+            rules_before_filters,
+            rules_after_filters = count_loaded,
+            field_map_nonempty = !field_map.is_empty(),
+            workers = ?workers,
+            "Sigma check: rules loaded and filtered"
+        );
+
         if count_loaded == 0 {
+            tracing::warn!(
+                target: "ironsift::sigma",
+                filter_tags = ?req.filter_tags,
+                filter_levels = ?req.filter_levels,
+                filter_rule_ids = ?req.filter_rule_ids,
+                "Sigma check failed: zero rules after tag/level/id filters"
+            );
             if cleanup_log {
                 let _ = fs::remove_file(&log_path);
             }
             return Err(
-                "no Sigma rules to evaluate after tag/level/id filters (check your rules_dir and filters)"
+                "no Sigma rules to evaluate after tag/level/id filters (check stored rules, rules_dir, or filters)"
                     .into(),
             );
         }
 
+        let rules_compiled = count_loaded;
+        let t_engine = Instant::now();
         let mut engine = SigmaEngine::new(workers);
         if !field_map.is_empty() {
             engine.set_field_map(parse_sigma_field_map(&field_map));
         }
         let _n = engine
             .load_rules_from_rules(filtered)
-            .map_err(|e: anyhow::Error| -> Box<dyn Error> { e.to_string().into() })?;
+            .map_err(|e: anyhow::Error| -> Box<dyn Error> {
+                tracing::warn!(
+                    target: "ironsift::sigma",
+                    error = %e,
+                    "Sigma check failed: engine.load_rules_from_rules"
+                );
+                e.to_string().into()
+            })?;
+        let engine_build_ms = t_engine.elapsed().as_millis() as u64;
 
-        let log_text = fs::read_to_string(&log_path)
-            .map_err(|e| -> Box<dyn Error> { e.to_string().into() })?;
+        let t_parse = Instant::now();
+        let file = fs::File::open(&log_path).map_err(|e| -> Box<dyn Error> {
+            tracing::warn!(
+                target: "ironsift::sigma",
+                path = %log_path.display(),
+                error = %e,
+                "Sigma check failed: open log file"
+            );
+            e.to_string().into()
+        })?;
+        // Large buffer reduces syscall overhead when scanning multi‑GB NDJSON exports.
+        const SIGMA_JSONL_BUF_CAP: usize = 1024 * 1024;
+        let mut reader = BufReader::with_capacity(SIGMA_JSONL_BUF_CAP, file);
         let mut entries: Vec<LogEntry> = Vec::new();
-        for line in log_text.lines() {
-            let t = line.trim();
+        if line_count > 0 {
+            if let Ok(cap) = usize::try_from(line_count) {
+                entries.reserve(cap.min(50_000_000));
+            }
+        }
+        let mut non_empty_lines = 0usize;
+        let mut json_parse_failures = 0usize;
+        let mut line_buf = String::new();
+        loop {
+            line_buf.clear();
+            let n = reader.read_line(&mut line_buf).map_err(|e| -> Box<dyn Error> {
+                tracing::warn!(
+                    target: "ironsift::sigma",
+                    path = %log_path.display(),
+                    error = %e,
+                    "Sigma check failed: read log file"
+                );
+                e.to_string().into()
+            })?;
+            if n == 0 {
+                break;
+            }
+            let t = line_buf.trim();
             if t.is_empty() {
                 continue;
             }
+            non_empty_lines += 1;
             if let Ok(e) = serde_json::from_str::<LogEntry>(t) {
                 entries.push(e);
+            } else {
+                json_parse_failures += 1;
             }
         }
+        let jsonl_parse_ms = t_parse.elapsed().as_millis() as u64;
+
+        tracing::info!(
+            target: "ironsift::sigma",
+            parsed_log_entries = entries.len(),
+            non_empty_jsonl_lines = non_empty_lines,
+            json_lines_failed_parse = json_parse_failures,
+            jsonl_parse_ms,
+            "Sigma check: JSONL → LogEntry parse"
+        );
+
         if entries.is_empty() {
+            tracing::warn!(
+                target: "ironsift::sigma",
+                json_lines_failed_parse = json_parse_failures,
+                non_empty_lines,
+                "Sigma check failed: no lines deserialized as sigma_zero::models::LogEntry"
+            );
             if cleanup_log {
                 let _ = fs::remove_file(&log_path);
             }
             return Err("no valid JSON log lines to evaluate (expected JSON objects per line)".into());
         }
 
+        let approx_scalar_checks =
+            (rules_compiled as u64).saturating_mul(entries.len() as u64);
+
+        let t_eval = Instant::now();
         let rule_matches = engine.evaluate_log_batch(&entries);
+        let evaluate_ms = t_eval.elapsed().as_millis() as u64;
         let n_rules = rule_matches.len();
+
+        tracing::info!(
+            target: "ironsift::sigma",
+            matches_returned = n_rules,
+            entries_evaluated = entries.len(),
+            rules_compiled,
+            approx_scalar_checks,
+            engine_build_ms,
+            evaluate_ms,
+            "Sigma check: evaluate_log_batch complete (Rayon parallel rule×log; fast is normal)"
+        );
         let mut matches: Vec<serde_json::Value> = Vec::with_capacity(n_rules);
         for m in rule_matches {
             matches.push(serde_json::to_value(&m).map_err(|e| e.to_string())?);
@@ -632,14 +1781,41 @@ impl PlatformStore {
         if cleanup_log {
             let _ = fs::remove_file(&log_path);
         }
+
+        tracing::info!(
+            target: "ironsift::sigma",
+            status = "ok",
+            line_count,
+            rules_match_count = n_rules,
+            rules_source = %rules_source,
+            process_log_source = %process_log_source,
+            file_log_source = %file_log_source,
+            engine_build_ms,
+            jsonl_parse_ms,
+            evaluate_ms,
+            approx_scalar_checks,
+            "Sigma check: success"
+        );
+
         Ok(SigmaZeroCheckResult {
             status: "ok".to_string(),
             line_count,
             source_dataset_ids: source_ids,
-            rules_dir: rules_dir.to_string(),
+            rules_dir: rules_dir_out,
+            rules_source,
             rules_match_count: n_rules,
             matches,
             stderr: String::new(),
+            process_log_source,
+            file_log_source,
+            evaluation: SigmaZeroEvaluationStats {
+                rules_compiled,
+                log_entries_evaluated: entries.len(),
+                approx_scalar_checks,
+                engine_build_ms,
+                jsonl_parse_ms,
+                evaluate_ms,
+            },
         })
     }
 
@@ -744,6 +1920,7 @@ impl PlatformStore {
             rel_training_data_path: format!("{}/{}", rel, stored_basename),
             training_line_count: line_count,
             bin_path_used: "anomark (in-process library)".to_string(),
+            favorite: false,
         };
         self.db.write().anomark_trainings.push(record.clone());
         self.save()?;
@@ -800,21 +1977,33 @@ impl PlatformStore {
         if !req.tags.is_empty() {
             selected.retain(|d| d.tags.iter().any(|t| req.tags.iter().any(|rt| rt == t)));
         }
-        selected.retain(|d| d.kind == DatasetKind::Process);
+        selected.retain(|d| {
+            matches!(
+                d.kind,
+                DatasetKind::Process | DatasetKind::Mixed
+            )
+        });
         if selected.is_empty() {
             return Err(
                 "no process datasets selected for training (provide training_path or dataset_ids/tags)"
                     .into(),
             );
         }
+        // Source file is only required as a fallback; if SQLite has rows for the dataset
+        // (the normal post-ingest state) we train from there so test rows added via
+        // Inspect → Append also feed the model.
+        let edb = EventDb::new(&self.sql_path)?;
         for ds in &selected {
-            let p = Path::new(&ds.source_path);
-            if !p.is_file() {
-                return Err(format!(
-                    "dataset {} source file is missing or not a file: {}",
-                    ds.id, ds.source_path
-                )
-                .into());
+            let n_sql = edb.process_entries_for_dataset(&ds.id)?.len();
+            if n_sql == 0 {
+                let p = Path::new(&ds.source_path);
+                if !p.is_file() {
+                    return Err(format!(
+                        "dataset {} has no SQLite process rows and the source file is missing or not a file: {}",
+                        ds.id, ds.source_path
+                    )
+                    .into());
+                }
             }
         }
         let source_ids: Vec<String> = selected.iter().map(|d| d.id.clone()).collect();
@@ -824,14 +2013,21 @@ impl PlatformStore {
         let tmp_path = std::env::temp_dir().join(&tmp_name);
         let mut out = String::new();
         for ds in selected {
-            let profiles = load_process_profiles(&ds, &DetectionConfig::default())?;
+            let profiles = load_process_profiles_sqlite_first(
+                &self.sql_path,
+                &ds,
+                &DetectionConfig::unfiltered_row_loading(),
+            )?;
             for p in profiles {
                 for (sig, count) in p.counts {
+                    let proc_cmd = format!("{} {}", sig.path, sig.name);
+                    let cmd_for_markov = anomark_score_line(&p.id, &proc_cmd);
                     for _ in 0..count {
                         out.push_str(
                             &serde_json::json!({
                                 "machine_id": p.id,
-                                "command": format!("{} {}", sig.path, sig.name),
+                                "cmdline": cmd_for_markov,
+                                "command": cmd_for_markov,
                             })
                             .to_string(),
                         );
@@ -857,6 +2053,35 @@ impl PlatformStore {
     /// List training jobs newest last (or reverse in UI from API).
     pub fn list_anomark_trainings(&self) -> Vec<AnoMarkTrainRecord> {
         self.db.read().anomark_trainings.clone()
+    }
+
+    /// Favorites first, then newest by [`AnoMarkTrainRecord::created_at`].
+    pub fn list_anomark_trainings_for_display(&self) -> Vec<AnoMarkTrainRecord> {
+        let mut v = self.list_anomark_trainings();
+        v.sort_by(cmp_anomark_train_record_display);
+        v
+    }
+
+    pub fn set_anomark_training_favorite(
+        &self,
+        train_id: &str,
+        favorite: bool,
+    ) -> Result<(), Box<dyn Error>> {
+        let id = train_id.trim();
+        if id.is_empty() {
+            return Err("empty training id".into());
+        }
+        {
+            let mut w = self.db.write();
+            let rec = w
+                .anomark_trainings
+                .iter_mut()
+                .find(|r| r.id == id)
+                .ok_or_else(|| format!("AnoMark training not found: {}", id))?;
+            rec.favorite = favorite;
+        }
+        self.save()?;
+        Ok(())
     }
 
     /// Path to a persisted `model.bin` for download, or `None` if missing.
@@ -895,8 +2120,395 @@ impl PlatformStore {
         }
     }
 
+    fn anomark_where_generated(&self, rec: &AnoMarkTrainRecord) -> Result<AnoMarkWhereGenerated, Box<dyn Error>> {
+        let root = self.platform_root()?;
+        let source_label = if rec.from_user_file {
+            let p = rec.request.training_path.trim();
+            if p.is_empty() {
+                "Training file (path not recorded in request)".to_string()
+            } else {
+                format!("Training file: {}", p)
+            }
+        } else if !rec.source_dataset_ids.is_empty() {
+            format!("Process datasets: {}", rec.source_dataset_ids.join(", "))
+        } else {
+            "Process datasets (from tags / filters in request)".to_string()
+        };
+        let optional = rec.request.output_model_path.trim().to_string();
+        Ok(AnoMarkWhereGenerated {
+            train_id: rec.id.clone(),
+            generated_at: rec.created_at.clone(),
+            generation_engine: rec.bin_path_used.clone(),
+            platform_data_directory: root.to_string_lossy().to_string(),
+            model_file_relative: rec.rel_model_path.clone(),
+            training_input_relative: rec.rel_training_data_path.clone(),
+            optional_output_copy_path: optional,
+            source_label,
+            training_line_count: rec.training_line_count,
+            request: rec.request.clone(),
+            source_dataset_ids: rec.source_dataset_ids.clone(),
+            from_user_file: rec.from_user_file,
+        })
+    }
+
+    /// Load the saved `model.bin` for a training job and return Markov stats plus where it was produced.
+    pub fn inspect_anomark_training_model(&self, train_id: &str) -> Result<AnoMarkModelInspection, Box<dyn Error>> {
+        let rec = self
+            .db
+            .read()
+            .anomark_trainings
+            .iter()
+            .find(|r| r.id == train_id)
+            .cloned()
+            .ok_or_else(|| format!("unknown training id: {}", train_id))?;
+        let path = self
+            .anomark_train_stored_model_path(train_id)
+            .ok_or_else(|| "model file missing for this training".to_string())?;
+        let wg = self.anomark_where_generated(&rec)?;
+        Self::inspect_anomark_model_file(&path, Some(wg), "")
+    }
+
+    /// Inspect the model file currently set in AnoMark settings (may be external to saved trainings).
+    pub fn inspect_anomark_configured_model(&self) -> Result<AnoMarkModelInspection, Box<dyn Error>> {
+        let cfg = self.get_anomark_settings();
+        let p = cfg.model_path.trim();
+        if p.is_empty() {
+            return Err("AnoMark model path is not set (enter a path on the AnoMark tab and save)".into());
+        }
+        let path = Path::new(p);
+        let note = "This path is the current AnoMark model in settings. It may have been copied from anywhere; use Inspect on a saved training row for a model that IronSift generated on this server, with full provenance.";
+        Self::inspect_anomark_model_file(path, None, note)
+    }
+
+    fn inspect_anomark_model_file(
+        path: &Path,
+        where_generated: Option<AnoMarkWhereGenerated>,
+        config_origin_note: &str,
+    ) -> Result<AnoMarkModelInspection, Box<dyn Error>> {
+        if !path.is_file() {
+            return Err(format!("model file not found: {}", path.display()).into());
+        }
+        let path_str = path
+            .to_str()
+            .ok_or("model path is not valid UTF-8")?;
+        let mut model =
+            ModelHandler::load_model(path_str).map_err(|e: anyhow::Error| e.to_string())?;
+        if !model.is_trained() {
+            model.normalize_model_and_compute_prior();
+        }
+        let threshold = ModelHandler::compute_threshold(&model, 95.0);
+        let meta = fs::metadata(path)?;
+        let model_path = path
+            .canonicalize()
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .to_string();
+        Ok(AnoMarkModelInspection {
+            model_path,
+            file_size_bytes: meta.len(),
+            order: model.order,
+            is_trained: model.is_trained(),
+            prior: model.prior,
+            num_contexts: model.num_contexts(),
+            num_transitions: model.num_transitions(),
+            alphabet_len: model.alphabet_len(),
+            raw_markov_entries: model.raw_markov_entries(),
+            suspect_threshold_ln: threshold,
+            where_generated,
+            config_origin_note: config_origin_note.to_string(),
+        })
+    }
+
+    /// Run the same logic as [`Self::test_anomark_cli`] for a single command line; useful when
+    /// the caller does not need dataset-wide scoring. `explicit_model_path` wins over `train_id`,
+    /// which wins over the platform settings model path.
+    pub fn score_anomark_command_with_model_file(
+        &self,
+        explicit_model_path: Option<&Path>,
+        command: &str,
+        machine_name: Option<&str>,
+        train_id: Option<&str>,
+        suspect_percent: f64,
+    ) -> Result<AnoMarkCommandScore, Box<dyn Error>> {
+        let (path, source, stored_id) = self.resolve_anomark_model_for_test(
+            explicit_model_path,
+            train_id,
+        )?;
+        score_one_command_against_model(&path, &source, stored_id, command, machine_name, suspect_percent)
+    }
+
+    /// Test an AnoMark model from the CLI: optionally score a single command, and/or compute
+    /// suspect-command ratios across selected ingested process datasets (the same way runs do).
+    /// Datasets are filtered by ids and/or tags; only `Process` and `Mixed` kinds are scored.
+    /// Reads ingested rows from `events.db` (so test rows added via Inspect → Append are scored).
+    pub fn test_anomark_cli(
+        &self,
+        explicit_model_path: Option<&Path>,
+        train_id: Option<&str>,
+        command: Option<&str>,
+        machine_name: Option<&str>,
+        dataset_ids: &[String],
+        tags: &[String],
+        suspect_percent: f64,
+    ) -> Result<AnoMarkTestResult, Box<dyn Error>> {
+        let (model_path, model_source, stored_id) =
+            self.resolve_anomark_model_for_test(explicit_model_path, train_id)?;
+        let path_str = model_path
+            .to_str()
+            .ok_or("model path is not valid UTF-8")?;
+        let mut model =
+            ModelHandler::load_model(path_str).map_err(|e: anyhow::Error| e.to_string())?;
+        if !model.is_trained() {
+            model.normalize_model_and_compute_prior();
+        }
+        let pct = clamp_anomark_suspect_percent(suspect_percent);
+        let threshold_ln = ModelHandler::compute_threshold(&model, pct);
+
+        let command_score = match command.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(cmd) => Some(score_one_command_against_model(
+                &model_path,
+                &model_source,
+                stored_id.clone(),
+                cmd,
+                machine_name,
+                suspect_percent,
+            )?),
+            None => None,
+        };
+
+        let mut datasets_summaries: Vec<AnoMarkTestDatasetSummary> = Vec::new();
+        let mut datasets_skipped: Vec<String> = Vec::new();
+        let any_filter = !dataset_ids.is_empty() || !tags.is_empty();
+        if any_filter {
+            let all_datasets = self.db.read().datasets.clone();
+            let mut selected: Vec<DatasetRecord> = all_datasets;
+            if !dataset_ids.is_empty() {
+                selected.retain(|d| dataset_ids.iter().any(|id| id == &d.id));
+            }
+            if !tags.is_empty() {
+                selected.retain(|d| d.tags.iter().any(|t| tags.iter().any(|rt| rt == t)));
+            }
+            for d in &selected {
+                if !matches!(d.kind, DatasetKind::Process | DatasetKind::Mixed) {
+                    datasets_skipped.push(format!("{} ({}, kind={:?})", d.id, d.name, d.kind));
+                    continue;
+                }
+            }
+            selected.retain(|d| matches!(d.kind, DatasetKind::Process | DatasetKind::Mixed));
+
+            let edb = EventDb::new(&self.sql_path)?;
+            for ds in selected {
+                let entries = edb.process_entries_for_dataset(&ds.id)?;
+                let mut totals: HashMap<String, (u64, u64)> = HashMap::new();
+                let mut commands_scored: u64 = 0;
+                let mut suspect_commands: u64 = 0;
+                for e in &entries {
+                    let row = raw_log_entry_to_anomark_row(e);
+                    let cmd = row_command_for_anomark(&row, "cmdline");
+                    let host_raw = row_machine_for_anomark(&row, "machine_id");
+                    let scored = anomark_score_line(&host_raw, &cmd);
+                    if scored.is_empty() {
+                        continue;
+                    }
+                    let padded = format!("{}{}", "~".repeat(model.order), scored);
+                    let ll = model.log_likelihood(&padded);
+                    let suspect = ModelHandler::is_suspect_command(ll, threshold_ln);
+                    commands_scored += 1;
+                    let slot = totals.entry(host_raw.clone()).or_insert((0, 0));
+                    slot.0 += 1;
+                    if suspect {
+                        slot.1 += 1;
+                        suspect_commands += 1;
+                    }
+                }
+                let mut host_stats: Vec<AnoMarkTestDatasetHostStat> = totals
+                    .into_iter()
+                    .map(|(host, (commands, suspect))| AnoMarkTestDatasetHostStat {
+                        host,
+                        commands,
+                        suspect,
+                        ratio: if commands == 0 {
+                            0.0
+                        } else {
+                            suspect as f64 / commands as f64
+                        },
+                    })
+                    .collect();
+                host_stats.sort_by(|a, b| b.ratio.partial_cmp(&a.ratio).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.host.cmp(&b.host)));
+                datasets_summaries.push(AnoMarkTestDatasetSummary {
+                    dataset_id: ds.id.clone(),
+                    dataset_name: ds.name.clone(),
+                    commands_scored,
+                    suspect_commands,
+                    host_stats,
+                });
+            }
+        }
+
+        Ok(AnoMarkTestResult {
+            model_path: model_path.to_string_lossy().into_owned(),
+            model_source,
+            model_order: model.order,
+            model_prior_ln: model.prior,
+            suspect_percent_used: pct,
+            suspect_threshold_ln: threshold_ln,
+            command_score,
+            datasets: datasets_summaries,
+            datasets_skipped,
+        })
+    }
+
+    fn resolve_anomark_model_for_test(
+        &self,
+        explicit_model_path: Option<&Path>,
+        train_id: Option<&str>,
+    ) -> Result<(PathBuf, String, Option<String>), Box<dyn Error>> {
+        if let Some(p) = explicit_model_path {
+            if !p.is_file() {
+                return Err(format!("AnoMark model file not found: {}", p.display()).into());
+            }
+            return Ok((p.to_path_buf(), "explicit-path".to_string(), None));
+        }
+        if let Some(tid) = train_id.map(str::trim).filter(|s| !s.is_empty()) {
+            let p = self.anomark_train_stored_model_path(tid).ok_or_else(|| {
+                format!(
+                    "no model file for training {} (refresh the list or train again)",
+                    tid
+                )
+            })?;
+            return Ok((p, "training".to_string(), Some(tid.to_string())));
+        }
+        let cfg = self.get_anomark_settings();
+        let p = cfg.model_path.trim();
+        if p.is_empty() {
+            return Err(
+                "AnoMark model path is empty — pass --anomark-model, --anomark-train-id, or set the platform settings"
+                    .into(),
+            );
+        }
+        let path = self.resolve_anomark_model_path(p).ok_or_else(|| {
+            format!(
+                "AnoMark model file not found for settings path {:?} (use an absolute path or one relative to the platform directory next to db.json)",
+                p
+            )
+        })?;
+        Ok((path, "platform".to_string(), None))
+    }
+
+    /// Score one command with the platform model path or a saved training's `model.bin`.
+    /// `suspect_percent` is clamped to **55.0–99.999** (same scale as [`ModelHandler::compute_threshold`]); lower = more sensitive (more commands flagged).
+    pub fn score_anomark_command(
+        &self,
+        command: &str,
+        machine_name: Option<&str>,
+        train_id: Option<&str>,
+        suspect_percent: f64,
+    ) -> Result<AnoMarkCommandScore, Box<dyn Error>> {
+        const MAX_CMD: usize = 32 * 1024;
+        if command.len() > MAX_CMD {
+            return Err(format!("command exceeds {} characters", MAX_CMD).into());
+        }
+        let trimmed = command.trim();
+        let machine_trim = machine_name.map(str::trim).filter(|s| !s.is_empty()).unwrap_or("");
+        let scored_line = anomark_score_line(machine_trim, trimmed);
+        if scored_line.is_empty() {
+            return Err("command is empty".into());
+        }
+        if scored_line.len() > MAX_CMD {
+            return Err(format!("scored line exceeds {} characters", MAX_CMD).into());
+        }
+
+        let pct = clamp_anomark_suspect_percent(suspect_percent);
+
+        let tid = train_id.map(str::trim).filter(|s| !s.is_empty());
+
+        let (path, source, stored_id): (PathBuf, String, Option<String>) = if let Some(id) = tid {
+            let p = self.anomark_train_stored_model_path(id).ok_or_else(|| {
+                format!(
+                    "no model file for training {} (refresh the list or train again)",
+                    id
+                )
+            })?;
+            (p, "training".to_string(), Some(id.to_string()))
+        } else {
+            let cfg = self.get_anomark_settings();
+            let p = cfg.model_path.trim();
+            if p.is_empty() {
+                return Err(
+                    "AnoMark model path is empty — set it in AnoMark settings or pick a saved training"
+                        .into(),
+                );
+            }
+            let path = self.resolve_anomark_model_path(p).ok_or_else(|| {
+                format!(
+                    "AnoMark model file not found for settings path {:?} (use an absolute path or one relative to the platform directory next to db.json)",
+                    p
+                )
+            })?;
+            (path, "platform".to_string(), None)
+        };
+
+        if !path.is_file() {
+            return Err(format!("model file not found: {}", path.display()).into());
+        }
+        let path_str = path
+            .to_str()
+            .ok_or("model path is not valid UTF-8")?;
+        let mut model =
+            ModelHandler::load_model(path_str).map_err(|e: anyhow::Error| e.to_string())?;
+        if !model.is_trained() {
+            model.normalize_model_and_compute_prior();
+        }
+        let threshold_ln = ModelHandler::compute_threshold(&model, pct);
+        let padded = format!("{}{}", "~".repeat(model.order), scored_line);
+        let log_likelihood = model.log_likelihood(&padded);
+        let is_suspect = ModelHandler::is_suspect_command(log_likelihood, threshold_ln);
+        let margin_ln = log_likelihood - threshold_ln;
+        let model_path = path
+            .canonicalize()
+            .unwrap_or_else(|_| path.clone())
+            .to_string_lossy()
+            .to_string();
+        Ok(AnoMarkCommandScore {
+            model_path,
+            source,
+            train_id: stored_id,
+            order: model.order,
+            log_likelihood,
+            suspect_threshold_ln: threshold_ln,
+            is_suspect,
+            margin_ln,
+            suspect_percent_used: pct,
+            line_scored: scored_line,
+        })
+    }
+
     pub fn get_run(&self, id: &str) -> Option<DetectionRunRecord> {
         self.db.read().runs.iter().find(|r| r.id == id).cloned()
+    }
+
+    /// Findings for `GET .../detections`: ensures `dataset_tags` is set (resolves when empty for legacy runs).
+    pub fn findings_for_run_detections_api(&self, run_id: &str) -> Option<Vec<DetectionFinding>> {
+        let r = self.get_run(run_id)?;
+        let db = self.db.read();
+        let datasets = db.datasets.as_slice();
+        let out: Vec<DetectionFinding> = r
+            .findings
+            .iter()
+            .map(|f| {
+                let mut ff = f.clone();
+                if ff.dataset_tags.is_empty() {
+                    ff.dataset_tags = resolve_machine_dataset_tags_for_run(
+                        &ff.machine_id,
+                        &r.dataset_ids,
+                        r.detection_focus,
+                        datasets,
+                    );
+                }
+                ff
+            })
+            .collect();
+        Some(out)
     }
 
     /// Remove a single saved detection run from `db.json` (ingested datasets are unchanged).
@@ -913,6 +2525,47 @@ impl PlatformStore {
         Ok(())
     }
 
+    /// Replace saved analyst triage for a run. Every `machine_id` must appear in that run's findings.
+    pub fn update_run_user_triage(
+        &self,
+        run_id: &str,
+        triage: RunUserTriage,
+    ) -> Result<(), Box<dyn Error>> {
+        let valid_hosts: HashSet<String> = {
+            let db = self.db.read();
+            let rec = db
+                .runs
+                .iter()
+                .find(|r| r.id == run_id)
+                .ok_or_else(|| format!("run not found: {}", run_id))?;
+            rec.findings.iter().map(|f| f.machine_id.clone()).collect()
+        };
+        let mut seen_m = HashSet::new();
+        let triage = triage.without_excluded_reason_decisions();
+        for m in &triage.machines {
+            if !seen_m.insert(m.machine_id.clone()) {
+                return Err(format!("duplicate machine_id in triage: {}", m.machine_id).into());
+            }
+            if !valid_hosts.contains(&m.machine_id) {
+                return Err(format!(
+                    "unknown machine_id in triage: {} (not in this run's findings)",
+                    m.machine_id
+                )
+                .into());
+            }
+        }
+        let mut db = self.db.write();
+        let rec = db
+            .runs
+            .iter_mut()
+            .find(|r| r.id == run_id)
+            .ok_or_else(|| format!("run not found: {}", run_id))?;
+        rec.user_triage = triage;
+        drop(db);
+        self.save()?;
+        Ok(())
+    }
+
     /// Remove all detection runs (same storage as `delete_all_datasets` — only the run list in `db.json`).
     pub fn delete_all_runs(&self) -> Result<(), Box<dyn Error>> {
         self.db.write().runs.clear();
@@ -920,8 +2573,185 @@ impl PlatformStore {
         Ok(())
     }
 
-    pub fn inspect_dataset(&self, dataset_id: &str) -> Result<DatasetInspection, Box<dyn Error>> {
-        EventDb::new(&self.sql_path)?.inspect_dataset(dataset_id)
+    /// Absolute path to the on-disk model file `train_anomark` would have written for this id, if
+    /// the platform root is resolvable. Used to compare against `AnoMarkSettings::model_path` so we
+    /// can clear stale references when a training is deleted.
+    fn anomark_train_canonical_model_path(&self, train_id: &str) -> Option<PathBuf> {
+        let rec = self
+            .db
+            .read()
+            .anomark_trainings
+            .iter()
+            .find(|r| r.id == train_id)
+            .cloned()?;
+        let root = self.platform_root().ok()?;
+        Some(root.join(&rec.rel_model_path))
+    }
+
+    /// `true` when the configured platform `model_path` points at this training's stored model.
+    /// Compares both the absolute expected path (`{platform_root}/anomark-trains/{id}/model.bin`)
+    /// and a relative-suffix match, so manually-edited settings still get cleaned up on delete.
+    fn settings_points_at_training(&self, train_id: &str, expected_abs: &Path) -> bool {
+        let cfg = self.get_anomark_settings();
+        let mp = cfg.model_path.trim();
+        if mp.is_empty() {
+            return false;
+        }
+        let exp = expected_abs.to_string_lossy();
+        if mp == exp {
+            return true;
+        }
+        let suffix_unix = format!("anomark-trains/{}/model.bin", train_id);
+        let mp_norm = mp.replace('\\', "/");
+        if mp_norm.ends_with(&suffix_unix) {
+            return true;
+        }
+        false
+    }
+
+    /// Delete a single AnoMark training: remove its `db.json` record, best-effort wipe of
+    /// `{platform_root}/anomark-trains/{id}/`, and clear `anomark.model_path` if it pointed at the
+    /// deleted training. Existing detection runs that referenced this training are kept (their
+    /// findings are already baked in); rerunning a finding that needs the deleted model will
+    /// surface the usual "model not readable" error.
+    pub fn delete_anomark_training(&self, train_id: &str) -> Result<(), Box<dyn Error>> {
+        let id = train_id.trim();
+        if id.is_empty() {
+            return Err("anomark training id is required".into());
+        }
+        let canonical = self.anomark_train_canonical_model_path(id);
+        let dir = canonical.as_ref().and_then(|p| p.parent().map(Path::to_path_buf));
+        {
+            let mut w = self.db.write();
+            let n = w.anomark_trainings.len();
+            w.anomark_trainings.retain(|r| r.id != id);
+            if w.anomark_trainings.len() == n {
+                return Err(format!("anomark training not found: {}", id).into());
+            }
+        }
+        if let Some(d) = &dir {
+            if d.is_dir() {
+                if let Err(e) = fs::remove_dir_all(d) {
+                    log::warn!(
+                        "delete_anomark_training: failed to remove {}: {} (db.json record was removed)",
+                        d.display(),
+                        e
+                    );
+                }
+            }
+        }
+        if let Some(canon) = canonical {
+            if self.settings_points_at_training(id, &canon) {
+                let mut updated = self.get_anomark_settings();
+                updated.model_path = String::new();
+                let _ = self.set_anomark_settings(updated);
+            }
+        }
+        self.save()?;
+        Ok(())
+    }
+
+    /// Delete every saved AnoMark training (records + on-disk dirs). Returns the number of
+    /// records removed. Clears `anomark.model_path` when it pointed at any deleted training.
+    pub fn delete_all_anomark_trainings(&self) -> Result<usize, Box<dyn Error>> {
+        let trainings = self.list_anomark_trainings();
+        if trainings.is_empty() {
+            return Ok(0);
+        }
+        let root = self.platform_root().ok();
+        let cfg_path = self.get_anomark_settings().model_path.trim().to_string();
+        let mut should_clear_settings = false;
+        for t in &trainings {
+            if let Some(rt) = &root {
+                let abs = rt.join(&t.rel_model_path);
+                if !cfg_path.is_empty() && self.settings_points_at_training(&t.id, &abs) {
+                    should_clear_settings = true;
+                }
+                if let Some(dir) = abs.parent() {
+                    if dir.is_dir() {
+                        if let Err(e) = fs::remove_dir_all(dir) {
+                            log::warn!(
+                                "delete_all_anomark_trainings: failed to remove {}: {}",
+                                dir.display(),
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let removed = {
+            let mut w = self.db.write();
+            let n = w.anomark_trainings.len();
+            w.anomark_trainings.clear();
+            n
+        };
+        if should_clear_settings {
+            let mut updated = self.get_anomark_settings();
+            updated.model_path = String::new();
+            let _ = self.set_anomark_settings(updated);
+        }
+        self.save()?;
+        Ok(removed)
+    }
+
+    pub fn inspect_dataset(
+        &self,
+        dataset_id: &str,
+        process_limit: u32,
+        file_limit: u32,
+    ) -> Result<DatasetInspection, Box<dyn Error>> {
+        EventDb::new(&self.sql_path)?.inspect_dataset(dataset_id, process_limit, file_limit)
+    }
+
+    /// Append NDJSON lines to the SQLite event store for this dataset (testing / manual injection).
+    /// Does not replace data re-ingested from the dataset source file on full `ingest_dataset`.
+    pub fn append_dataset_test_ndjson(
+        &self,
+        dataset_id: &str,
+        ndjson: &str,
+    ) -> Result<crate::event_db::AppendTestSummary, Box<dyn Error>> {
+        let (source_path, ingest_mid) = {
+            let g = self.db.read();
+            let ds = g
+                .datasets
+                .iter()
+                .find(|d| d.id == dataset_id)
+                .ok_or("dataset not found")?;
+            (ds.source_path.clone(), ds.ingest_default_machine_id.clone())
+        };
+        let default_mid =
+            default_machine_fallback_for_source_file(&source_path, ingest_mid.as_deref());
+        EventDb::new(&self.sql_path)?.append_test_ndjson(dataset_id, &default_mid, ndjson)
+    }
+
+    /// Delete ingested process/file rows by SQLite `id` (inspect samples include these keys).
+    pub fn delete_dataset_events(
+        &self,
+        dataset_id: &str,
+        req: DeleteDatasetEventsRequest,
+    ) -> Result<(usize, usize), Box<dyn Error>> {
+        let n_req = req.process_ids.len() + req.file_ids.len();
+        if n_req == 0 {
+            return Err("no row ids provided".into());
+        }
+        if n_req > DELETE_DATASET_EVENTS_MAX_IDS {
+            return Err(format!(
+                "too many row ids in one request (max {})",
+                DELETE_DATASET_EVENTS_MAX_IDS
+            )
+            .into());
+        }
+        {
+            let db = self.db.read();
+            if !db.datasets.iter().any(|d| d.id == dataset_id) {
+                return Err("dataset not found".into());
+            }
+        }
+        let edb = EventDb::new(&self.sql_path)?;
+        let dp = edb.delete_process_events_by_ids(dataset_id, &req.process_ids)?;
+        let df = edb.delete_file_events_by_ids(dataset_id, &req.file_ids)?;
+        Ok((dp, df))
     }
 
     pub fn delete_all_datasets(&self) -> Result<(), Box<dyn Error>> {
@@ -931,7 +2761,10 @@ impl PlatformStore {
         Ok(())
     }
 
-    pub fn create_dataset(&self, req: CreateDatasetRequest) -> Result<DatasetRecord, Box<dyn Error>> {
+    pub fn create_dataset(
+        &self,
+        req: CreateDatasetRequest,
+    ) -> Result<(DatasetRecord, IngestSummary), Box<dyn Error>> {
         if !Path::new(&req.source_path).exists() {
             return Err(format!("source_path does not exist: {}", req.source_path).into());
         }
@@ -939,7 +2772,7 @@ impl PlatformStore {
             Some(ext) => ext.to_lowercase(),
             None => "unknown".to_string(),
         };
-        let rec = DatasetRecord {
+        let mut rec = DatasetRecord {
             id: Uuid::new_v4().to_string(),
             name: req.name,
             source_path: req.source_path,
@@ -948,11 +2781,13 @@ impl PlatformStore {
             tags: req.tags,
             schema_profile: req.schema_profile,
             imported_at: Utc::now().to_rfc3339(),
+            ingest_default_machine_id: req.ingest_default_machine_id,
         };
-        EventDb::new(&self.sql_path)?.ingest_dataset(&rec)?;
+        let summary = EventDb::new(&self.sql_path)?.ingest_dataset(&rec)?;
+        rec.kind = dataset_kind_from_ingest_summary(&summary);
         self.db.write().datasets.push(rec.clone());
         self.save()?;
-        Ok(rec)
+        Ok((rec, summary))
     }
 
     pub fn import_file_auto(
@@ -960,12 +2795,17 @@ impl PlatformStore {
         source_path: &str,
         name: Option<String>,
         tags: Vec<String>,
-    ) -> Result<DatasetRecord, Box<dyn Error>> {
+        ingest_default_machine_id: Option<String>,
+        kind_override: Option<DatasetKind>,
+    ) -> Result<(DatasetRecord, IngestSummary), Box<dyn Error>> {
         let path = Path::new(source_path);
         if !path.exists() {
             return Err(format!("source_path does not exist: {}", source_path).into());
         }
-        let kind = detect_kind(path)?;
+        let kind = match kind_override {
+            Some(k) => k,
+            None => detect_kind(path)?,
+        };
         let dataset_name = name.unwrap_or_else(|| {
             path.file_name()
                 .and_then(|x| x.to_str())
@@ -978,10 +2818,90 @@ impl PlatformStore {
             kind,
             tags,
             schema_profile: default_schema_profile(),
+            ingest_default_machine_id,
         })
     }
 
-    pub fn add_dataset_tags(&self, dataset_id: &str, tags: &[String]) -> Result<DatasetRecord, Box<dyn Error>> {
+    /// Recursively find every `.jsonl` file under `root_dir` and import each as its own dataset.
+    /// Dataset names are the path relative to `root_dir` (POSIX slashes) so nested files stay distinct.
+    ///
+    /// `parent_tag` adds one tag per file from the **parent folder’s name**: split by the rule’s
+    /// delimiter and take the 1-based `field` segment (see [`ParentDirTagRule`]). Merged with
+    /// `tags` without duplicates.
+    /// `kind_override`: when `Some`, dataset **metadata** uses that kind before ingest; the stored kind
+    /// is still derived from row counts (NDJSON with both process and file lines becomes `mixed`).
+    /// Prefer `None` so [`detect_kind`] can return [`DatasetKind::Mixed`] for mixed logs.
+    pub fn import_jsonl_recursive(
+        &self,
+        root_dir: &Path,
+        tags: Vec<String>,
+        parent_tag: Option<ParentDirTagRule>,
+        kind_override: Option<DatasetKind>,
+    ) -> Result<Vec<(DatasetRecord, IngestSummary)>, Box<dyn Error>> {
+        if !root_dir.is_dir() {
+            return Err(format!("not a directory: {}", root_dir.display()).into());
+        }
+        let root_norm = fs::canonicalize(root_dir)?;
+        let mut paths: Vec<PathBuf> = Vec::new();
+        collect_jsonl_paths(&root_norm, &mut paths)?;
+        paths.sort();
+        let mut out: Vec<(DatasetRecord, IngestSummary)> = Vec::new();
+        for p in paths {
+            let p_norm = fs::canonicalize(&p)?;
+            let source = p_norm.to_string_lossy().to_string();
+            let rel = p_norm.strip_prefix(&root_norm).unwrap_or(p_norm.as_path());
+            let name = {
+                let s = rel.to_string_lossy().replace('\\', "/");
+                let s = s.trim_start_matches('/').trim();
+                if s.is_empty() {
+                    p_norm
+                        .file_name()
+                        .and_then(|x| x.to_str())
+                        .unwrap_or("dataset")
+                        .to_string()
+                } else {
+                    s.to_string()
+                }
+            };
+            let parent_machine = parent_tag
+                .as_ref()
+                .and_then(|rule| parent_dir_tag_from_path(&p_norm, rule));
+            let mut merged = tags.clone();
+            if let Some(ref extra) = parent_machine {
+                if !merged.iter().any(|x| x == extra) {
+                    merged.push(extra.clone());
+                }
+            } else if let Some(rule) = parent_tag.as_ref() {
+                log::debug!(
+                    "ingest: no parent-dir tag for {} (parent name segment {} / {:?})",
+                    p_norm.display(),
+                    rule.field,
+                    rule.delimiter
+                );
+            }
+            out.push(self.import_file_auto(
+                &source,
+                Some(name),
+                merged,
+                parent_machine,
+                kind_override,
+            )?);
+        }
+        if out.is_empty() {
+            return Err(format!(
+                "no .jsonl files found under {}",
+                root_dir.display()
+            )
+            .into());
+        }
+        Ok(out)
+    }
+
+    pub fn add_dataset_tags(
+        &self,
+        dataset_id: &str,
+        tags: &[String],
+    ) -> Result<(DatasetRecord, IngestSummary), Box<dyn Error>> {
         let mut db = self.db.write();
         let rec = db
             .datasets
@@ -995,82 +2915,314 @@ impl PlatformStore {
         }
         let out = rec.clone();
         drop(db);
-        EventDb::new(&self.sql_path)?.ingest_dataset(&out)?;
+        let summary = EventDb::new(&self.sql_path)?.ingest_dataset(&out)?;
+        let kind = dataset_kind_from_ingest_summary(&summary);
+        {
+            let mut db = self.db.write();
+            if let Some(r) = db.datasets.iter_mut().find(|d| d.id == dataset_id) {
+                r.kind = kind;
+            }
+        }
         self.save()?;
-        Ok(out)
+        let updated = self
+            .db
+            .read()
+            .datasets
+            .iter()
+            .find(|d| d.id == dataset_id)
+            .cloned()
+            .ok_or("dataset not found")?;
+        Ok((updated, summary))
+    }
+
+    pub fn remove_dataset_tags(
+        &self,
+        dataset_id: &str,
+        tags: &[String],
+    ) -> Result<(DatasetRecord, IngestSummary), Box<dyn Error>> {
+        if tags.is_empty() {
+            return Err("no tags to remove".into());
+        }
+        let mut db = self.db.write();
+        let rec = db
+            .datasets
+            .iter_mut()
+            .find(|d| d.id == dataset_id)
+            .ok_or("dataset not found")?;
+        rec.tags.retain(|t| !tags.iter().any(|rm| rm == t));
+        let out = rec.clone();
+        drop(db);
+        let summary = EventDb::new(&self.sql_path)?.ingest_dataset(&out)?;
+        let kind = dataset_kind_from_ingest_summary(&summary);
+        {
+            let mut db = self.db.write();
+            if let Some(r) = db.datasets.iter_mut().find(|d| d.id == dataset_id) {
+                r.kind = kind;
+            }
+        }
+        self.save()?;
+        let updated = self
+            .db
+            .read()
+            .datasets
+            .iter()
+            .find(|d| d.id == dataset_id)
+            .cloned()
+            .ok_or("dataset not found")?;
+        Ok((updated, summary))
+    }
+
+    /// Append one reason to a finding while keeping the per-detector bucket
+    /// ([`DetectionFinding::reasons_by_detector`]) and the flat list
+    /// ([`DetectionFinding::reasons`]) in sync. The flat list is what older clients (and saved
+    /// runs) read; the bucket is what the new UI uses to render reasons grouped per detector.
+    fn push_detector_reason(f: &mut DetectionFinding, detector: &str, reason: String) {
+        f.reasons.push(reason.clone());
+        match f.reasons_by_detector.iter_mut().find(|b| b.detector == detector) {
+            Some(b) => b.reasons.push(reason),
+            None => f.reasons_by_detector.push(DetectorReasons {
+                detector: detector.to_string(),
+                reasons: vec![reason],
+            }),
+        }
+    }
+
+    /// Bulk version of [`Self::push_detector_reason`] for cases that already build a `Vec`
+    /// (e.g. `analyze_*_fleet` returning `anomalous_features`).
+    fn extend_detector_reasons<I: IntoIterator<Item = String>>(
+        f: &mut DetectionFinding,
+        detector: &str,
+        reasons: I,
+    ) {
+        for r in reasons {
+            Self::push_detector_reason(f, detector, r);
+        }
     }
 
     pub fn run_detection(&self, req: CreateRunRequest) -> Result<DetectionRunRecord, Box<dyn Error>> {
         let datasets = self.selected_datasets(&req)?;
-        let config = self.get_run_config();
+        let (config, dc_id, dc_name) = self.resolve_detection_config_for_run(&req)?;
 
-        let process_sets: Vec<_> = datasets
-            .iter()
-            .filter(|d| d.kind == DatasetKind::Process)
-            .cloned()
-            .collect();
-        let file_sets: Vec<_> = datasets
-            .iter()
-            .filter(|d| d.kind == DatasetKind::File)
-            .cloned()
-            .collect();
+        let mut process_sets = Vec::new();
+        let mut file_sets = Vec::new();
+        for d in &datasets {
+            let (use_p, use_f) = run_detection_arms(d.kind, req.detection_focus);
+            if use_p {
+                process_sets.push(d.clone());
+            }
+            if use_f {
+                file_sets.push(d.clone());
+            }
+        }
 
         let mut finding_by_host: HashMap<String, DetectionFinding> = HashMap::new();
 
+        let run_fleet = run_fleet_detection(req.detector_mode);
+        let run_anomark = run_anomark_detection(req.detector_mode, req.enable_anomark);
+        let anomark_suspect_percent = clamp_anomark_suspect_percent(req.anomark_suspect_percent);
+
+        if matches!(req.detector_mode, RunDetectorMode::AnomarkOnly) && process_sets.is_empty() {
+            return Err(
+                "AnoMark-only run needs at least one dataset that contributes process rows (kind process or mixed, given detection scope)."
+                    .into(),
+            );
+        }
+
         if !process_sets.is_empty() {
+            let multi_process = process_sets.len() > 1;
             let mut all = Vec::<MachineProfile>::new();
             for d in &process_sets {
-                all.extend(load_process_profiles(d, &config)?);
+                let mut profiles =
+                    load_process_profiles_sqlite_first(&self.sql_path, d, &config)?;
+                if multi_process {
+                    for p in &mut profiles {
+                        p.id = namespace_run_machine_id(&d.id, &p.id, true);
+                    }
+                }
+                all.extend(profiles);
             }
             let merged = merge_process_profiles(&all);
-            let report = analyze_fleet(&merged, &config)?;
-            for an in report.anomalies {
-                let sev_score = match an.severity {
-                    AnomalyLevel::Critical => 1.0,
-                    AnomalyLevel::High => 0.75,
-                    AnomalyLevel::Medium => 0.5,
-                    AnomalyLevel::Low => 0.25,
-                };
-                let e = finding_by_host
-                    .entry(an.machine_id.clone())
-                    .or_insert_with(|| DetectionFinding {
-                        machine_id: an.machine_id.clone(),
-                        severity: "LOW".to_string(),
-                        score: 0.0,
-                        reasons: Vec::new(),
-                        detectors: Vec::new(),
-                    });
-                e.score = e.score.max(sev_score);
-                e.reasons.extend(an.anomalous_features);
-                e.detectors.push("ironsift-process".to_string());
+            if run_fleet {
+                let report = analyze_fleet(&merged, &config)?;
+                let process_dataset_ids: Vec<String> =
+                    process_sets.iter().map(|d| d.id.clone()).collect();
+                let edb_examples = EventDb::new(&self.sql_path)?;
+                for an in report.anomalies {
+                    let sev_score = match an.severity {
+                        AnomalyLevel::Critical => 1.0,
+                        AnomalyLevel::High => 0.75,
+                        AnomalyLevel::Medium => 0.5,
+                        AnomalyLevel::Low => 0.25,
+                    };
+                    let e = finding_by_host
+                        .entry(an.machine_id.clone())
+                        .or_insert_with(|| DetectionFinding {
+                            machine_id: an.machine_id.clone(),
+                            severity: "LOW".to_string(),
+                            score: 0.0,
+                            reasons: Vec::new(),
+                            detectors: Vec::new(),
+                            dataset_tags: Vec::new(),
+                            reasons_by_detector: Vec::new(),
+                        });
+                    e.score = e.score.max(sev_score);
+                    Self::extend_detector_reasons(e, "ironsift-process", an.anomalous_features);
+                    e.detectors.push("ironsift-process".to_string());
+
+                    if let Some(profile) = merged.iter().find(|p| p.id == an.machine_id) {
+                        let (lookup_datasets, logical_machine) = if multi_process {
+                            split_namespaced_machine_id(&an.machine_id)
+                                .map(|(ds, host)| (vec![ds], host))
+                                .unwrap_or_else(|| {
+                                    (process_dataset_ids.clone(), an.machine_id.clone())
+                                })
+                        } else {
+                            (process_dataset_ids.clone(), an.machine_id.clone())
+                        };
+                        let mut examples_added = 0usize;
+                        let mut risky: Vec<(&ProcessSignature, u32)> = profile
+                            .counts
+                            .iter()
+                            .filter(|(sig, _)| {
+                                let common =
+                                    config.common_root_processes.iter().any(|p| sig.name.contains(p));
+                                let behavioral = sig.is_high_entropy || sig.is_suspicious_path;
+                                let unexpected_root = sig.uid == 0 && !common;
+                                behavioral || unexpected_root
+                            })
+                            .map(|(s, c)| (s, *c))
+                            .collect();
+                        risky.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.name.cmp(&b.0.name)));
+                        for (sig, _count) in risky {
+                            if examples_added >= PROCESS_RISK_EXAMPLES_PER_HOST {
+                                break;
+                            }
+                            match edb_examples.find_process_row_example(
+                                &lookup_datasets,
+                                &logical_machine,
+                                sig.name.as_ref(),
+                                sig.path.as_ref(),
+                            ) {
+                                Ok(Some(row)) => {
+                                    Self::push_detector_reason(
+                                        e,
+                                        "ironsift-process",
+                                        format!(
+                                            "Process row: dataset={} machine_id={} pid={} parent={} uid={} name={} path={} cmdline={} start_time={}",
+                                            row.dataset_id,
+                                            row.machine_id,
+                                            row.pid,
+                                            row.parent,
+                                            row.uid,
+                                            row.name,
+                                            row.path,
+                                            truncate_for_reason(&row.cmdline),
+                                            row.start_time
+                                                .map(|s| s.to_string())
+                                                .unwrap_or_else(|| "(none)".to_string()),
+                                        ),
+                                    );
+                                    examples_added += 1;
+                                }
+                                Ok(None) => {}
+                                Err(err) => {
+                                    log::debug!(
+                                        "process row lookup failed (dataset={:?}, machine={}, name={}, path={}): {}",
+                                        lookup_datasets,
+                                        logical_machine,
+                                        sig.name,
+                                        sig.path,
+                                        err
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
             }
-            if req.enable_anomark {
+            if run_anomark {
                 if let Some(amo) = self.resolve_anomark_settings_for_run(&req) {
-                    let an_scores = score_with_anomark(&process_sets, &amo)?;
-                    for (host, s) in an_scores {
-                        let s = finite_f64(s);
+                    let an_scores = score_with_anomark(
+                        &self.sql_path,
+                        &process_sets,
+                        &amo,
+                        multi_process,
+                        anomark_suspect_percent,
+                    )?;
+                    for (host, host_score) in an_scores {
+                        let ratio = finite_f64(host_score.ratio);
+                        if host_score.suspects.is_empty() && ratio <= 0.0 {
+                            continue;
+                        }
                         let e = finding_by_host.entry(host.clone()).or_insert_with(|| DetectionFinding {
                             machine_id: host,
                             severity: "LOW".to_string(),
                             score: 0.0,
                             reasons: Vec::new(),
                             detectors: Vec::new(),
+                            dataset_tags: Vec::new(),
+                            reasons_by_detector: Vec::new(),
                         });
                         e.score = e
                             .score
-                            .max(finite_f64((e.score * 0.7) + (s * 0.3)));
-                        e.reasons
-                            .push(format!("AnoMark suspicious command ratio {:.2}", s));
+                            .max(finite_f64((e.score * 0.7) + (ratio * 0.3)));
+                        Self::push_detector_reason(
+                            e,
+                            "anomark-rs",
+                            format!(
+                                "AnoMark suspicious command ratio {:.2} (suspect {:.1}%)",
+                                ratio, anomark_suspect_percent
+                            ),
+                        );
+                        for ex in &host_score.suspects {
+                            Self::push_detector_reason(
+                                e,
+                                "anomark-rs",
+                                format!(
+                                    "AnoMark suspect: {} (ll={:.2}, margin={:.2})",
+                                    truncate_for_reason(&ex.command),
+                                    ex.log_likelihood,
+                                    ex.margin_ln
+                                ),
+                            );
+                        }
                         e.detectors.push("anomark-rs".to_string());
                     }
+                } else if matches!(req.detector_mode, RunDetectorMode::AnomarkOnly) {
+                    return Err(
+                        "AnoMark-only run requires a readable model (configure AnoMark in settings or choose a saved training)."
+                            .into(),
+                    );
+                } else {
+                    log::warn!(
+                        "AnoMark was enabled for this run but skipped: no readable model file (configure AnoMark in settings or pick a valid saved training)"
+                    );
                 }
             }
         }
 
-        if !file_sets.is_empty() {
+        if !file_sets.is_empty() && run_fleet {
+            let multi_file = file_sets.len() > 1;
+            let run_file_dataset_ids: Vec<String> = file_sets
+                .iter()
+                .map(|d| d.id.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
             let mut all = Vec::<MachineFileProfile>::new();
             for d in &file_sets {
-                all.extend(load_file_profiles(d, &config)?);
+                let mut profiles = load_file_profiles_sqlite_first(
+                    &self.sql_path,
+                    d,
+                    &config,
+                    &run_file_dataset_ids,
+                )?;
+                if multi_file {
+                    for p in &mut profiles {
+                        p.id = namespace_run_machine_id(&d.id, &p.id, true);
+                    }
+                }
+                all.extend(profiles);
             }
             let merged = merge_file_profiles(&all);
             let report = analyze_files_fleet(&merged, &config)?;
@@ -1089,9 +3241,11 @@ impl PlatformStore {
                         score: 0.0,
                         reasons: Vec::new(),
                         detectors: Vec::new(),
+                        dataset_tags: Vec::new(),
+                        reasons_by_detector: Vec::new(),
                     });
                 e.score = e.score.max(sev_score);
-                e.reasons.extend(an.anomalous_features);
+                Self::extend_detector_reasons(e, "ironsift-file", an.anomalous_features);
                 e.detectors.push("ironsift-file".to_string());
             }
         }
@@ -1105,12 +3259,50 @@ impl PlatformStore {
                 f.reasons.dedup();
                 f.detectors.sort();
                 f.detectors.dedup();
+                // Within each per-detector bucket, dedup while preserving insertion order so
+                // high-level summaries stay above details (e.g. AnoMark ratio before suspects).
+                for bucket in f.reasons_by_detector.iter_mut() {
+                    let mut seen: HashSet<String> = HashSet::new();
+                    bucket.reasons.retain(|r| seen.insert(r.clone()));
+                }
+                // Stable canonical order across buckets so the UI groups appear consistently.
+                fn detector_rank(d: &str) -> u8 {
+                    match d {
+                        "ironsift-process" => 0,
+                        "anomark-rs" => 1,
+                        "ironsift-file" => 2,
+                        _ => 3,
+                    }
+                }
+                f.reasons_by_detector.sort_by(|a, b| {
+                    detector_rank(&a.detector)
+                        .cmp(&detector_rank(&b.detector))
+                        .then_with(|| a.detector.cmp(&b.detector))
+                });
                 f
             })
             .collect();
-        findings.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-
         let selected_ids: Vec<String> = datasets.iter().map(|d| d.id.clone()).collect();
+        for f in &mut findings {
+            f.dataset_tags = resolve_machine_dataset_tags_for_run(
+                &f.machine_id,
+                &selected_ids,
+                req.detection_focus,
+                &datasets,
+            );
+        }
+        findings.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        let request = DetectionRunRequestSnapshot {
+            dataset_ids: selected_ids.clone(),
+            baseline_tags: req.baseline_tags.clone(),
+            candidate_tags: req.candidate_tags.clone(),
+            enable_anomark: req.enable_anomark,
+            anomark_train_id: req.anomark_train_id.clone(),
+            anomark_suspect_percent,
+            detection_config_id: dc_id.clone(),
+            detection_focus: req.detection_focus,
+            detector_mode: req.detector_mode,
+        };
         let rec = DetectionRunRecord {
             id: Uuid::new_v4().to_string(),
             created_at: Utc::now().to_rfc3339(),
@@ -1121,6 +3313,13 @@ impl PlatformStore {
             candidate_finding_count: findings.len(),
             summary: format!("{} findings", findings.len()),
             findings,
+            detection_config_id: dc_id,
+            detection_config_name: dc_name,
+            detection_focus: req.detection_focus,
+            detector_mode: req.detector_mode,
+            anomark_suspect_percent,
+            request,
+            user_triage: RunUserTriage::default(),
         };
         self.db.write().runs.push(rec.clone());
         self.save()?;
@@ -1157,9 +3356,21 @@ impl PlatformStore {
             .map(|f| (f.machine_id.clone(), f))
             .collect();
 
+        let db = self.db.read();
+        let datasets_slice = db.datasets.as_slice();
+
         let cells: Vec<HoneycombCell> = all
             .into_iter()
             .map(|name| {
+                let dataset_tags = match by_machine.get(&name) {
+                    Some(f) if !f.dataset_tags.is_empty() => f.dataset_tags.clone(),
+                    Some(_) | None => resolve_machine_dataset_tags_for_run(
+                        &name,
+                        &r.dataset_ids,
+                        r.detection_focus,
+                        datasets_slice,
+                    ),
+                };
                 if let Some(f) = by_machine.get(&name) {
                     let matches_filter = finding_passes(f, min_score, severity);
                     HoneycombCell {
@@ -1170,6 +3381,7 @@ impl PlatformStore {
                         matches_filter,
                         reasons: f.reasons.clone(),
                         detectors: f.detectors.clone(),
+                        dataset_tags,
                     }
                 } else {
                     HoneycombCell {
@@ -1180,64 +3392,12 @@ impl PlatformStore {
                         matches_filter: true,
                         reasons: vec![],
                         detectors: vec![],
+                        dataset_tags,
                     }
                 }
             })
             .collect();
         Some(cells)
-    }
-
-    pub fn run_auto_pipeline(
-        &self,
-        req: AutoPipelineRequest,
-    ) -> Result<AutoPipelineResult, Box<dyn Error>> {
-        let dir = Path::new(&req.directory);
-        if !dir.is_dir() {
-            return Err(format!("directory not found: {}", req.directory).into());
-        }
-        let mut ids = Vec::new();
-        for entry in fs::read_dir(dir)? {
-            let p = entry?.path();
-            if !p.is_file() {
-                continue;
-            }
-            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or_default();
-            if ext != "csv" && ext != "json" && ext != "jsonl" {
-                continue;
-            }
-            let mut tags = Vec::new();
-            if !req.candidate_tag.is_empty() {
-                tags.push(req.candidate_tag.clone());
-            }
-            let fname = p.file_name().and_then(|x| x.to_str()).unwrap_or_default();
-            if fname.contains("baseline") && !req.baseline_tag.is_empty() {
-                tags.push(req.baseline_tag.clone());
-            }
-            let rec = self.import_file_auto(p.to_str().unwrap_or_default(), None, tags)?;
-            ids.push(rec.id);
-        }
-        if ids.is_empty() {
-            return Err("no importable files found (csv/json/jsonl)".into());
-        }
-        let run = self.run_detection(CreateRunRequest {
-            dataset_ids: ids.clone(),
-            baseline_tags: if req.baseline_tag.is_empty() {
-                Vec::new()
-            } else {
-                vec![req.baseline_tag]
-            },
-            candidate_tags: if req.candidate_tag.is_empty() {
-                Vec::new()
-            } else {
-                vec![req.candidate_tag]
-            },
-            enable_anomark: req.enable_anomark,
-            anomark_train_id: None,
-        })?;
-        Ok(AutoPipelineResult {
-            imported_dataset_ids: ids,
-            run_id: run.id,
-        })
     }
 
     fn selected_datasets(&self, req: &CreateRunRequest) -> Result<Vec<DatasetRecord>, Box<dyn Error>> {
@@ -1285,16 +3445,58 @@ fn severity_from_score(score: f64) -> &'static str {
     }
 }
 
+fn collect_jsonl_paths(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Box<dyn Error>> {
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_jsonl_paths(&path, out)?;
+        } else if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("jsonl"))
+        {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
 fn load_process_profiles(
     dataset: &DatasetRecord,
     cfg: &DetectionConfig,
 ) -> Result<Vec<MachineProfile>, Box<dyn Error>> {
+    let mid = dataset.ingest_default_machine_id.as_deref();
     match dataset.format.as_str() {
-        "jsonl" => load_jsonl_data(&dataset.source_path, cfg),
+        "jsonl" => load_jsonl_data(&dataset.source_path, cfg, mid),
         "json" => load_json_data(&dataset.source_path, cfg),
         "csv" => load_csv_data(&dataset.source_path, cfg),
         _ => Err(format!("unsupported process dataset format: {}", dataset.format).into()),
     }
+}
+
+/// Prefer ingested SQLite rows so test rows (Inspect → Append) are evaluated by detection runs;
+/// fall back to the source file when SQLite has no rows for this dataset (e.g. ingest is stale).
+fn load_process_profiles_sqlite_first(
+    sql_path: &str,
+    dataset: &DatasetRecord,
+    cfg: &DetectionConfig,
+) -> Result<Vec<MachineProfile>, Box<dyn Error>> {
+    let edb = EventDb::new(sql_path)?;
+    let entries = edb.process_entries_for_dataset(&dataset.id)?;
+    if !entries.is_empty() {
+        log::info!(
+            "Run: loaded {} process rows from event_db for dataset {} (includes any test rows)",
+            entries.len(),
+            dataset.id
+        );
+        return Ok(build_profiles(entries, cfg));
+    }
+    log::info!(
+        "Run: dataset {} has no SQLite process rows; falling back to source file {}",
+        dataset.id,
+        dataset.source_path
+    );
+    load_process_profiles(dataset, cfg)
 }
 
 fn detect_kind(path: &Path) -> Result<DatasetKind, Box<dyn Error>> {
@@ -1315,16 +3517,27 @@ fn detect_kind(path: &Path) -> Result<DatasetKind, Box<dyn Error>> {
             Ok(DatasetKind::File)
         }
     } else if ext == "json" || ext == "jsonl" {
-        // Heuristic based on filename when JSON shape is unknown.
-        let n = path
-            .file_name()
-            .and_then(|x| x.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if n.contains("file") {
-            Ok(DatasetKind::File)
-        } else {
-            Ok(DatasetKind::Process)
+        match crate::json_parse::sniff_json_or_jsonl_dataset_kind(path) {
+            Ok(crate::json_parse::JsonSniffDatasetKind::Process) => Ok(DatasetKind::Process),
+            Ok(crate::json_parse::JsonSniffDatasetKind::File) => Ok(DatasetKind::File),
+            Ok(crate::json_parse::JsonSniffDatasetKind::Mixed) => Ok(DatasetKind::Mixed),
+            Err(e) => {
+                log::warn!(
+                    "could not sniff JSON/JSONL kind for {} ({}); falling back to filename heuristic",
+                    path.display(),
+                    e
+                );
+                let n = path
+                    .file_name()
+                    .and_then(|x| x.to_str())
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                Ok(if n.contains("file") {
+                    DatasetKind::File
+                } else {
+                    DatasetKind::Process
+                })
+            }
         }
     } else {
         Err("unsupported format for auto detection".into())
@@ -1335,12 +3548,63 @@ fn load_file_profiles(
     dataset: &DatasetRecord,
     cfg: &DetectionConfig,
 ) -> Result<Vec<MachineFileProfile>, Box<dyn Error>> {
+    let mid = dataset.ingest_default_machine_id.as_deref();
     match dataset.format.as_str() {
-        "jsonl" => load_files_jsonl_data(&dataset.source_path, cfg),
-        "json" => load_files_json_data(&dataset.source_path, cfg),
+        "jsonl" => load_files_jsonl_data(&dataset.source_path, cfg, mid),
+        "json" => load_files_json_data(&dataset.source_path, cfg, mid),
         "csv" => load_files_csv_data(&dataset.source_path, cfg),
         _ => Err(format!("unsupported file dataset format: {}", dataset.format).into()),
     }
+}
+
+fn load_file_profiles_sqlite_first(
+    sql_path: &str,
+    dataset: &DatasetRecord,
+    cfg: &DetectionConfig,
+    run_file_dataset_ids: &[String],
+) -> Result<Vec<MachineFileProfile>, Box<dyn Error>> {
+    let edb = EventDb::new(sql_path)?;
+    // Stream rows from SQLite directly into per-machine groups: with a 20 × 40k file fleet this
+    // skips a 200+ MB intermediate `Vec<RawFileEntry>` that would otherwise stay alive while
+    // the per-machine vectors were also being built.
+    let grouped = edb.group_file_entries_by_machine_for_run(
+        &dataset.id,
+        run_file_dataset_ids,
+        cfg.file_exclude_common_inventory_sql,
+    )?;
+    if !grouped.is_empty() {
+        let machines_after_sql = grouped.len();
+        let after_sql: usize = grouped.values().map(|v| v.len()).sum();
+        let profiles = build_file_profiles_from_grouped(grouped, cfg);
+        let ingested: usize = profiles.iter().map(|p| p.total_logs as usize).sum();
+        if cfg.file_exclude_common_inventory_sql && !run_file_dataset_ids.is_empty() {
+            let stored = edb.count_file_rows_for_dataset(&dataset.id)? as usize;
+            log::info!(
+                "Run: file dataset {} — {} row(s) in event_db, {} retained after inv_checksum exclusion (common across all {} file dataset(s) in this run, or universal across hosts when a single file dataset), {} ingested into profiles after path/filename filters (final rows used for detection); {} machine(s) after SQL filter, streamed by machine; includes test rows",
+                dataset.id,
+                stored,
+                after_sql,
+                run_file_dataset_ids.len(),
+                ingested,
+                machines_after_sql,
+            );
+        } else {
+            log::info!(
+                "Run: loaded {} file row(s) from event_db for dataset {} across {} machine(s), {} ingested into profiles after path/filename filters (final rows used for detection; streamed by machine; includes test rows)",
+                after_sql,
+                dataset.id,
+                machines_after_sql,
+                ingested,
+            );
+        }
+        return Ok(profiles);
+    }
+    log::info!(
+        "Run: dataset {} has no SQLite file rows; falling back to source file {}",
+        dataset.id,
+        dataset.source_path
+    );
+    load_file_profiles(dataset, cfg)
 }
 
 fn merge_process_profiles(input: &[MachineProfile]) -> Vec<MachineProfile> {
@@ -1353,6 +3617,25 @@ fn merge_process_profiles(input: &[MachineProfile]) -> Vec<MachineProfile> {
         }
     }
     map.into_values().collect()
+}
+
+/// When multiple datasets are in one run, the same logical `machine_id` in two files must not be
+/// merged—they are different collection windows. Prefix with `dataset_id/` so fleet analysis and
+/// findings stay distinct (single-dataset runs keep plain host ids for stable UI labels).
+fn namespace_run_machine_id(dataset_id: &str, logical_host: &str, multi_dataset: bool) -> String {
+    if multi_dataset {
+        format!("{}/{}", dataset_id, logical_host)
+    } else {
+        logical_host.to_string()
+    }
+}
+
+/// Inverse of [`namespace_run_machine_id`] when `multi_dataset` was true: split the `dataset_id/host`
+/// pair so callers can scope a SQLite lookup to that dataset. Returns `None` when there is no `/`.
+fn split_namespaced_machine_id(namespaced: &str) -> Option<(String, String)> {
+    namespaced
+        .split_once('/')
+        .map(|(ds, host)| (ds.to_string(), host.to_string()))
 }
 
 fn merge_file_profiles(input: &[MachineFileProfile]) -> Vec<MachineFileProfile> {
@@ -1379,16 +3662,50 @@ fn merge_file_profiles(input: &[MachineFileProfile]) -> Vec<MachineFileProfile> 
     map.into_values().collect()
 }
 
+/// Max risky-process example rows surfaced per host in fleet findings (one row per signature).
+const PROCESS_RISK_EXAMPLES_PER_HOST: usize = 5;
+
+/// Max suspect command examples kept per host (ascending by `log_likelihood`, i.e. worst-first).
+const ANOMARK_SUSPECT_EXAMPLES_PER_HOST: usize = 5;
+
+/// Max characters of a suspect command preserved in finding reasons (longer cmdlines get truncated with `…`).
+const ANOMARK_SUSPECT_EXAMPLE_MAX_CHARS: usize = 240;
+
+#[derive(Debug, Clone)]
+struct AnomarkSuspectExample {
+    command: String,
+    log_likelihood: f64,
+    margin_ln: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AnomarkHostScore {
+    ratio: f64,
+    /// Worst-first (lowest log_likelihood = most surprising); bounded by [`ANOMARK_SUSPECT_EXAMPLES_PER_HOST`].
+    suspects: Vec<AnomarkSuspectExample>,
+}
+
+fn truncate_for_reason(s: &str) -> String {
+    if s.chars().count() <= ANOMARK_SUSPECT_EXAMPLE_MAX_CHARS {
+        return s.to_string();
+    }
+    let truncated: String = s.chars().take(ANOMARK_SUSPECT_EXAMPLE_MAX_CHARS).collect();
+    format!("{}…", truncated)
+}
+
 fn score_with_anomark(
+    sql_path: &str,
     process_datasets: &[DatasetRecord],
     settings: &AnoMarkSettings,
-) -> Result<HashMap<String, f64>, Box<dyn Error>> {
+    namespace_by_dataset: bool,
+    suspect_percent: f64,
+) -> Result<HashMap<String, AnomarkHostScore>, Box<dyn Error>> {
     if settings.model_path.is_empty() {
         return Ok(HashMap::new());
     }
     let model_path = settings.model_path.as_str();
     let column = if settings.column.is_empty() {
-        "command"
+        "cmdline"
     } else {
         settings.column.as_str()
     };
@@ -1402,51 +3719,95 @@ fn score_with_anomark(
     if !model.is_trained() {
         model.normalize_model_and_compute_prior();
     }
-    let threshold_ln = ModelHandler::compute_threshold(&model, 95.0);
+    let pct = clamp_anomark_suspect_percent(suspect_percent);
+    let threshold_ln = ModelHandler::compute_threshold(&model, pct);
 
     let mut totals: HashMap<String, (u32, u32)> = HashMap::new();
+    let mut suspects_per_host: HashMap<String, Vec<AnomarkSuspectExample>> = HashMap::new();
+    let edb = EventDb::new(sql_path)?;
 
     for ds in process_datasets {
-        // `anomark::load_jsonl_with_columns` is for newline-delimited JSON, not a single JSON array file.
-        // `json` process datasets are loaded elsewhere via `parse_json_logs` — match that here.
-        let rows: Vec<AHashMap<String, String>> = match ds.format.as_str() {
-            "json" => {
-                let content = fs::read_to_string(&ds.source_path)
-                    .map_err(|e: std::io::Error| e.to_string())?;
-                let entries = parse_json_logs(&content).map_err(|e| e.to_string())?;
-                if entries.is_empty() {
-                    log::warn!(
-                        "AnoMark: no parseable process rows in json dataset at {}",
-                        ds.source_path
-                    );
+        // Prefer ingested SQLite rows so test rows added via Inspect → Append are scored.
+        // Fall back to the source file only when SQLite has no rows (e.g. ingest is stale).
+        let sqlite_entries = edb.process_entries_for_dataset(&ds.id)?;
+        let rows: Vec<AHashMap<String, String>> = if !sqlite_entries.is_empty() {
+            sqlite_entries
+                .iter()
+                .map(raw_log_entry_to_anomark_row)
+                .collect()
+        } else {
+            // `anomark::load_jsonl_with_columns` is for newline-delimited JSON, not a single JSON array file.
+            // `json` process datasets are loaded elsewhere via `parse_json_logs` — match that here.
+            match ds.format.as_str() {
+                "json" => {
+                    let content = fs::read_to_string(&ds.source_path)
+                        .map_err(|e: std::io::Error| e.to_string())?;
+                    let entries = parse_json_logs(&content).map_err(|e| e.to_string())?;
+                    if entries.is_empty() {
+                        log::warn!(
+                            "AnoMark: no parseable process rows in json dataset at {}",
+                            ds.source_path
+                        );
+                    }
+                    entries.iter().map(raw_log_entry_to_anomark_row).collect()
                 }
-                entries.iter().map(raw_log_entry_to_anomark_row).collect()
+                "jsonl" => load_jsonl_with_columns(&ds.source_path)
+                    .map_err(|e: anyhow::Error| e.to_string())?,
+                "csv" => load_csv_with_columns(&ds.source_path)
+                    .map_err(|e: anyhow::Error| e.to_string())?,
+                _ => {
+                    return Err(format!(
+                        "unsupported dataset format for anomark scoring: {} (use csv, json, or jsonl)",
+                        ds.format
+                    )
+                    .into())
+                }
             }
-            "jsonl" => load_jsonl_with_columns(&ds.source_path)
-                .map_err(|e: anyhow::Error| e.to_string())?,
-            "csv" => load_csv_with_columns(&ds.source_path)
-                .map_err(|e: anyhow::Error| e.to_string())?,
-            _ => return Err(
-                format!(
-                    "unsupported dataset format for anomark scoring: {} (use csv, json, or jsonl)",
-                    ds.format
-                )
-                .into(),
-            ),
         };
         for row in rows {
-            let cmd = row_key_lookup(&row, column);
-            let host = row_key_lookup(&row, machine_field);
-            if cmd.is_empty() {
+            let cmd = row_command_for_anomark(&row, column);
+            let host_raw = row_machine_for_anomark(&row, machine_field);
+            let host = namespace_run_machine_id(&ds.id, &host_raw, namespace_by_dataset);
+            let scored = anomark_score_line(&host_raw, &cmd);
+            if scored.is_empty() {
                 continue;
             }
-            let padded = format!("{}{}", "~".repeat(model.order), cmd);
+            let padded = format!("{}{}", "~".repeat(model.order), scored);
             let score = model.log_likelihood(&padded);
             let suspect = ModelHandler::is_suspect_command(score, threshold_ln);
-            let entry = totals.entry(host).or_insert((0, 0));
-            entry.0 += 1;
-            if suspect {
-                entry.1 += 1;
+            {
+                let entry = totals.entry(host.clone()).or_insert((0, 0));
+                entry.0 += 1;
+                if suspect {
+                    entry.1 += 1;
+                }
+            }
+            if suspect && !cmd.trim().is_empty() {
+                let bucket = suspects_per_host.entry(host).or_default();
+                let example = AnomarkSuspectExample {
+                    command: cmd,
+                    log_likelihood: finite_f64(score),
+                    margin_ln: finite_f64(score - threshold_ln),
+                };
+                if bucket.len() < ANOMARK_SUSPECT_EXAMPLES_PER_HOST {
+                    bucket.push(example);
+                    bucket.sort_by(|a, b| {
+                        a.log_likelihood
+                            .partial_cmp(&b.log_likelihood)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                } else if let Some(worst_kept) = bucket.last() {
+                    // Keep the N most surprising commands (lowest log_likelihood = "most unusual").
+                    if example.log_likelihood < worst_kept.log_likelihood {
+                        bucket.pop();
+                        bucket.push(example);
+                        bucket.sort_by(|a, b| {
+                            a.log_likelihood
+                                .partial_cmp(&b.log_likelihood)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                    }
+                }
             }
         }
     }
@@ -1454,7 +3815,9 @@ fn score_with_anomark(
     let mut scores = HashMap::new();
     for (host, (all, suspect)) in totals {
         if all > 0 {
-            scores.insert(host, suspect as f64 / all as f64);
+            let ratio = suspect as f64 / all as f64;
+            let suspects = suspects_per_host.remove(&host).unwrap_or_default();
+            scores.insert(host, AnomarkHostScore { ratio, suspects });
         }
     }
     Ok(scores)
@@ -1475,6 +3838,75 @@ fn parse_sigma_field_map(s: &str) -> HashMap<String, String> {
         .collect()
 }
 
+/// Common command field names when the configured AnoMark column is empty (e.g. JSONL uses `command` vs `cmdline`).
+const ANOMARK_CMD_FALLBACK_KEYS: &[&str] = &[
+    "cmdline",
+    "command",
+    "cmd",
+    "CommandLine",
+    "command_line",
+    "ProcessCommandLine",
+    "Image",
+];
+
+/// Host / machine columns used when [`AnoMarkSettings::machine_field`] is missing on a row.
+const ANOMARK_MACHINE_FALLBACK_KEYS: &[&str] = &[
+    "machine_id",
+    "hostname",
+    "host_identifier",
+    "host",
+    "node",
+];
+
+/// Text scored by AnoMark: `"{machine} {cmd}"` when `machine_label` is non-empty (matches training snapshots).
+fn anomark_score_line(machine_label: &str, cmd: &str) -> String {
+    let m = machine_label.trim();
+    let c = cmd.trim();
+    if c.is_empty() {
+        return String::new();
+    }
+    if m.is_empty() {
+        return c.to_string();
+    }
+    format!("{} {}", m, c)
+}
+
+fn row_machine_for_anomark(row: &AHashMap<String, String>, primary: &str) -> String {
+    let primary_lc = primary.to_ascii_lowercase();
+    let mut h = row_key_lookup(row, primary);
+    if !h.is_empty() {
+        return h;
+    }
+    for key in ANOMARK_MACHINE_FALLBACK_KEYS {
+        if key.to_ascii_lowercase() == primary_lc {
+            continue;
+        }
+        h = row_key_lookup(row, key);
+        if !h.is_empty() {
+            return h;
+        }
+    }
+    String::new()
+}
+
+fn row_command_for_anomark(row: &AHashMap<String, String>, primary: &str) -> String {
+    let primary_lc = primary.to_ascii_lowercase();
+    let mut cmd = row_key_lookup(row, primary);
+    if !cmd.is_empty() {
+        return cmd;
+    }
+    for key in ANOMARK_CMD_FALLBACK_KEYS {
+        if key.to_ascii_lowercase() == primary_lc {
+            continue;
+        }
+        cmd = row_key_lookup(row, key);
+        if !cmd.is_empty() {
+            return cmd;
+        }
+    }
+    String::new()
+}
+
 /// Case-insensitive single-value lookup in a training row.
 /// String rows for AnoMark, aligned with `parse_json_logs` / `load_json_data` (not line-oriented JSONL helpers).
 fn raw_log_entry_to_anomark_row(e: &RawLogEntry) -> AHashMap<String, String> {
@@ -1491,6 +3923,7 @@ fn raw_log_entry_to_anomark_row(e: &RawLogEntry) -> AHashMap<String, String> {
     } else {
         e.name.clone()
     };
+    m.insert("cmdline".to_string(), command.clone());
     m.insert("command".to_string(), command);
     m
 }
@@ -1513,5 +3946,531 @@ fn _analysis_type_name(t: AnalysisType) -> &'static str {
     match t {
         AnalysisType::Process => "process",
         AnalysisType::File => "file",
+    }
+}
+
+#[cfg(test)]
+mod json_kind_sniff_tests {
+    use crate::json_parse::{classify_json_line_shape, JsonLineShape};
+    use serde_json::json;
+
+    #[test]
+    fn file_information_inventory_row_is_file() {
+        let v = json!({
+            "timestamp": "2026-04-27T00:10:05",
+            "date": "2026-04-17T20:34:00",
+            "event_type": "file_information",
+            "permissions": "-rw-r-----.",
+            "owner": "root",
+            "group": "root",
+            "size": 221295,
+            "file_path": "/data/var/dlogs/config_rest_server.log"
+        });
+        assert_eq!(classify_json_line_shape(&v), JsonLineShape::File);
+    }
+
+    #[test]
+    fn cmdline_pid_row_is_process() {
+        let v = json!({"cmdline": "/bin/sh -c id", "pid": 401, "parent": 1});
+        assert_eq!(classify_json_line_shape(&v), JsonLineShape::Process);
+    }
+}
+
+#[cfg(test)]
+mod parent_dir_tag_tests {
+    use super::parent_dir_segment_tag;
+
+    #[test]
+    fn example_folder_name_field_4_is_host() {
+        let n = "RemoteAccess-Periodicsnapshot-standalone-HOSTEXAMPLE01-20260330-0012";
+        assert_eq!(
+            parent_dir_segment_tag(n, 4, '-').as_deref(),
+            Some("HOSTEXAMPLE01")
+        );
+    }
+
+    #[test]
+    fn out_of_range_returns_none() {
+        assert!(parent_dir_segment_tag("a-b", 9, '-').is_none());
+    }
+}
+
+#[cfg(test)]
+mod anomark_score_line_tests {
+    use super::anomark_score_line;
+
+    #[test]
+    fn prefixes_machine_when_non_empty() {
+        assert_eq!(
+            anomark_score_line("web-01", "/bin/bash -c ls"),
+            "web-01 /bin/bash -c ls"
+        );
+    }
+
+    #[test]
+    fn command_only_when_machine_missing() {
+        assert_eq!(anomark_score_line("", "echo hi"), "echo hi");
+        assert_eq!(anomark_score_line("   ", "echo hi"), "echo hi");
+    }
+
+    #[test]
+    fn empty_when_command_empty() {
+        assert!(anomark_score_line("host", "").is_empty());
+        assert!(anomark_score_line("host", "  ").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod anomark_row_command_tests {
+    use super::{row_command_for_anomark, AHashMap};
+
+    #[test]
+    fn falls_back_from_cmdline_to_command() {
+        let mut row = AHashMap::default();
+        row.insert("command".to_string(), "C:\\\\Windows\\\\cmd.exe /c whoami".to_string());
+        assert_eq!(
+            row_command_for_anomark(&row, "cmdline"),
+            "C:\\\\Windows\\\\cmd.exe /c whoami"
+        );
+    }
+
+    #[test]
+    fn primary_column_wins_when_present() {
+        let mut row = AHashMap::default();
+        row.insert("cmdline".to_string(), "primary".to_string());
+        row.insert("command".to_string(), "other".to_string());
+        assert_eq!(row_command_for_anomark(&row, "cmdline"), "primary");
+    }
+}
+
+#[cfg(test)]
+mod run_detector_mode_tests {
+    use super::{run_anomark_detection, run_fleet_detection, RunDetectorMode};
+
+    #[test]
+    fn fleet_and_anomark_flags_by_mode() {
+        assert!(run_fleet_detection(RunDetectorMode::Both));
+        assert!(run_fleet_detection(RunDetectorMode::IronsiftOnly));
+        assert!(!run_fleet_detection(RunDetectorMode::AnomarkOnly));
+
+        assert!(run_anomark_detection(RunDetectorMode::AnomarkOnly, false));
+        assert!(!run_anomark_detection(RunDetectorMode::IronsiftOnly, true));
+        assert!(run_anomark_detection(RunDetectorMode::Both, true));
+        assert!(!run_anomark_detection(RunDetectorMode::Both, false));
+    }
+}
+
+#[cfg(test)]
+mod run_detection_focus_tests {
+    use super::{run_detection_arms, DatasetKind, RunDetectionFocus};
+
+    #[test]
+    fn auto_mixed_in_both_arms() {
+        assert_eq!(
+            run_detection_arms(DatasetKind::Mixed, RunDetectionFocus::Auto),
+            (true, true)
+        );
+    }
+
+    #[test]
+    fn process_only_mixed_process_arm_only() {
+        assert_eq!(
+            run_detection_arms(DatasetKind::Mixed, RunDetectionFocus::ProcessOnly),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn file_only_mixed_file_arm_only() {
+        assert_eq!(
+            run_detection_arms(DatasetKind::Mixed, RunDetectionFocus::FileOnly),
+            (false, true)
+        );
+    }
+
+    #[test]
+    fn pure_process_and_file_unaffected_by_focus_arms() {
+        assert_eq!(
+            run_detection_arms(DatasetKind::Process, RunDetectionFocus::ProcessOnly),
+            (true, false)
+        );
+        assert_eq!(
+            run_detection_arms(DatasetKind::File, RunDetectionFocus::FileOnly),
+            (false, true)
+        );
+    }
+}
+
+#[cfg(test)]
+mod run_namespace_tests {
+    use super::namespace_run_machine_id;
+
+    #[test]
+    fn single_dataset_run_keeps_plain_host_id() {
+        assert_eq!(namespace_run_machine_id("ds-1", "web-01", false), "web-01");
+    }
+
+    #[test]
+    fn multi_dataset_run_prefixes_dataset_id() {
+        assert_eq!(
+            namespace_run_machine_id("817cbabb-2a33-483f-a70e-dc952263d9fa", "web-01", true),
+            "817cbabb-2a33-483f-a70e-dc952263d9fa/web-01"
+        );
+    }
+}
+
+#[cfg(test)]
+mod dataset_tags_resolve_tests {
+    use super::{
+        resolve_machine_dataset_tags_for_run, DatasetKind, DatasetRecord, RunDetectionFocus,
+    };
+
+    fn ds(id: &str, kind: DatasetKind, tags: &[&str]) -> DatasetRecord {
+        DatasetRecord {
+            id: id.to_string(),
+            name: id.to_string(),
+            source_path: String::new(),
+            format: "jsonl".to_string(),
+            kind,
+            tags: tags.iter().map(|s| (*s).to_string()).collect(),
+            schema_profile: String::new(),
+            imported_at: String::new(),
+            ingest_default_machine_id: None,
+        }
+    }
+
+    #[test]
+    fn prefixed_machine_uses_that_dataset_tags() {
+        let datasets = vec![
+            ds("ds-a", DatasetKind::Process, &["prod"]),
+            ds("ds-b", DatasetKind::Process, &["staging"]),
+        ];
+        let run_ids = vec!["ds-a".to_string(), "ds-b".to_string()];
+        let t = resolve_machine_dataset_tags_for_run(
+            "ds-a/host1",
+            &run_ids,
+            RunDetectionFocus::Auto,
+            &datasets,
+        );
+        assert_eq!(t, vec!["prod".to_string()]);
+    }
+
+    #[test]
+    fn single_process_dataset_unprefixed_gets_sorted_tags() {
+        let datasets = vec![ds("only", DatasetKind::Process, &["win", "srv"])];
+        let run_ids = vec!["only".to_string()];
+        let t = resolve_machine_dataset_tags_for_run(
+            "host",
+            &run_ids,
+            RunDetectionFocus::Auto,
+            &datasets,
+        );
+        assert_eq!(t, vec!["srv".to_string(), "win".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod anomark_training_delete_tests {
+    use super::{
+        AnoMarkSettings, AnoMarkTrainRecord, AnoMarkTrainRequest, PlatformStore,
+    };
+    use std::fs;
+    use std::path::Path;
+    use tempfile::tempdir;
+
+    /// Seed a [`PlatformStore`] with a fake AnoMark training record on disk so we can verify the
+    /// delete paths without spinning up the (slow) real `train_anomark` pipeline.
+    fn seed_training(store: &PlatformStore, id: &str) -> std::path::PathBuf {
+        let root = store.platform_root().expect("platform root resolves");
+        let dir = root.join("anomark-trains").join(id);
+        fs::create_dir_all(&dir).expect("training dir");
+        fs::write(dir.join("model.bin"), b"fake-model").expect("model.bin");
+        fs::write(dir.join("training_input.jsonl"), b"{\"cmdline\":\"ls -la\"}\n")
+            .expect("training input");
+        let rel_dir = format!("anomark-trains/{}", id);
+        let req = AnoMarkTrainRequest {
+            training_path: String::new(),
+            dataset_ids: Vec::new(),
+            tags: Vec::new(),
+            column: "cmdline".to_string(),
+            order: 4,
+            output_model_path: String::new(),
+        };
+        let rec = AnoMarkTrainRecord {
+            id: id.to_string(),
+            created_at: "1970-01-01T00:00:00Z".to_string(),
+            request: req,
+            source_dataset_ids: Vec::new(),
+            from_user_file: false,
+            rel_model_path: format!("{}/model.bin", rel_dir),
+            rel_training_data_path: format!("{}/training_input.jsonl", rel_dir),
+            training_line_count: 1,
+            bin_path_used: "test".to_string(),
+            favorite: false,
+        };
+        store.db.write().anomark_trainings.push(rec);
+        store.save().expect("save db");
+        dir
+    }
+
+    fn point_settings_at(store: &PlatformStore, model_path: &Path) {
+        let mut s = AnoMarkSettings::default();
+        s.model_path = model_path.to_string_lossy().to_string();
+        store
+            .set_anomark_settings(s)
+            .expect("settings update succeeds");
+    }
+
+    #[test]
+    fn delete_anomark_training_removes_record_and_files() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("db.json");
+        let store = PlatformStore::load_or_create(db_path.to_str().unwrap()).expect("store");
+        let train_dir = seed_training(&store, "train-aaa");
+        let model_file = train_dir.join("model.bin");
+        point_settings_at(&store, &model_file);
+
+        store
+            .delete_anomark_training("train-aaa")
+            .expect("delete succeeds");
+
+        assert!(store.list_anomark_trainings().is_empty());
+        assert!(!train_dir.exists(), "training dir should be wiped");
+        let cfg = store.get_anomark_settings();
+        assert!(
+            cfg.model_path.trim().is_empty(),
+            "model_path should be cleared when it pointed at the deleted training: {}",
+            cfg.model_path
+        );
+    }
+
+    #[test]
+    fn delete_anomark_training_keeps_unrelated_settings_path() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("db.json");
+        let store = PlatformStore::load_or_create(db_path.to_str().unwrap()).expect("store");
+        seed_training(&store, "train-aaa");
+        // External path that is *not* the deleted training's stored model.
+        let unrelated = dir.path().join("external-model.bin");
+        fs::write(&unrelated, b"fake").expect("write external");
+        point_settings_at(&store, &unrelated);
+
+        store
+            .delete_anomark_training("train-aaa")
+            .expect("delete succeeds");
+
+        let cfg = store.get_anomark_settings();
+        assert_eq!(
+            cfg.model_path,
+            unrelated.to_string_lossy().to_string(),
+            "external model_path must be preserved on training delete"
+        );
+    }
+
+    #[test]
+    fn delete_anomark_training_unknown_id_is_error() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("db.json");
+        let store = PlatformStore::load_or_create(db_path.to_str().unwrap()).expect("store");
+        seed_training(&store, "train-aaa");
+        let err = store
+            .delete_anomark_training("does-not-exist")
+            .expect_err("deleting unknown id must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not found"),
+            "error should mention not-found: {}",
+            msg
+        );
+        assert_eq!(
+            store.list_anomark_trainings().len(),
+            1,
+            "valid trainings must remain untouched"
+        );
+    }
+
+    #[test]
+    fn delete_all_anomark_trainings_clears_records_and_dirs() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("db.json");
+        let store = PlatformStore::load_or_create(db_path.to_str().unwrap()).expect("store");
+        let d1 = seed_training(&store, "train-aaa");
+        let d2 = seed_training(&store, "train-bbb");
+        let model_file = d2.join("model.bin");
+        point_settings_at(&store, &model_file);
+
+        let removed = store
+            .delete_all_anomark_trainings()
+            .expect("purge succeeds");
+
+        assert_eq!(removed, 2);
+        assert!(store.list_anomark_trainings().is_empty());
+        assert!(!d1.exists());
+        assert!(!d2.exists());
+        let cfg = store.get_anomark_settings();
+        assert!(
+            cfg.model_path.trim().is_empty(),
+            "purge should clear model_path that referenced any deleted training"
+        );
+    }
+
+    #[test]
+    fn delete_all_anomark_trainings_no_op_when_empty() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("db.json");
+        let store = PlatformStore::load_or_create(db_path.to_str().unwrap()).expect("store");
+        let removed = store
+            .delete_all_anomark_trainings()
+            .expect("purge succeeds even when empty");
+        assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn set_anomark_training_favorite_persists() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("db.json");
+        let store = PlatformStore::load_or_create(db_path.to_str().unwrap()).expect("store");
+        seed_training(&store, "train-aaa");
+        store
+            .set_anomark_training_favorite("train-aaa", true)
+            .expect("set favorite");
+        assert!(store.list_anomark_trainings()[0].favorite);
+        store
+            .set_anomark_training_favorite("train-aaa", false)
+            .expect("unset favorite");
+        assert!(!store.list_anomark_trainings()[0].favorite);
+    }
+
+    #[test]
+    fn set_anomark_training_favorite_unknown_id_errors() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("db.json");
+        let store = PlatformStore::load_or_create(db_path.to_str().unwrap()).expect("store");
+        seed_training(&store, "train-aaa");
+        let err = store
+            .set_anomark_training_favorite("missing", true)
+            .expect_err("unknown id");
+        assert!(
+            err.to_string().contains("not found"),
+            "unexpected: {}",
+            err
+        );
+        assert!(!store.list_anomark_trainings()[0].favorite);
+    }
+}
+
+#[cfg(test)]
+mod detector_reason_helpers_tests {
+    use super::{DetectionFinding, PlatformStore};
+
+    fn empty_finding(machine_id: &str) -> DetectionFinding {
+        DetectionFinding {
+            machine_id: machine_id.to_string(),
+            severity: "LOW".to_string(),
+            score: 0.0,
+            reasons: Vec::new(),
+            detectors: Vec::new(),
+            dataset_tags: Vec::new(),
+            reasons_by_detector: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn push_detector_reason_keeps_flat_and_bucket_in_sync() {
+        let mut f = empty_finding("h1");
+        PlatformStore::push_detector_reason(
+            &mut f,
+            "anomark-rs",
+            "AnoMark suspicious command ratio 0.01 (suspect 95.0%)".to_string(),
+        );
+        PlatformStore::push_detector_reason(
+            &mut f,
+            "anomark-rs",
+            "AnoMark suspect: /bin/ps (ll=-11.29, margin=-0.22)".to_string(),
+        );
+        PlatformStore::push_detector_reason(
+            &mut f,
+            "ironsift-process",
+            "RISK DETECTED: name=sh path=sh".to_string(),
+        );
+
+        assert_eq!(f.reasons.len(), 3);
+        assert_eq!(f.reasons_by_detector.len(), 2);
+        let an = f
+            .reasons_by_detector
+            .iter()
+            .find(|b| b.detector == "anomark-rs")
+            .expect("anomark bucket");
+        assert_eq!(an.reasons.len(), 2);
+        assert!(an.reasons[0].contains("ratio"));
+        assert!(an.reasons[1].contains("AnoMark suspect"));
+        let isp = f
+            .reasons_by_detector
+            .iter()
+            .find(|b| b.detector == "ironsift-process")
+            .expect("ironsift-process bucket");
+        assert_eq!(isp.reasons.len(), 1);
+    }
+
+    #[test]
+    fn extend_detector_reasons_preserves_input_order() {
+        let mut f = empty_finding("h1");
+        PlatformStore::extend_detector_reasons(
+            &mut f,
+            "ironsift-file",
+            vec![
+                "MTIME ANOMALY: /etc/passwd modified 48h NEWER than fleet baseline".to_string(),
+                "Rare file access: /tmp/.x/agent [suspicious_path]".to_string(),
+                "(+5 more rare files matched the same gate, not shown)".to_string(),
+            ],
+        );
+        assert_eq!(f.reasons.len(), 3);
+        let bucket = &f.reasons_by_detector[0];
+        assert_eq!(bucket.detector, "ironsift-file");
+        assert_eq!(bucket.reasons[0].starts_with("MTIME ANOMALY"), true);
+        assert_eq!(bucket.reasons[1].starts_with("Rare file access"), true);
+        assert_eq!(bucket.reasons[2].starts_with("(+5"), true);
+    }
+
+    #[test]
+    fn duplicate_reasons_are_handled_per_bucket() {
+        let mut f = empty_finding("h1");
+        PlatformStore::push_detector_reason(&mut f, "anomark-rs", "dup".to_string());
+        PlatformStore::push_detector_reason(&mut f, "anomark-rs", "dup".to_string());
+        // Pre-finalization both copies are present (dedup happens at the end of run_detection
+        // alongside flat reasons sort/dedup). What matters here is that the bucket is only
+        // created once and sequential pushes target it.
+        assert_eq!(f.reasons_by_detector.len(), 1);
+        assert_eq!(f.reasons_by_detector[0].reasons, vec!["dup", "dup"]);
+    }
+}
+
+#[cfg(test)]
+mod run_user_triage_filter_tests {
+    use super::{MachineTriageEntry, ReasonTriageEntry, RunUserTriage, TriageVerdict};
+
+    #[test]
+    fn without_excluded_reason_decisions_drops_process_row() {
+        let t = RunUserTriage {
+            machines: vec![MachineTriageEntry {
+                machine_id: "h1".into(),
+                reason_decisions: vec![
+                    ReasonTriageEntry {
+                        detector: "ironsift-process".into(),
+                        reason: "Process row: dataset=x pid=1".into(),
+                        verdict: TriageVerdict::Malicious,
+                    },
+                    ReasonTriageEntry {
+                        detector: "ironsift-process".into(),
+                        reason: "RISK DETECTED: uid=0".into(),
+                        verdict: TriageVerdict::FalsePositive,
+                    },
+                ],
+                final_verdict: TriageVerdict::Unset,
+            }],
+        };
+        let f = t.without_excluded_reason_decisions();
+        assert_eq!(f.machines[0].reason_decisions.len(), 1);
+        assert!(f.machines[0].reason_decisions[0].reason.starts_with("RISK"));
     }
 }

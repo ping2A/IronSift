@@ -47,7 +47,7 @@ impl Default for FileRecentMtimeConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectionConfig {
-    // NOTE: persisted in `.ironsift-platform/db.json` as part of the platform `run_config`.
+    // NOTE: persisted in SQLite (`events.db`, table `detection_configs`) with a mirror in `.ironsift-platform/db.json` `run_config`.
     // This must be backwards-compatible: older/partial objects must still deserialize.
     // `#[serde(default)]` for scalars/Vecs uses type default (0.0, empty) — wrong for us — so fields
     // that must match `DetectionConfig::default()` use `default = "def_..."` helpers.
@@ -96,7 +96,8 @@ pub struct DetectionConfig {
     #[serde(default = "def_exclude_init_children")]
     pub exclude_init_children: bool,
 
-    /// Path whitelist patterns (glob-style wildcards: * and ?)
+    /// Path whitelist patterns (glob-style wildcards: * and ?). Compiled once per load/run (not
+    /// per row).
     #[serde(default = "def_whitelisted_path_patterns")]
     pub whitelisted_path_patterns: Vec<String>,
 
@@ -133,6 +134,64 @@ pub struct DetectionConfig {
     /// access timestamps across hosts do not split the same path+uid into separate features.
     #[serde(default)]
     pub file_rare_signature_includes_recent_mtime: bool,
+
+    /// **File analysis only:** when **true** (default), a “rare file access” reason is emitted only
+    /// for paths that also carry a risk indicator (suspicious path, world/group writable, root UID
+    /// outside `/proc /sys /dev`, recent mtime, or system-administered directory like `/etc /bin
+    /// /sbin /usr/bin /usr/sbin /root /boot /var/spool/cron`). Set to `false` to restore the
+    /// previous "every fleet-unique file is rare" behavior. Massive endpoint inventories (40k+
+    /// files per host) generate many uninteresting unique entries; this gate keeps the signal high.
+    #[serde(default = "def_file_rare_requires_risk")]
+    pub file_rare_requires_risk: bool,
+
+    /// **File analysis only:** maximum number of `Rare file access:` rows added to a single host's
+    /// `anomalous_features` per analysis. The most interesting (highest-risk, then highest-count)
+    /// entries are kept; the rest are summarized as `(+N more rare files not shown)`. Default 20.
+    #[serde(default = "def_file_max_rare_examples_per_host")]
+    pub file_max_rare_examples_per_host: usize,
+
+    /// **File analysis only:** maximum number of distinct file signatures to keep as columns in the
+    /// fleet TF-IDF / DBSCAN matrix. When exceeded, the rarest middle-frequency signatures are
+    /// kept (drop universal features and fleet-unique features which are reported separately as
+    /// "Rare file access"). Default 8000. Helps endpoints with very large file inventories
+    /// (40k+ unique paths per host) stay responsive without losing fleet-relative signals.
+    #[serde(default = "def_file_max_unique_features")]
+    pub file_max_unique_features: usize,
+
+    /// **File fleet only:** when **true**, inventory rows that share the same fingerprint (path +
+    /// uid + permissions + owner + group + size + optional mtime bucket) on at least
+    /// [`Self::file_fleet_baseline_min_host_fraction`] of hosts are treated as fleet **baseline**
+    /// and excluded from rare-file doc-frequency counting and TF-IDF middle-frequency features.
+    /// Reduces noise when every endpoint has the same copies of common packages. **Off by default**
+    /// because centrally deployed malware could match on every host — pair with
+    /// [`Self::file_fleet_baseline_exclude_suspicious_paths`] (default true) so suspicious-path
+    /// rows never become baseline.
+    #[serde(default)]
+    pub file_fleet_baseline_fingerprint_enabled: bool,
+
+    /// Minimum fraction of hosts (0.0–1.0) that must exhibit the same fingerprint for it to count
+    /// as baseline. `1.0` means every host in the run (default).
+    #[serde(default = "def_file_fleet_baseline_min_host_fraction")]
+    pub file_fleet_baseline_min_host_fraction: f64,
+
+    /// Bucket width in seconds for mtime when hashing fingerprints (`mtime.timestamp / bucket`).
+    /// `0` disables mtime in the fingerprint (path/metadata/size only). Default 86400 (one day).
+    #[serde(default = "def_file_fleet_baseline_mtime_bucket_secs")]
+    pub file_fleet_baseline_mtime_bucket_secs: u64,
+
+    /// When building baseline fingerprints, skip rows whose `FileSignature` has
+    /// `is_suspicious_path: true` so universal `/tmp` or dot-bin paths are never dropped from
+    /// anomaly logic via the baseline rule.
+    #[serde(default = "def_file_fleet_baseline_exclude_suspicious_paths")]
+    pub file_fleet_baseline_exclude_suspicious_paths: bool,
+
+    /// **SQLite file runs only:** when **true** (default), loading file inventory for a detection run
+    /// skips rows whose `inv_checksum` (basename + permissions `mode` only, set at ingest) is
+    /// **common across the run’s selected file datasets**: on a single dataset, excluded if every
+    /// machine has that checksum; with multiple file datasets, excluded if the checksum appears in
+    /// **all** of them.
+    #[serde(default = "def_file_exclude_common_inventory_sql")]
+    pub file_exclude_common_inventory_sql: bool,
 }
 
 impl Default for DetectionConfig {
@@ -190,6 +249,14 @@ impl Default for DetectionConfig {
             file_rare_signature_includes_size: false,
             file_rare_signature_includes_metadata: false,
             file_rare_signature_includes_recent_mtime: false,
+            file_rare_requires_risk: true,
+            file_max_rare_examples_per_host: 20,
+            file_max_unique_features: 8000,
+            file_fleet_baseline_fingerprint_enabled: false,
+            file_fleet_baseline_min_host_fraction: 1.0,
+            file_fleet_baseline_mtime_bucket_secs: 86_400,
+            file_fleet_baseline_exclude_suspicious_paths: true,
+            file_exclude_common_inventory_sql: true,
         }
     }
 }
@@ -242,6 +309,34 @@ fn def_exclude_init_children() -> bool {
 
 fn def_whitelisted_path_patterns() -> Vec<String> {
     DetectionConfig::default().whitelisted_path_patterns
+}
+
+fn def_file_rare_requires_risk() -> bool {
+    DetectionConfig::default().file_rare_requires_risk
+}
+
+fn def_file_max_rare_examples_per_host() -> usize {
+    DetectionConfig::default().file_max_rare_examples_per_host
+}
+
+fn def_file_max_unique_features() -> usize {
+    DetectionConfig::default().file_max_unique_features
+}
+
+fn def_file_fleet_baseline_min_host_fraction() -> f64 {
+    DetectionConfig::default().file_fleet_baseline_min_host_fraction
+}
+
+fn def_file_fleet_baseline_mtime_bucket_secs() -> u64 {
+    DetectionConfig::default().file_fleet_baseline_mtime_bucket_secs
+}
+
+fn def_file_fleet_baseline_exclude_suspicious_paths() -> bool {
+    DetectionConfig::default().file_fleet_baseline_exclude_suspicious_paths
+}
+
+fn def_file_exclude_common_inventory_sql() -> bool {
+    DetectionConfig::default().file_exclude_common_inventory_sql
 }
 
 impl DetectionConfig {
@@ -314,5 +409,68 @@ impl DetectionConfig {
             self.file_rare_signature_includes_metadata,
             self.file_rare_signature_includes_recent_mtime
         );
+        log::info!(
+            "File rare-access gating: requires_risk={}, max_examples_per_host={}, max_unique_features={}",
+            self.file_rare_requires_risk,
+            self.file_max_rare_examples_per_host,
+            self.file_max_unique_features
+        );
+        log::info!(
+            "File fleet baseline fingerprint: enabled={}, min_host_fraction={:.2}, mtime_bucket_secs={}, exclude_suspicious_paths={}",
+            self.file_fleet_baseline_fingerprint_enabled,
+            self.file_fleet_baseline_min_host_fraction,
+            self.file_fleet_baseline_mtime_bucket_secs,
+            self.file_fleet_baseline_exclude_suspicious_paths
+        );
+        log::info!(
+            "File SQLite load filter (exclude run-scope common inv_checksum): {}",
+            self.file_exclude_common_inventory_sql
+        );
+    }
+
+    /// Row-level filters used only by [`crate::loaders`] when building in-memory profiles from disk
+    /// (kernel threads, PPID=1, path whitelist, file path regex exclusions).
+    ///
+    /// **SQLite ingestion** ([`crate::event_db::EventDb::ingest_dataset`]) does **not** use
+    /// [`DetectionConfig`] at all — every parsed line is stored.
+    ///
+    /// Use this when reloading the same source files for analysis helpers that should match what
+    /// was ingested (e.g. AnoMark training text built from datasets).
+    pub fn unfiltered_row_loading() -> Self {
+        let mut c = Self::default();
+        c.exclude_kernel_threads = false;
+        c.exclude_init_children = false;
+        c.whitelisted_path_patterns.clear();
+        c.file_excluded_path_regexes.clear();
+        c.file_excluded_filename_regexes.clear();
+        c
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unfiltered_row_loading_disables_filters_and_exclusions() {
+        let u = DetectionConfig::unfiltered_row_loading();
+        assert!(!u.exclude_kernel_threads);
+        assert!(!u.exclude_init_children);
+        assert!(u.whitelisted_path_patterns.is_empty());
+        assert!(u.file_excluded_path_regexes.is_empty());
+        assert!(u.file_excluded_filename_regexes.is_empty());
+    }
+
+    #[test]
+    fn detection_config_deserialize_empty_json_fills_defaults() {
+        let c: DetectionConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(c.dbscan_tolerance, DetectionConfig::default().dbscan_tolerance);
+        assert_eq!(c.entropy_threshold, DetectionConfig::default().entropy_threshold);
+    }
+
+    #[test]
+    fn file_recent_mtime_config_default_has_volatile_prefixes() {
+        let f = FileRecentMtimeConfig::default();
+        assert!(f.volatile_path_prefixes.iter().any(|p| p.contains("/tmp/")));
     }
 }

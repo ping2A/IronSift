@@ -348,11 +348,11 @@ API endpoints:
 - `GET /api/runs/:id`
 - `GET /api/runs/:id/detections`
 - `GET /api/fleet/honeycomb?run_id=<id>&min_score=<0..1>&severity=<LOW|MEDIUM|HIGH|CRITICAL>`
-- `POST /api/pipeline/auto` (one-shot full automation)
 - `GET/POST /api/anomark/config` (set model/columns from UI or API)
 - `GET /api/anomark/availability` (which model files exist: platform config + saved trainings; used by “Runs & Findings” to enable AnoMark)
 - `POST /api/anomark/train` (train AnoMark model from uploaded/local training data)
 - `GET/POST /api/sigma-zero/config` ([sigmazero](https://github.com/ping2A/sigmazero) / `sigma_zero` crate in-process, rules directory, field map)
+- `GET /api/sigma-zero/rule-templates` (starter Sigma rules as JSON for the UI, including the demo YAML)
 - `POST /api/sigma-zero/check` (run Sigma rules on selected process datasets or a server log path; exports JSONL with `process_name` / `command_line` and evaluates in memory)
 
 AnoMark is included on a run when `enable_anomark=true` and a model file exists. Optionally set `anomark_train_id` to a saved training id to use that `model.bin` instead of the platform `model_path`. The Web UI **Runs & Findings** section loads `GET /api/anomark/availability`, pre-enables the checkbox when any model is on disk, and offers a model picker.
@@ -360,51 +360,34 @@ Configure environment variables:
 
 - `ANOMARK_MODEL_PATH` (required to activate scoring)
 - `ANOMARK_BIN` (only if you use external tools; the server uses the `anomark` crate in-process for training and scoring)
-- `ANOMARK_COLUMN` (default: `command`)
+- `ANOMARK_COLUMN` (default: `cmdline`, aligned with osquery `processes.cmdline`)
 - `ANOMARK_MACHINE_FIELD` (default: `machine_id`)
 
 For osquery alignment, datasets can be tagged with the schema profile `osquery-5.22.1`.
 
-#### One-shot fully automatic pipeline
+#### CLI: recursive JSONL directory ingest (with tags)
 
-Run server:
+The **`ironsift`** binary can walk a directory tree, import every `.jsonl` file as its own platform dataset (same store as the web UI), and apply tags to all imports in one go. Dataset names are the path relative to the directory you pass (nested files stay distinct). Optional `--platform-db` points at the platform `db.json` (default: `.ironsift-platform/db.json`); the SQLite event store is `events.db` in that same folder.
 
-```bash
-cargo run --bin ironsift-server
-```
-
-Then call:
+When you use `--ingest-parent-tag-field` (and optional `--ingest-parent-tag-delimiter`), the extracted segment is added as a tag **and** stored on the dataset as the default host label: JSONL lines with no `machine_id` / `hostname` / `host` / `server` / `node` use that string instead of the log file’s stem. Detection reloads and SQLite ingestion both honor this.
 
 ```bash
-curl -sS -X POST http://localhost:8080/api/pipeline/auto \
-  -H "Content-Type: application/json" \
-  -d '{
-    "directory": "./data",
-    "baseline_tag": "baseline",
-    "candidate_tag": "candidate",
-    "enable_anomark": true
-  }'
+cargo run --bin ironsift -- --ingest-jsonl-dir ./logs --tag baseline --tag jan2026
 ```
 
-Run the shell helper script (requires server already running):
+Comma-separated tags (same effect as repeated `--tag`):
 
 ```bash
-scripts/auto_pipeline.sh --dir ./data
+cargo run --bin ironsift -- --ingest-jsonl-dir ./data --tags prod,audit
 ```
 
-With AnoMark:
+Quiet mode prints one dataset id per line (for scripting):
 
 ```bash
-ANOMARK_MODEL_PATH=./models/process_model.bin \
-scripts/auto_pipeline.sh --dir ./data --enable-anomark
+cargo run -q --bin ironsift -- --ingest-jsonl-dir ./logs --tag cohort-a
 ```
 
-Note: on first run, server startup can take time because Rust dependencies compile.  
-Start the server manually (for example `cargo run --bin ironsift-server`) before running the script.
-The script waits for `/api/health` and exits with guidance if server is not reachable.
-If the directory has no logs yet, the script exits cleanly and tells you to use the UI to upload logs.
-
-If no server is detected quickly (5s check), the script starts `ironsift-server` in foreground mode (no background/detached process).
+Then run **`cargo run --bin ironsift-server`** and open the UI to run detection on the imported datasets.
 
 You can now configure AnoMark directly in the Web UI:
 
@@ -420,7 +403,7 @@ curl -sS -X POST http://localhost:8080/api/anomark/config \
   -H "Content-Type: application/json" \
   -d '{
     "model_path": "./models/process_model.bin",
-    "column": "command",
+    "column": "cmdline",
     "machine_field": "machine_id"
   }'
 ```
@@ -432,7 +415,7 @@ curl -sS -X POST http://localhost:8080/api/anomark/train \
   -H "Content-Type: application/json" \
   -d '{
     "training_path": "./data/train.jsonl",
-    "column": "command",
+    "column": "cmdline",
     "order": 4,
     "output_model_path": "./models/process_model.bin"
   }'
@@ -446,7 +429,7 @@ curl -sS -X POST http://localhost:8080/api/anomark/train \
   -d '{
     "dataset_ids": ["<dataset-id-1>", "<dataset-id-2>"],
     "tags": ["baseline", "prod-clean"],
-    "column": "command",
+    "column": "cmdline",
     "order": 4,
     "output_model_path": ""
   }'
@@ -454,7 +437,7 @@ curl -sS -X POST http://localhost:8080/api/anomark/train \
 
 List past trainings: `GET /api/anomark/trains`. Download: `GET /api/anomark/trains/<id>/model` and `GET /api/anomark/trains/<id>/training-data`.
 
-**Sigma (sigmazero):** the server links the [sigmazero](https://github.com/ping2A/sigmazero) library (`sigma_zero` crate) at build time—no `sigma-zero` binary. Set `rules_dir` to a folder of `.yml` Sigma rules, then run checks from the **Sigma** tab or via API. IronSift converts process datasets to JSONL with `process_name`, `command_line`, `machine_id`, etc. Use `field_map` in config or the request if your rules use other field names (e.g. Windows `Image` → `process_name`).
+**Sigma (sigmazero):** the server links the [sigmazero](https://github.com/ping2A/sigmazero) library (`sigma_zero` crate) at build time—no `sigma-zero` binary. Prefer **`sigma_zero.rules_inline`** in `db.json`: an array of `{ "id", "title", "yaml", "enabled", "tags" }` objects (full Sigma YAML per rule; **`enabled`** defaults to true; **`tags`** is an optional string array of library labels — merged into the parsed rule for Sigma’s `filter_tags` and shown in the UI for filtering). If `rules_inline` is empty, **`rules_dir`** must point at a directory of `.yml` files (legacy / CLI). The default UI template is embedded at compile time from `src/sigma_demo_recon.yml`. IronSift converts process datasets to JSONL with `process_name`, `command_line`, `machine_id`, etc. Use `field_map` in config or the request if your rules use other field names (e.g. Windows `Image` → `process_name`).
 
 ```bash
 curl -sS -X POST http://localhost:8080/api/sigma-zero/config \
@@ -462,7 +445,8 @@ curl -sS -X POST http://localhost:8080/api/sigma-zero/config \
   -d '{
     "rules_dir": "/path/to/sigma-rules",
     "field_map": "",
-    "workers": 8
+    "workers": 8,
+    "rules_inline": []
   }'
 
 curl -sS -X POST http://localhost:8080/api/sigma-zero/check \
@@ -523,8 +507,10 @@ All imported data is persisted into a SQLite database using the platform schema:
 - tables:
   - `datasets`
   - `dataset_tags`
-  - `process_events`
-  - `file_events`
+  - `processes` — columns match [osquery 5.22.1 `processes`](https://osquery.io/schema/5.22.1/#processes) (see `specs/processes.table` in the osquery repo), plus IronSift columns `id`, `dataset_id`, `machine_id`
+  - `file` — columns match [osquery 5.22.1 `file`](https://osquery.io/schema/5.22.1/#file) (`specs/utility/file.table`), plus `id`, `dataset_id`, `machine_id`, and IronSift column `inv_checksum` (hash of **filename + mode** only, so common files match across datasets despite differing paths/timestamps; used when excluding universally common inventory rows)
+
+On first open, obsolete tables named `process_events` or `file_events` are dropped without copying rows. If an older `file` table exists without `inv_checksum`, or the DB predates schema version 5 (checksum formula change), `file` is dropped and recreated empty (`PRAGMA user_version`); file datasets must be re-imported.
 
 #### Honeycomb fleet map (Runs & Findings)
 

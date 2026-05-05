@@ -40,11 +40,10 @@ pub fn calculate_shannon_entropy(s: &str) -> f64 {
     entropy
 }
 
-/// Check if a path matches a glob-style pattern with wildcards (* and ?)
-pub fn matches_wildcard(path: &str, pattern: &str) -> bool {
+/// Convert one glob-style whitelist pattern (`*`, `?`) into a full-match regex (anchored).
+pub fn glob_wildcard_to_regex(pattern: &str) -> Result<Regex, regex::Error> {
     let mut regex_pattern = String::new();
     regex_pattern.push('^');
-
     for ch in pattern.chars() {
         match ch {
             '*' => regex_pattern.push_str(".*"),
@@ -56,25 +55,64 @@ pub fn matches_wildcard(path: &str, pattern: &str) -> bool {
             _ => regex_pattern.push(ch),
         }
     }
-
     regex_pattern.push('$');
-
     Regex::new(&regex_pattern)
+}
+
+/// Compile path whitelist globs once for hot loops (process/file loaders over large NDJSON).
+///
+/// Invalid patterns are skipped with a warning (same spirit as [`compile_regex_list`]).
+pub fn compile_wildcard_list(patterns: &[String]) -> Vec<Regex> {
+    patterns
+        .iter()
+        .filter_map(|p| match glob_wildcard_to_regex(p) {
+            Ok(re) => Some(re),
+            Err(e) => {
+                log::warn!("Invalid whitelist glob {:?}: {}", p, e);
+                None
+            }
+        })
+        .collect()
+}
+
+/// True if `path` matches any precompiled whitelist glob.
+#[inline]
+pub fn is_path_whitelisted_compiled(path: &str, compiled: &[Regex]) -> bool {
+    compiled.iter().any(|re| re.is_match(path))
+}
+
+/// Check if a path matches a glob-style pattern with wildcards (* and ?).
+///
+/// **Performance:** compiles a regex on every call; in loaders use [`compile_wildcard_list`] and
+/// [`is_path_whitelisted_compiled`] instead.
+pub fn matches_wildcard(path: &str, pattern: &str) -> bool {
+    glob_wildcard_to_regex(pattern)
         .map(|re| re.is_match(path))
         .unwrap_or(false)
 }
 
-/// Check if path matches any whitelisted pattern
+/// Check if path matches any whitelisted pattern (slow: recompiles each glob every time).
 pub fn is_path_whitelisted(path: &str, whitelist: &[String]) -> bool {
     whitelist.iter().any(|pattern| matches_wildcard(path, pattern))
 }
 
+/// Check suspicious-path regexes against `path`.
+///
+/// **Performance:** compiles each pattern with [`Regex::new`] on every call. Fine for tests and
+/// one-off checks; on hot paths (file/process builders over tens of thousands of rows) compile
+/// once with [`compile_regex_list`] and use [`is_path_suspicious_compiled`] instead.
 pub fn is_path_suspicious(path: &str, patterns: &[String]) -> bool {
     patterns.iter().any(|pattern| {
         Regex::new(pattern)
             .map(|re| re.is_match(path))
             .unwrap_or(false)
     })
+}
+
+/// Precompiled variant of [`is_path_suspicious`]; pass the output of [`compile_regex_list`].
+#[inline]
+pub fn is_path_suspicious_compiled(path: &str, compiled: &[Regex]) -> bool {
+    compiled.iter().any(|re| re.is_match(path))
 }
 
 /// Compile regex strings for repeated matching; invalid patterns are skipped with a warning.
@@ -136,6 +174,12 @@ pub fn unix_permission_flags(ls_perm: &str) -> (bool, bool) {
     (world_writable, group_writable)
 }
 
+/// Linux-style kernel thread task name as shown in `ps` / `/proc` (e.g. `[kworker/0:0H]`).
+#[inline]
+pub fn looks_like_kernel_thread_name(name: &str) -> bool {
+    name.starts_with('[') && name.ends_with(']')
+}
+
 /// Parse a command line into (name, path, args)
 pub fn parse_command_line(command: &str) -> (String, String, String) {
     let command = command.trim();
@@ -195,4 +239,118 @@ pub(crate) fn parse_command_parts(command: &str) -> Vec<String> {
     }
 
     parts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use regex::Regex;
+
+    #[test]
+    fn entropy_empty_is_zero() {
+        assert_eq!(calculate_shannon_entropy(""), 0.0);
+    }
+
+    #[test]
+    fn wildcard_star_and_question() {
+        assert!(matches_wildcard("/var/log/app.log", "/var/log/*.log"));
+        assert!(matches_wildcard("/tmp/a1", "/tmp/a?"));
+        assert!(!matches_wildcard("/tmp/b", "/tmp/a?"));
+    }
+
+    #[test]
+    fn whitelist_any_pattern() {
+        let wl = vec!["/usr/bin/*".to_string()];
+        assert!(is_path_whitelisted("/usr/bin/python3", &wl));
+        assert!(!is_path_whitelisted("/bin/sh", &wl));
+    }
+
+    #[test]
+    fn compile_wildcard_list_matches_is_path_whitelisted() {
+        let patterns = vec![
+            "/opt/conda/*".to_string(),
+            "/home/*/venv/*".to_string(),
+        ];
+        let compiled = compile_wildcard_list(&patterns);
+        for path in ["/opt/conda/bin/python", "/home/u/venv/lib/x", "/etc/passwd"] {
+            assert_eq!(
+                is_path_whitelisted(path, &patterns),
+                is_path_whitelisted_compiled(path, &compiled),
+                "path={path}"
+            );
+        }
+    }
+
+    #[test]
+    fn suspicious_path_matches_regex() {
+        let pats = vec![r"/tmp/".to_string()];
+        assert!(is_path_suspicious("/tmp/x", &pats));
+        assert!(!is_path_suspicious("/etc/passwd", &pats));
+    }
+
+    #[test]
+    fn compile_regex_list_skips_invalid() {
+        let pats = vec![r"^\d+$".to_string(), "[".to_string()];
+        let res = compile_regex_list(&pats);
+        assert_eq!(res.len(), 1);
+        assert!(res[0].is_match("42"));
+    }
+
+    #[test]
+    fn file_path_matches_exclusion_path_or_basename() {
+        let path_re = vec![Regex::new("^/proc").unwrap()];
+        let name_re = vec![Regex::new("^\\.cache$").unwrap()];
+        assert!(file_path_matches_exclusion("/proc/1/cmdline", &path_re, &name_re));
+        assert!(file_path_matches_exclusion("/home/u/.cache", &path_re, &name_re));
+        assert!(!file_path_matches_exclusion("/home/u/file", &path_re, &name_re));
+    }
+
+    #[test]
+    fn parse_log_datetime_rfc3339_and_naive() {
+        assert!(parse_log_datetime("2024-01-02T03:04:05Z").is_some());
+        assert!(parse_log_datetime("2024-01-02T03:04:05+00:00").is_some());
+        assert!(parse_log_datetime("2024-01-02 03:04:05").is_some());
+        assert!(parse_log_datetime("").is_none());
+    }
+
+    #[test]
+    fn unix_permission_world_and_group_write() {
+        let (world, group) = unix_permission_flags("-rw-rw-rw-.");
+        assert!(world);
+        assert!(group);
+        let (world2, group2) = unix_permission_flags("-rw-r--r--.");
+        assert!(!world2);
+        assert!(!group2);
+    }
+
+    #[test]
+    fn unix_permission_short_string() {
+        let (w, g) = unix_permission_flags("-rw");
+        assert!(!w);
+        assert!(!g);
+    }
+
+    #[test]
+    fn kernel_thread_brackets() {
+        assert!(looks_like_kernel_thread_name("[kworker/0:0H]"));
+        assert!(!looks_like_kernel_thread_name("kworker"));
+    }
+
+    #[test]
+    fn parse_command_line_basic_and_bracket() {
+        let (n, p, a) = parse_command_line("/bin/bash -c \"echo hi\"");
+        assert_eq!(n, "bash");
+        assert_eq!(p, "/bin/bash");
+        assert_eq!(a, "-c echo hi"); // quoted segments are stripped by parse_command_parts
+        let (n2, p2, a2) = parse_command_line("[kworker/0:0H]");
+        assert_eq!(n2, "[kworker/0:0H]");
+        assert_eq!(p2, "[kworker/0:0H]");
+        assert!(a2.is_empty());
+    }
+
+    #[test]
+    fn parse_command_parts_respects_quotes() {
+        let parts = parse_command_parts(r#"one "two three" four"#);
+        assert_eq!(parts, vec!["one", "two three", "four"]);
+    }
 }

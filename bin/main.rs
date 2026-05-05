@@ -1,5 +1,5 @@
 use std::error::Error;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::env;
 use std::fs;
 
@@ -9,7 +9,7 @@ use log;
 use ironsift::{
     load_csv_data, load_json_data, load_jsonl_data, generate_mock_data, analyze_fleet,
     load_files_csv_data, load_files_json_data, load_files_jsonl_data, analyze_files_fleet,
-    DetectionConfig
+    AnoMarkTestResult, DatasetKind, DetectionConfig, ParentDirTagRule, PlatformStore,
 };
 
 const DEFAULT_INPUT_CSV: &str = "test_dataset.csv";
@@ -29,8 +29,33 @@ fn print_usage() {
     println!("  --export-json [path]  Export forensic report as JSON (default: forensic_report.json)");
     println!("                        Use '-' to write JSON to stdout (script-friendly)");
     println!("  -q, --quiet           Minimal output: one-line summary only (for pipelines)");
+    println!("  --include-kernel-threads  Do not drop Linux kernel thread names like [kworker/0:0H]");
+    println!("                        (default: exclude them; set exclude_kernel_threads=false)");
     println!("  --tolerance <value>   Override DBSCAN tolerance (default: from config, 0.35)");
     println!("  --help                Show this help message");
+    println!();
+    println!("Platform ingestion (web UI datasets / SQLite events):");
+    println!("  --ingest-jsonl-dir <dir>  Recursively import every .jsonl file as a dataset");
+    println!("  --platform-db <path>    Platform db.json (default: .ironsift-platform/db.json)");
+    println!("  --tag <name>            Tag applied to every imported file (repeat for multiple)");
+    println!("  --tags <a,b,c>          Comma-separated tags (same effect as repeated --tag)");
+    println!("  --ingest-parent-tag-field <n>  Also tag each file from parent folder name: n-th");
+    println!("                        segment (1-based) after splitting by delimiter (default -)");
+    println!("  --ingest-parent-tag-delimiter <c>  Single character split (default: -); requires");
+    println!("                        --ingest-parent-tag-field");
+    println!("  --ingest-kind auto|process|file|mixed  Override per-file kind for --ingest-jsonl-dir");
+    println!("                        (default auto: sniff uses the same parsers as ingest)");
+    println!();
+    println!("AnoMark test (score one command and/or ingested datasets against a model):");
+    println!("  --anomark-test                 Run AnoMark in test mode and exit (no fleet analysis)");
+    println!("  --anomark-command <text>       Command line to score (use quotes for full argv)");
+    println!("  --anomark-machine <name>       Hostname/machine_id prefix for the scored line (matches fleet runs)");
+    println!("  --anomark-model <path>         Explicit AnoMark .bin model file (wins over training/platform)");
+    println!("  --anomark-train-id <uuid>      Score against a saved training model.bin (under .ironsift-platform/anomark-trains/<id>/)");
+    println!("  --anomark-dataset <id>         Add an ingested dataset to score (repeatable)");
+    println!("  --anomark-tags <a,b,c>         Pick datasets by tag (comma-separated)");
+    println!("  --anomark-suspect-percent <p>  Suspect threshold percent of ln(prior) (55–99.999, default 95)");
+    println!("  --anomark-json                 Print result as JSON instead of human-readable text");
     println!();
     println!("Supported Input Formats:");
     println!("  • CSV files (.csv)    - Process logs (RawLogEntry) or file logs (RawFileEntry)");
@@ -48,6 +73,11 @@ fn print_usage() {
     println!("  ironsift --export-json report.json # Write JSON report to file");
     println!("  ironsift --tolerance 0.08          # Run with custom tolerance");
     println!("  ironsift --config custom.json      # Run with custom config");
+    println!("  ironsift --ingest-jsonl-dir ./logs --tag baseline --tag jan2026");
+    println!("  ironsift --ingest-jsonl-dir ./root --ingest-parent-tag-field 4 --tag baseline");
+    println!("  ironsift --anomark-test --anomark-command \"/bin/bash -c id\" --anomark-machine web-01");
+    println!("  ironsift --anomark-test --anomark-model models/baseline.bin --anomark-dataset <ds-id>");
+    println!("  ironsift --anomark-test --anomark-tags baseline --anomark-suspect-percent 90 --anomark-json");
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -75,7 +105,24 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut config = DetectionConfig::default();
     let mut config_path: Option<String> = None;
     let mut input_files: Vec<String> = Vec::new();
-    
+    let mut ingest_jsonl_dir: Option<String> = None;
+    let mut platform_db: Option<String> = None;
+    let mut ingest_tags: Vec<String> = Vec::new();
+    let mut ingest_parent_tag_field: Option<usize> = None;
+    let mut ingest_parent_tag_delimiter: Option<char> = None;
+    let mut include_kernel_threads_cli = false;
+    let mut ingest_kind_override: Option<DatasetKind> = None;
+
+    let mut anomark_test = false;
+    let mut anomark_command: Option<String> = None;
+    let mut anomark_machine: Option<String> = None;
+    let mut anomark_model_path: Option<String> = None;
+    let mut anomark_train_id: Option<String> = None;
+    let mut anomark_dataset_ids: Vec<String> = Vec::new();
+    let mut anomark_tags: Vec<String> = Vec::new();
+    let mut anomark_suspect_percent: f64 = 95.0;
+    let mut anomark_json = false;
+
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -85,6 +132,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             "-q" | "--quiet" => {
                 config.quiet = true;
+            }
+            "--include-kernel-threads" => {
+                include_kernel_threads_cli = true;
             }
             "--export-json" => {
                 i += 1;
@@ -125,6 +175,150 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
                 config_path = Some(args[i].clone());
             }
+            "--ingest-jsonl-dir" => {
+                i += 1;
+                if i >= args.len() {
+                    log::error!("--ingest-jsonl-dir requires a directory path");
+                    return Err("Missing directory path".into());
+                }
+                ingest_jsonl_dir = Some(args[i].clone());
+            }
+            "--platform-db" => {
+                i += 1;
+                if i >= args.len() {
+                    log::error!("--platform-db requires a file path");
+                    return Err("Missing platform db path".into());
+                }
+                platform_db = Some(args[i].clone());
+            }
+            "--tag" => {
+                i += 1;
+                if i >= args.len() {
+                    log::error!("--tag requires a value");
+                    return Err("Missing tag value".into());
+                }
+                ingest_tags.push(args[i].clone());
+            }
+            "--tags" => {
+                i += 1;
+                if i >= args.len() {
+                    log::error!("--tags requires a value");
+                    return Err("Missing tags value".into());
+                }
+                for part in args[i].split(',') {
+                    let t = part.trim();
+                    if !t.is_empty() {
+                        ingest_tags.push(t.to_string());
+                    }
+                }
+            }
+            "--ingest-parent-tag-field" => {
+                i += 1;
+                if i >= args.len() {
+                    log::error!("--ingest-parent-tag-field requires a positive integer (1 = first segment)");
+                    return Err("Missing segment index".into());
+                }
+                let n: usize = args[i]
+                    .parse()
+                    .map_err(|_| "Invalid --ingest-parent-tag-field (use a positive integer, e.g. 4)")?;
+                if n < 1 {
+                    return Err("--ingest-parent-tag-field must be >= 1 (1 = first segment)".into());
+                }
+                ingest_parent_tag_field = Some(n);
+            }
+            "--ingest-parent-tag-delimiter" => {
+                i += 1;
+                if i >= args.len() {
+                    log::error!("--ingest-parent-tag-delimiter requires one character");
+                    return Err("Missing delimiter".into());
+                }
+                let s = args[i].as_str();
+                let mut it = s.chars();
+                let c = it.next().ok_or("Delimiter must not be empty")?;
+                if it.next().is_some() {
+                    return Err("--ingest-parent-tag-delimiter must be a single character".into());
+                }
+                ingest_parent_tag_delimiter = Some(c);
+            }
+            "--anomark-test" => {
+                anomark_test = true;
+            }
+            "--anomark-command" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--anomark-command requires a value".into());
+                }
+                anomark_command = Some(args[i].clone());
+            }
+            "--anomark-machine" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--anomark-machine requires a value".into());
+                }
+                anomark_machine = Some(args[i].clone());
+            }
+            "--anomark-model" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--anomark-model requires a path".into());
+                }
+                anomark_model_path = Some(args[i].clone());
+            }
+            "--anomark-train-id" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--anomark-train-id requires a uuid".into());
+                }
+                anomark_train_id = Some(args[i].clone());
+            }
+            "--anomark-dataset" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--anomark-dataset requires a dataset id".into());
+                }
+                anomark_dataset_ids.push(args[i].clone());
+            }
+            "--anomark-tags" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--anomark-tags requires a comma-separated value".into());
+                }
+                for part in args[i].split(',') {
+                    let t = part.trim();
+                    if !t.is_empty() {
+                        anomark_tags.push(t.to_string());
+                    }
+                }
+            }
+            "--anomark-suspect-percent" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--anomark-suspect-percent requires a value".into());
+                }
+                anomark_suspect_percent = args[i]
+                    .parse()
+                    .map_err(|_| "Invalid --anomark-suspect-percent (use a number, e.g. 95)")?;
+            }
+            "--anomark-json" => {
+                anomark_json = true;
+            }
+            "--ingest-kind" => {
+                i += 1;
+                if i >= args.len() {
+                    log::error!("--ingest-kind requires auto, process, file, or mixed");
+                    return Err("Missing --ingest-kind value".into());
+                }
+                ingest_kind_override = match args[i].to_ascii_lowercase().as_str() {
+                    "auto" => None,
+                    "process" => Some(DatasetKind::Process),
+                    "file" => Some(DatasetKind::File),
+                    "mixed" => Some(DatasetKind::Mixed),
+                    other => {
+                        log::error!("--ingest-kind must be auto, process, file, or mixed (got {})", other);
+                        return Err("Invalid --ingest-kind".into());
+                    }
+                };
+            }
             other => {
                 log::error!("Unknown option: {}", other);
                 print_usage();
@@ -132,6 +326,93 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
         i += 1;
+    }
+
+    if ingest_jsonl_dir.is_some() && !input_files.is_empty() {
+        return Err("--ingest-jsonl-dir cannot be combined with --input".into());
+    }
+    if ingest_jsonl_dir.is_some() && analyze_files {
+        return Err("--ingest-jsonl-dir cannot be combined with --files".into());
+    }
+    if ingest_parent_tag_field.is_some() && ingest_jsonl_dir.is_none() {
+        return Err("--ingest-parent-tag-field requires --ingest-jsonl-dir".into());
+    }
+    if ingest_parent_tag_delimiter.is_some() && ingest_parent_tag_field.is_none() {
+        return Err("--ingest-parent-tag-delimiter requires --ingest-parent-tag-field".into());
+    }
+
+    let anomark_explicitly_used = anomark_command.is_some()
+        || anomark_model_path.is_some()
+        || anomark_train_id.is_some()
+        || !anomark_dataset_ids.is_empty()
+        || !anomark_tags.is_empty();
+    if anomark_test || anomark_explicitly_used {
+        if !anomark_test {
+            log::info!("AnoMark flags supplied without --anomark-test; running test mode");
+        }
+        if anomark_command.is_none()
+            && anomark_dataset_ids.is_empty()
+            && anomark_tags.is_empty()
+        {
+            return Err(
+                "--anomark-test needs at least one of --anomark-command, --anomark-dataset, or --anomark-tags"
+                    .into(),
+            );
+        }
+        let db_path = platform_db
+            .clone()
+            .unwrap_or_else(|| ".ironsift-platform/db.json".to_string());
+        return run_anomark_test(
+            &db_path,
+            anomark_command.as_deref(),
+            anomark_machine.as_deref(),
+            anomark_model_path.as_deref(),
+            anomark_train_id.as_deref(),
+            &anomark_dataset_ids,
+            &anomark_tags,
+            anomark_suspect_percent,
+            anomark_json,
+            config.quiet,
+        );
+    }
+
+    if let Some(dir) = ingest_jsonl_dir {
+        let db = platform_db.unwrap_or_else(|| ".ironsift-platform/db.json".to_string());
+        let store = PlatformStore::load_or_create(&db)?;
+        let path = std::path::Path::new(&dir);
+        if !path.is_dir() {
+            return Err(format!("Not a directory: {}", dir).into());
+        }
+        let mut seen = std::collections::HashSet::<String>::new();
+        ingest_tags.retain(|t| seen.insert(t.clone()));
+        let parent_rule = ingest_parent_tag_field.map(|field| ParentDirTagRule {
+            field,
+            delimiter: ingest_parent_tag_delimiter.unwrap_or('-'),
+        });
+        let imported = store.import_jsonl_recursive(path, ingest_tags, parent_rule, ingest_kind_override)?;
+        if !config.quiet {
+            println!(
+                "Imported {} dataset(s) into {}",
+                imported.len(),
+                db
+            );
+            for (d, s) in &imported {
+                println!(
+                    "  {}  {}  kind={}  processes={}  files={}  {:?}",
+                    d.id,
+                    d.name,
+                    s.kind,
+                    s.process_event_count,
+                    s.file_event_count,
+                    d.tags
+                );
+            }
+        } else {
+            for (d, _) in &imported {
+                println!("{}", d.id);
+            }
+        }
+        return Ok(());
     }
     
     // When writing JSON to stdout, suppress all other stdout so pipes get only JSON
@@ -143,6 +424,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let Some(path) = config_path {
         log::info!("Loading configuration from: {}", path);
         config = DetectionConfig::from_file(&path)?;
+    }
+    if include_kernel_threads_cli {
+        config.exclude_kernel_threads = false;
     }
     
     if !config.quiet {
@@ -168,9 +452,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
                 log::info!("Loading file data from: {}", input);
                 if input.ends_with(".json") {
-                    all.extend(load_files_json_data(input, &config)?);
+                    all.extend(load_files_json_data(input, &config, None)?);
                 } else if input.ends_with(".jsonl") {
-                    all.extend(load_files_jsonl_data(input, &config)?);
+                    all.extend(load_files_jsonl_data(input, &config, None)?);
                 } else if input.ends_with(".csv") {
                     all.extend(load_files_csv_data(input, &config)?);
                 } else {
@@ -186,7 +470,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             // Auto-detect default files
             if Path::new(DEFAULT_INPUT_FILES_JSON).exists() {
                 log::info!("Loading file data from: {}", DEFAULT_INPUT_FILES_JSON);
-                load_files_json_data(DEFAULT_INPUT_FILES_JSON, &config)?
+                load_files_json_data(DEFAULT_INPUT_FILES_JSON, &config, None)?
             } else if Path::new(DEFAULT_INPUT_FILES_CSV).exists() {
                 log::info!("Loading file data from: {}", DEFAULT_INPUT_FILES_CSV);
                 load_files_csv_data(DEFAULT_INPUT_FILES_CSV, &config)?
@@ -226,14 +510,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
                 log::info!("Loading data from: {}", input);
                 if input.ends_with(".jsonl") {
-                    let file_profiles = load_jsonl_data(input, &config)?;
+                    let file_profiles = load_jsonl_data(input, &config, None)?;
                     all_profiles.extend(file_profiles);
                 } else if input.ends_with(".json") {
                     match load_json_data(input, &config) {
                         Ok(file_profiles) => all_profiles.extend(file_profiles),
                         Err(_) => {
                             log::info!("Detected file access data in JSON");
-                            let file_profiles = load_files_json_data(input, &config)?;
+                            let file_profiles = load_files_json_data(input, &config, None)?;
                             log::info!("Loaded {} machine file profiles", file_profiles.len());
                             log::info!("Running DBSCAN clustering analysis on file access patterns");
                             let report = analyze_files_fleet(&file_profiles, &config)?;
@@ -280,7 +564,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             // Auto-detect default files
             if Path::new(DEFAULT_INPUT_FILES_JSON).exists() {
                 log::info!("Detected file access data: {}", DEFAULT_INPUT_FILES_JSON);
-                let file_profiles = load_files_json_data(DEFAULT_INPUT_FILES_JSON, &config)?;
+                let file_profiles = load_files_json_data(DEFAULT_INPUT_FILES_JSON, &config, None)?;
                 log::info!("Loaded {} machine file profiles", file_profiles.len());
                 log::info!("Running DBSCAN clustering analysis on file access patterns");
                 let report = analyze_files_fleet(&file_profiles, &config)?;
@@ -350,6 +634,103 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
+}
+
+fn run_anomark_test(
+    platform_db: &str,
+    command: Option<&str>,
+    machine: Option<&str>,
+    model_path: Option<&str>,
+    train_id: Option<&str>,
+    dataset_ids: &[String],
+    tags: &[String],
+    suspect_percent: f64,
+    as_json: bool,
+    quiet: bool,
+) -> Result<(), Box<dyn Error>> {
+    let store = PlatformStore::load_or_create(platform_db)?;
+    let explicit = model_path.map(PathBuf::from);
+    let result = store.test_anomark_cli(
+        explicit.as_deref(),
+        train_id,
+        command,
+        machine,
+        dataset_ids,
+        tags,
+        suspect_percent,
+    )?;
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        print_anomark_test_human(&result, quiet);
+    }
+    Ok(())
+}
+
+fn print_anomark_test_human(r: &AnoMarkTestResult, quiet: bool) {
+    if !quiet {
+        println!("{:=^60}", " ANOMARK TEST ");
+    }
+    println!("Model:                {}", r.model_path);
+    println!("Source:               {}", r.model_source);
+    println!(
+        "Order / prior_ln:     {} / {:.6}",
+        r.model_order, r.model_prior_ln
+    );
+    println!(
+        "Suspect % (used):     {:.3}    threshold_ln: {:.6}",
+        r.suspect_percent_used, r.suspect_threshold_ln
+    );
+    if let Some(cs) = &r.command_score {
+        println!();
+        println!("--- Command score ---");
+        println!("Scored line:          {}", cs.line_scored);
+        println!("log_likelihood:       {:.6}", cs.log_likelihood);
+        println!(
+            "margin_ln:            {:.6}   ({} threshold)",
+            cs.margin_ln,
+            if cs.margin_ln >= 0.0 { ">=" } else { "<" }
+        );
+        println!(
+            "Verdict:              {}",
+            if cs.is_suspect {
+                "SUSPECT"
+            } else {
+                "not suspect"
+            }
+        );
+    }
+    if !r.datasets.is_empty() || !r.datasets_skipped.is_empty() {
+        println!();
+        println!("--- Datasets ---");
+    }
+    for d in &r.datasets {
+        let global_ratio = if d.commands_scored == 0 {
+            0.0
+        } else {
+            d.suspect_commands as f64 / d.commands_scored as f64
+        };
+        println!(
+            "{}  ({})    cmds={}    suspect={}    ratio={:.3}",
+            d.dataset_id, d.dataset_name, d.commands_scored, d.suspect_commands, global_ratio
+        );
+        for hs in &d.host_stats {
+            println!(
+                "    host={:<32}  cmds={:>7}  suspect={:>7}  ratio={:.3}",
+                hs.host, hs.commands, hs.suspect, hs.ratio
+            );
+        }
+    }
+    if !r.datasets_skipped.is_empty() {
+        println!();
+        println!(
+            "Skipped {} non-process dataset(s):",
+            r.datasets_skipped.len()
+        );
+        for s in &r.datasets_skipped {
+            println!("  - {}", s);
+        }
+    }
 }
 
 /// Detect if a CSV file contains file entries or process entries by checking the header

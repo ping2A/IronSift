@@ -20,9 +20,12 @@ use crate::interner::{merge_pid_map_entry, SharedInterner};
 use crate::file_analysis::{
     build_file_profiles, merge_file_log_into_profile, should_ingest_file_entry,
 };
-use crate::json_parse::{parse_files_json_logs, parse_json_logs, parse_jsonl_process_line};
+use crate::json_parse::{
+    default_machine_fallback_for_source_file, parse_files_json_logs, parse_json_logs,
+    parse_jsonl_process_line,
+};
 use crate::types::{MachineFileProfile, MachineProfile, RawFileEntry, RawLogEntry};
-use crate::utils::compile_regex_list;
+use crate::utils::{compile_regex_list, compile_wildcard_list, looks_like_kernel_thread_name};
 
 pub fn load_csv_data(
     path: &str,
@@ -46,6 +49,8 @@ pub fn load_csv_data(
         }
     }
 
+    let whitelist_res = compile_wildcard_list(&config.whitelisted_path_patterns);
+    let suspicious_path_res = compile_regex_list(&config.suspicious_path_patterns);
     let mut machine_profiles: HashMap<String, MachineProfile> = HashMap::new();
     let mut debug_keys: HashMap<String, HashMap<String, u32>> = HashMap::new();
     let mut row_count: u64 = 0;
@@ -54,7 +59,7 @@ pub fn load_csv_data(
         for result in rdr.deserialize::<RawLogEntry>() {
             let entry = result?;
             row_count += 1;
-            if !process_entry_passes_filters(&entry, config) {
+            if !process_entry_passes_filters(&entry, config, &whitelist_res) {
                 continue;
             }
             let mid = entry.machine_id.clone();
@@ -66,7 +71,7 @@ pub fn load_csv_data(
             } else {
                 None
             };
-            merge_log_into_profile(profile, &entry, &pid_to_name, config, &interner, pc);
+            merge_log_into_profile(profile, &entry, &pid_to_name, config, &interner, pc, &suspicious_path_res);
         }
     }
 
@@ -107,10 +112,12 @@ pub fn load_json_data(
 
 /// Load process data from a JSONL file (one JSON object per line).
 /// Format: `{"timestamp": "...", "event_type": "process", "user": "0", "command": "...", "pid": 1, "ppid": 0}`
-/// Optional per-line: `machine_id`, `hostname`, `host`. If absent, the file stem is used as machine_id.
+/// Optional per-line: `machine_id`, `hostname`, `host`. If absent, uses `ingest_default_machine_id`
+/// when set (dataset metadata / CLI parent-folder segment), otherwise the file stem.
 pub fn load_jsonl_data(
     path: &str,
     config: &DetectionConfig,
+    ingest_default_machine_id: Option<&str>,
 ) -> Result<Vec<MachineProfile>, Box<dyn Error>> {
     if !Path::new(path).exists() {
         return Err(format!("Input file not found: '{}'", path).into());
@@ -119,10 +126,8 @@ pub fn load_jsonl_data(
     if metadata.len() == 0 {
         return Err(format!("Input file is empty: '{}'", path).into());
     }
-    let default_machine_id = Path::new(path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("default");
+    let default_machine_id =
+        default_machine_fallback_for_source_file(path, ingest_default_machine_id);
 
     let interner = SharedInterner::default();
     let mut pid_to_name: HashMap<(Arc<str>, u32), Arc<str>> = HashMap::new();
@@ -134,16 +139,19 @@ pub fn load_jsonl_data(
             if t.is_empty() || t.starts_with("//") || t.starts_with('#') {
                 continue;
             }
-            match parse_jsonl_process_line(t, default_machine_id) {
+            match parse_jsonl_process_line(t, &default_machine_id) {
                 Ok(entry) => merge_pid_map_entry(&interner, &mut pid_to_name, &entry),
-                Err(e) => log::warn!("JSONL pid-map pass skipped line: {} — {}", t, e),
+                Err(e) => log::debug!("JSONL pid-map pass skipped line: {}", e),
             }
         }
     }
 
+    let whitelist_res = compile_wildcard_list(&config.whitelisted_path_patterns);
+    let suspicious_path_res = compile_regex_list(&config.suspicious_path_patterns);
     let mut machine_profiles: HashMap<String, MachineProfile> = HashMap::new();
     let mut debug_keys: HashMap<String, HashMap<String, u32>> = HashMap::new();
     let mut row_count: u64 = 0;
+    let mut skipped_kernel_threads: u64 = 0;
     {
         let f = File::open(path)?;
         for line in BufReader::new(f).lines() {
@@ -152,15 +160,18 @@ pub fn load_jsonl_data(
             if t.is_empty() || t.starts_with("//") || t.starts_with('#') {
                 continue;
             }
-            let entry = match parse_jsonl_process_line(t, default_machine_id) {
+            let entry = match parse_jsonl_process_line(t, &default_machine_id) {
                 Ok(e) => e,
                 Err(e) => {
-                    log::warn!("JSONL profile pass skipped line: {} — {}", t, e);
+                    log::debug!("JSONL profile pass skipped line: {}", e);
                     continue;
                 }
             };
             row_count += 1;
-            if !process_entry_passes_filters(&entry, config) {
+            if !process_entry_passes_filters(&entry, config, &whitelist_res) {
+                if config.exclude_kernel_threads && looks_like_kernel_thread_name(&entry.name) {
+                    skipped_kernel_threads += 1;
+                }
                 continue;
             }
             let mid = entry.machine_id.clone();
@@ -172,12 +183,35 @@ pub fn load_jsonl_data(
             } else {
                 None
             };
-            merge_log_into_profile(profile, &entry, &pid_to_name, config, &interner, pc);
+            merge_log_into_profile(profile, &entry, &pid_to_name, config, &interner, pc, &suspicious_path_res);
         }
     }
 
     if machine_profiles.is_empty() {
-        return Err(format!("No valid process lines found in '{}'.", path).into());
+        if row_count == 0 {
+            return Err(format!(
+                "No valid process lines found in '{}'. \
+                 NDJSON rows need cmdline/command/Image/path, or name/ProcessName, or executable path (same rules as JSON batch). \
+                 Run with RUST_LOG=debug to see per-line parse errors.",
+                path
+            )
+            .into());
+        }
+        let kernel_hint = if skipped_kernel_threads > 0 {
+            format!(
+                " {} of those line(s) look like Linux kernel threads (names in [brackets], e.g. [kworker/0:0H]) and were skipped because exclude_kernel_threads is true (default). \
+                 Re-run with --include-kernel-threads or set \"exclude_kernel_threads\": false in your config JSON.",
+                skipped_kernel_threads
+            )
+        } else {
+            String::new()
+        };
+        return Err(format!(
+            "Parsed {} process line(s) from '{}' but none were kept for analysis.{} \
+             Other reasons: exclude_init_children, or path whitelist filters.",
+            row_count, path, kernel_hint
+        )
+        .into());
     }
 
     log::info!(
@@ -204,8 +238,10 @@ pub fn load_files_csv_data(
         return Err(format!("Input file is empty: '{}'", path).into());
     }
 
+    let whitelist_res = compile_wildcard_list(&config.whitelisted_path_patterns);
     let path_exclude_res = compile_regex_list(&config.file_excluded_path_regexes);
     let filename_exclude_res = compile_regex_list(&config.file_excluded_filename_regexes);
+    let suspicious_path_res = compile_regex_list(&config.suspicious_path_patterns);
     let interner = SharedInterner::default();
 
     let mut machine_profiles: HashMap<String, MachineFileProfile> = HashMap::new();
@@ -217,9 +253,9 @@ pub fn load_files_csv_data(
         row_count += 1;
         if !should_ingest_file_entry(
             &entry,
-            config,
             &path_exclude_res,
             &filename_exclude_res,
+            &whitelist_res,
         ) {
             continue;
         }
@@ -240,6 +276,8 @@ pub fn load_files_csv_data(
             fc,
             &path_exclude_res,
             &filename_exclude_res,
+            &suspicious_path_res,
+            &whitelist_res,
         );
     }
 
@@ -262,6 +300,7 @@ pub fn load_files_csv_data(
 pub fn load_files_json_data(
     path: &str,
     config: &DetectionConfig,
+    ingest_default_machine_id: Option<&str>,
 ) -> Result<Vec<MachineFileProfile>, Box<dyn Error>> {
     if !Path::new(path).exists() {
         return Err(format!("Input file not found: '{}'", path).into());
@@ -270,12 +309,10 @@ pub fn load_files_json_data(
     if metadata.len() == 0 {
         return Err(format!("Input file is empty: '{}'", path).into());
     }
-    let default_machine_id = Path::new(path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("default");
+    let default_machine_id =
+        default_machine_fallback_for_source_file(path, ingest_default_machine_id);
     let content = fs::read_to_string(path)?;
-    let entries = parse_files_json_logs(&content, default_machine_id)?;
+    let entries = parse_files_json_logs(&content, &default_machine_id)?;
     if entries.is_empty() {
         return Err(format!("No valid file access logs found in '{}'.", path).into());
     }
@@ -283,10 +320,12 @@ pub fn load_files_json_data(
     Ok(build_file_profiles(entries, config))
 }
 
-/// Load file access logs from JSONL (one JSON object per line). Same schema as JSON; `machine_id` defaults to the file stem.
+/// Load file access logs from JSONL (one JSON object per line). Same schema as JSON; `machine_id`
+/// defaults to the file stem or `ingest_default_machine_id` when set.
 pub fn load_files_jsonl_data(
     path: &str,
     config: &DetectionConfig,
+    ingest_default_machine_id: Option<&str>,
 ) -> Result<Vec<MachineFileProfile>, Box<dyn Error>> {
     if !Path::new(path).exists() {
         return Err(format!("Input file not found: '{}'", path).into());
@@ -295,13 +334,13 @@ pub fn load_files_jsonl_data(
     if metadata.len() == 0 {
         return Err(format!("Input file is empty: '{}'", path).into());
     }
-    let default_machine_id = Path::new(path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("default");
+    let default_machine_id =
+        default_machine_fallback_for_source_file(path, ingest_default_machine_id);
 
+    let whitelist_res = compile_wildcard_list(&config.whitelisted_path_patterns);
     let path_exclude_res = compile_regex_list(&config.file_excluded_path_regexes);
     let filename_exclude_res = compile_regex_list(&config.file_excluded_filename_regexes);
+    let suspicious_path_res = compile_regex_list(&config.suspicious_path_patterns);
     let interner = SharedInterner::default();
 
     let mut machine_profiles: HashMap<String, MachineFileProfile> = HashMap::new();
@@ -317,7 +356,7 @@ pub fn load_files_jsonl_data(
         let mut entry: RawFileEntry = match serde_json::from_str(t) {
             Ok(e) => e,
             Err(e) => {
-                log::warn!("JSONL file line skipped: {} — {}", t, e);
+                log::debug!("JSONL file line skipped: {}", e);
                 continue;
             }
         };
@@ -327,9 +366,9 @@ pub fn load_files_jsonl_data(
         row_count += 1;
         if !should_ingest_file_entry(
             &entry,
-            config,
             &path_exclude_res,
             &filename_exclude_res,
+            &whitelist_res,
         ) {
             continue;
         }
@@ -350,6 +389,8 @@ pub fn load_files_jsonl_data(
             fc,
             &path_exclude_res,
             &filename_exclude_res,
+            &suspicious_path_res,
+            &whitelist_res,
         );
     }
 

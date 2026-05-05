@@ -128,7 +128,35 @@ pub fn analyze_fleet(
             if is_behavioral_risk || is_unexpected_root {
                 suspicious_count += *count;
                 has_genuine_risk = true;
-                anomalous_features.push(format!("RISK DETECTED: {} (root/path/entropy)", sig.name));
+                let mut reasons: Vec<&str> = Vec::with_capacity(3);
+                if is_unexpected_root {
+                    reasons.push("root_no_whitelist");
+                }
+                if sig.is_suspicious_path {
+                    reasons.push("suspicious_path");
+                }
+                if sig.is_high_entropy {
+                    reasons.push("high_entropy_args");
+                }
+                let path_disp: &str = if sig.path.as_ref().is_empty() {
+                    "(none)"
+                } else {
+                    sig.path.as_ref()
+                };
+                let parent_disp: &str = if sig.parent_name.as_ref().is_empty() {
+                    "(none)"
+                } else {
+                    sig.parent_name.as_ref()
+                };
+                anomalous_features.push(format!(
+                    "RISK DETECTED: name={} path={} parent={} uid={} count={} reasons={}",
+                    sig.name,
+                    path_disp,
+                    parent_disp,
+                    sig.uid,
+                    count,
+                    reasons.join(",")
+                ));
             }
 
             let doc_count = doc_count_map.get(sig).copied().unwrap_or(0);
@@ -148,9 +176,20 @@ pub fn analyze_fleet(
                 } else {
                     AnomalyLevel::High
                 }
+            } else if anomalous_features.is_empty() {
+                // Pure cluster outlier: no behavioral risk and no "rare process" doc-frequency hints.
+                AnomalyLevel::Low
             } else {
+                // e.g. fleet-unique process names without stronger risk markers.
                 AnomalyLevel::Medium
             };
+
+            if anomalous_features.is_empty() && (is_noise || is_minority) {
+                anomalous_features.push(
+                    "Process mix differs from fleet majority cluster (no behavioral/root/rare-process flags)."
+                        .to_string(),
+                );
+            }
 
             anomalies.push(AnomalyDetails {
                 machine_id: profile.id.clone(),
@@ -315,4 +354,29 @@ pub fn analyze_fleet2(
         config_used: config.clone(),
         analysis_type: AnalysisType::Process,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{analyze_fleet, analyze_fleet2};
+    use crate::config::DetectionConfig;
+    use crate::report::AnalysisType;
+
+    #[test]
+    fn analyze_fleet_empty_profiles_returns_process_report() {
+        let config = DetectionConfig::default();
+        let r = analyze_fleet(&[], &config).unwrap();
+        assert_eq!(r.total_analyzed, 0);
+        assert!(r.anomalies.is_empty());
+        assert_eq!(r.analysis_type, AnalysisType::Process);
+    }
+
+    #[test]
+    fn analyze_fleet2_empty_profiles_matches_analyze_fleet() {
+        let config = DetectionConfig::default();
+        let a = analyze_fleet(&[], &config).unwrap();
+        let b = analyze_fleet2(&[], &config).unwrap();
+        assert_eq!(a.total_analyzed, b.total_analyzed);
+        assert_eq!(a.anomalies.len(), b.anomalies.len());
+    }
 }

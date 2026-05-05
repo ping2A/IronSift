@@ -516,3 +516,29 @@ impl AnalysisReport {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::AnomalyLevel;
+
+    #[test]
+    fn anomaly_level_from_distance_buckets() {
+        assert!(matches!(
+            AnomalyLevel::from_distance(1.0),
+            AnomalyLevel::Critical
+        ));
+        assert!(matches!(AnomalyLevel::from_distance(0.7), AnomalyLevel::High));
+        assert!(matches!(
+            AnomalyLevel::from_distance(0.45),
+            AnomalyLevel::Medium
+        ));
+        assert!(matches!(AnomalyLevel::from_distance(0.2), AnomalyLevel::Low));
+    }
+
+    #[test]
+    fn anomaly_level_score_monotonic() {
+        assert!(AnomalyLevel::Critical.score() > AnomalyLevel::Low.score());
+        assert_eq!(AnomalyLevel::Medium.as_str(), "MEDIUM");
+        assert!(!AnomalyLevel::Low.emoji().is_empty());
+    }
+}

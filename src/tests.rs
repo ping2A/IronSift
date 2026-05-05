@@ -1417,6 +1417,15 @@ fn test_parse_jsonl_process_line() {
     assert_eq!(e2.pid, 8);
     assert_eq!(e2.ppid, 2);
     assert_eq!(e2.name, "[ksoftirqd/0]");
+
+    let sysmon = r#"{"hostname":"h","pid":4,"CommandLine":"C:\\Windows\\System32\\smss.exe","Image":"C:\\Windows\\System32\\smss.exe"}"#;
+    let e3 = parse_jsonl_process_line(sysmon, "default").unwrap();
+    assert_eq!(e3.path, r"C:\Windows\System32\smss.exe");
+
+    let path_only = r#"{"machine_id":"m","path":"/usr/bin/bash","pid":100}"#;
+    let e4 = parse_jsonl_process_line(path_only, "fallback").unwrap();
+    assert_eq!(e4.machine_id, "m");
+    assert_eq!(e4.path, "/usr/bin/bash");
 }
 
 #[test]
@@ -1440,7 +1449,7 @@ fn test_load_jsonl_data() {
 
     let path = temp.path().to_str().unwrap();
     let stem = temp.path().file_stem().unwrap().to_str().unwrap();
-    let profiles = load_jsonl_data(path, &config).unwrap();
+    let profiles = load_jsonl_data(path, &config, None).unwrap();
     assert_eq!(profiles.len(), 1);
     assert_eq!(profiles[0].id, stem);
     assert!(profiles[0].total_logs >= 2);
@@ -3140,6 +3149,7 @@ fn test_file_regex_exclusion() {
 
     let path_re = compile_regex_list(&config.file_excluded_path_regexes);
     let name_re = compile_regex_list(&config.file_excluded_filename_regexes);
+    let wl_re = compile_wildcard_list(&config.whitelisted_path_patterns);
     assert!(should_ingest_file_entry(
         &RawFileEntry {
             machine_id: "x".into(),
@@ -3149,9 +3159,9 @@ fn test_file_regex_exclusion() {
             mtime: None,
             ..Default::default()
         },
-        &config,
         &path_re,
-        &name_re
+        &name_re,
+        &wl_re
     ));
     assert!(!should_ingest_file_entry(
         &RawFileEntry {
@@ -3162,9 +3172,9 @@ fn test_file_regex_exclusion() {
             mtime: None,
             ..Default::default()
         },
-        &config,
         &path_re,
-        &name_re
+        &name_re,
+        &wl_re
     ));
 
     println!("✅ File regex exclusion test passed!");
@@ -3246,6 +3256,69 @@ fn test_analyze_files_fleet() {
     );
     
     println!("✅ File fleet analysis test passed!");
+}
+
+/// Same path/inventory on every host but [`DetectionConfig::file_rare_signature_includes_recent_mtime`]
+/// splits bucket keys; without baseline that creates doc-freq-1 “rare” noise. Baseline fingerprints
+/// suppress counting those rows toward rare-doc frequency.
+#[test]
+fn test_file_fleet_baseline_suppresses_split_signature_rare_noise() {
+    let mut config = DetectionConfig::default();
+    config.dbscan_tolerance = 0.5;
+    config.file_rare_signature_includes_recent_mtime = true;
+    config.file_fleet_baseline_fingerprint_enabled = true;
+    config.file_fleet_baseline_min_host_fraction = 1.0;
+    config.file_fleet_baseline_mtime_bucket_secs = 86_400;
+
+    let access_ts = "2024-01-15T12:00:00Z".to_string();
+    let file_mt = "2024-01-15T10:00:00Z".to_string();
+
+    let mut entries = Vec::new();
+    for i in 0..3 {
+        let mid = format!("host{}", i);
+        let (timestamp, mtime_field) = if i == 0 {
+            (Some(access_ts.clone()), Some(file_mt.clone()))
+        } else {
+            (None, Some(file_mt.clone()))
+        };
+        entries.push(RawFileEntry {
+            machine_id: mid,
+            path: "/etc/fleet_baseline_same_inv".to_string(),
+            uid: 0,
+            timestamp,
+            mtime: mtime_field,
+            permissions: Some("0644".to_string()),
+            owner: Some("root".to_string()),
+            group: Some("root".to_string()),
+            ..Default::default()
+        });
+    }
+
+    let profiles = build_file_profiles(entries, &config);
+
+    let mut cfg_off = config.clone();
+    cfg_off.file_fleet_baseline_fingerprint_enabled = false;
+    let report_off = analyze_files_fleet(&profiles, &cfg_off).unwrap();
+    let report_on = analyze_files_fleet(&profiles, &config).unwrap();
+
+    fn rare_file_access_lines(report: &AnalysisReport) -> usize {
+        report
+            .anomalies
+            .iter()
+            .flat_map(|a| a.anomalous_features.iter())
+            .filter(|f| f.starts_with("Rare file access"))
+            .count()
+    }
+
+    assert!(
+        rare_file_access_lines(&report_off) > rare_file_access_lines(&report_on),
+        "baseline should cut rare-file churn from split signatures"
+    );
+    assert_eq!(
+        rare_file_access_lines(&report_on),
+        0,
+        "with identical inventory on all hosts, baseline-on should drop rare-doc churn to zero"
+    );
 }
 
 /// Root UID on a path is flagged only when a clear fleet majority uses non-root for that same path.
@@ -3531,16 +3604,16 @@ fn test_file_rare_file_detection() {
         });
     }
     
-    // One machine with a unique file
+    // One machine with a unique file under a system directory (qualifies for rare-file gate).
     entries.push(RawFileEntry {
         machine_id: "outlier".to_string(),
-        path: "/unusual/path/file".to_string(),
+        path: "/etc/cron.d/backdoor".to_string(),
         uid: 1000,
         timestamp: None,
         mtime: None,
         ..Default::default()
     });
-    
+
     let profiles = build_file_profiles(entries, &config);
     let report = analyze_files_fleet(&profiles, &config).unwrap();
     
@@ -3555,6 +3628,158 @@ fn test_file_rare_file_detection() {
     }
     
     println!("✅ Rare file detection test passed!");
+}
+
+/// Defaults must drop fleet-unique but uninteresting paths (long-tail user data, caches, etc.) so
+/// 40k+-file endpoints do not produce thousands of "Rare file access" reasons. Set
+/// `file_rare_requires_risk = false` to recover the previous behavior.
+#[test]
+fn test_file_rare_requires_risk_default_drops_uninteresting_uniques() {
+    let mut config = DetectionConfig::default();
+    config.dbscan_tolerance = 0.5;
+
+    let mut entries = Vec::new();
+    for i in 0..5 {
+        entries.push(RawFileEntry {
+            machine_id: format!("normal_{}", i),
+            path: "/var/log/syslog".to_string(),
+            uid: 1000,
+            ..Default::default()
+        });
+    }
+    // Fleet-unique path on a single host, but boring (user data; uid=1000, no risk markers).
+    entries.push(RawFileEntry {
+        machine_id: "outlier".to_string(),
+        path: "/home/alice/Documents/notes.md".to_string(),
+        uid: 1000,
+        ..Default::default()
+    });
+
+    let profiles = build_file_profiles(entries, &config);
+    let report = analyze_files_fleet(&profiles, &config).unwrap();
+    if let Some(a) = report.anomalies.iter().find(|a| a.machine_id == "outlier") {
+        assert!(
+            !a.anomalous_features
+                .iter()
+                .any(|f| f.contains("Rare file access")),
+            "uninteresting fleet-unique file must not produce a rare-file reason: {:?}",
+            a.anomalous_features
+        );
+    }
+
+    let mut relaxed = config.clone();
+    relaxed.file_rare_requires_risk = false;
+    let report2 = analyze_files_fleet(&profiles, &relaxed).unwrap();
+    let outlier = report2
+        .anomalies
+        .iter()
+        .find(|a| a.machine_id == "outlier")
+        .expect("outlier should be reported when gate is relaxed");
+    assert!(
+        outlier
+            .anomalous_features
+            .iter()
+            .any(|f| f.contains("Rare file access: /home/alice/Documents/notes.md")),
+        "with file_rare_requires_risk=false, every fleet-unique file is rare: {:?}",
+        outlier.anomalous_features
+    );
+}
+
+/// `file_max_rare_examples_per_host` caps the per-host noise on huge inventories and emits a
+/// trailing "+N more" summary so analysts can tell that data was elided.
+#[test]
+fn test_file_rare_cap_truncates_with_summary() {
+    let mut config = DetectionConfig::default();
+    config.dbscan_tolerance = 0.5;
+    config.file_max_rare_examples_per_host = 3;
+
+    let mut entries = Vec::new();
+    for i in 0..3 {
+        entries.push(RawFileEntry {
+            machine_id: format!("baseline_{}", i),
+            path: "/etc/hostname".to_string(),
+            uid: 0,
+            ..Default::default()
+        });
+    }
+    // 10 fleet-unique system-dir paths on the same host: all qualify under the risk gate.
+    for i in 0..10 {
+        entries.push(RawFileEntry {
+            machine_id: "outlier".to_string(),
+            path: format!("/etc/cron.d/job_{}", i),
+            uid: 0,
+            ..Default::default()
+        });
+    }
+
+    let profiles = build_file_profiles(entries, &config);
+    let report = analyze_files_fleet(&profiles, &config).unwrap();
+    let outlier = report
+        .anomalies
+        .iter()
+        .find(|a| a.machine_id == "outlier")
+        .expect("outlier should be reported");
+    let rare = outlier
+        .anomalous_features
+        .iter()
+        .filter(|f| f.starts_with("Rare file access: "))
+        .count();
+    assert_eq!(
+        rare, 3,
+        "rare file reasons must respect file_max_rare_examples_per_host: {:?}",
+        outlier.anomalous_features
+    );
+    assert!(
+        outlier
+            .anomalous_features
+            .iter()
+            .any(|f| f.contains("more rare files matched")),
+        "expected truncation summary when cap is hit: {:?}",
+        outlier.anomalous_features
+    );
+}
+
+/// The qualifier on `Rare file access` reasons should surface the risk markers (suspicious path,
+/// world-writable, recent mtime, root UID) so analysts immediately see why the gate passed.
+#[test]
+fn test_file_rare_qualifier_lists_risk_markers() {
+    let mut config = DetectionConfig::default();
+    config.dbscan_tolerance = 0.5;
+
+    let mut entries = Vec::new();
+    for i in 0..3 {
+        entries.push(RawFileEntry {
+            machine_id: format!("baseline_{}", i),
+            path: "/etc/hostname".to_string(),
+            uid: 0,
+            ..Default::default()
+        });
+    }
+    entries.push(RawFileEntry {
+        machine_id: "outlier".to_string(),
+        path: "/tmp/.x/agent".to_string(),
+        uid: 0,
+        permissions: Some("-rwxrwxrwx".to_string()),
+        ..Default::default()
+    });
+
+    let profiles = build_file_profiles(entries, &config);
+    let report = analyze_files_fleet(&profiles, &config).unwrap();
+    let outlier = report
+        .anomalies
+        .iter()
+        .find(|a| a.machine_id == "outlier")
+        .expect("outlier should be reported");
+    let rare = outlier
+        .anomalous_features
+        .iter()
+        .find(|f| f.starts_with("Rare file access: /tmp/.x/agent"))
+        .expect("rare-file reason for the suspicious path");
+    assert!(
+        rare.contains("suspicious_path") && rare.contains("world_writable") && rare.contains("uid=0"),
+        "rare-file qualifier should list active risk markers: {}",
+        rare
+    );
 }
 
 /// Same path and uid with different reported sizes should not create spurious "Rare file access"
@@ -3576,7 +3801,7 @@ fn test_file_rare_ignores_size_by_default() {
     }
     entries.push(RawFileEntry {
         machine_id: "only_one".to_string(),
-        path: "/unique/backdoor".to_string(),
+        path: "/etc/unique/backdoor".to_string(),
         uid: 1000,
         ..Default::default()
     });
@@ -3620,7 +3845,7 @@ fn test_file_rare_includes_size_when_configured() {
     for i in 0..2 {
         entries.push(RawFileEntry {
             machine_id: format!("m{}", i),
-            path: "/shared/config".to_string(),
+            path: "/etc/shared/config".to_string(),
             uid: 1000,
             size: Some(10 + i as u64),
             ..Default::default()
@@ -3634,7 +3859,7 @@ fn test_file_rare_includes_size_when_configured() {
         report.anomalies.iter().all(|a| {
             a.anomalous_features
                 .iter()
-                .any(|f| f.contains("Rare file access: /shared/config"))
+                .any(|f| f.contains("Rare file access: /etc/shared/config"))
         }),
         "each host should be sole owner of its size-specific signature: {:?}",
         report.anomalies
@@ -4275,4 +4500,189 @@ fn test_mega_line_file_csv_benchmark() {
 
     assert_eq!(profiles.len(), machine_n);
     assert_eq!(report.total_analyzed, machine_n);
+}
+
+/// 20 hosts × 40k file events: stress for the full runs file arm via SQLite. Verifies the
+/// streamed SQLite-by-machine loader and `analyze_files_fleet` produce findings without
+/// exploding memory or hanging on a realistic file inventory shape (per-host unique paths
+/// plus a shared system-baseline). Mirrors the field report about runs misbehaving at that size.
+///
+/// Default size keeps regular `cargo test` runtime small; set `IRONSIFT_FILE_RUN_LINES` and
+/// `IRONSIFT_FILE_RUN_MACHINES` to reproduce the 20 × 40k case (set 800_000 / 20). The default
+/// (8 hosts × 5k = 40k) still exercises the same code paths as the larger run.
+#[test]
+fn run_file_fleet_smoke_realistic_shape() {
+    use crate::event_db::EventDb;
+    use crate::file_analysis::analyze_files_fleet;
+    use rusqlite::params;
+    use std::time::Instant;
+
+    let total: usize = std::env::var("IRONSIFT_FILE_RUN_LINES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40_000)
+        .clamp(1_000, 5_000_000);
+    let machine_n: usize = std::env::var("IRONSIFT_FILE_RUN_MACHINES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8)
+        .clamp(2, 64);
+    let per_host = total / machine_n;
+    let shared_baseline_n = (per_host / 50).max(20);
+    let dataset_id = "ds_file_run_smoke";
+
+    let dir = tempdir().unwrap();
+    let sql_path = dir.path().join("events.db");
+    let sql_path_str = sql_path.to_str().unwrap().to_string();
+
+    let cfg = DetectionConfig::default();
+
+    // Direct SQLite insert instead of going through the JSONL ingest path: keeps the test
+    // focused on the run path (load → group → analyze) for a known row layout.
+    let edb = EventDb::new(&sql_path_str).unwrap();
+    let mut conn = rusqlite::Connection::open(&sql_path_str).unwrap();
+    let t_ingest = Instant::now();
+    {
+        let tx = conn.transaction().unwrap();
+        tx.execute(
+            "INSERT OR REPLACE INTO datasets (id,name,source_path,format,kind,schema_profile,imported_at) VALUES (?,?,?,?,?,?,?)",
+            params![dataset_id, "smoke", "(memory)", "csv", "file", "osquery_v1", "2026-04-30T00:00:00Z"],
+        ).unwrap();
+        let mut stmt = tx
+            .prepare(
+                r#"INSERT INTO "file" (dataset_id,machine_id,path,directory,filename,uid,mode,size,mtime,atime,inv_checksum) VALUES (?,?,?,?,?,?,?,?,?,?,?)"#,
+            )
+            .unwrap();
+        for h in 0..machine_n {
+            let host = format!("file-host-{:02}", h);
+            for k in 0..shared_baseline_n {
+                let path = format!("/etc/baseline_{:04}.conf", k);
+                let mode = "-rw-r--r--";
+                let size = 4096i64;
+                let fname = format!("baseline_{:04}.conf", k);
+                let inv = crate::event_db::file_inv_checksum_for_row(fname.as_str(), Some(mode));
+                stmt.execute(params![
+                    dataset_id,
+                    host,
+                    path,
+                    "/etc",
+                    fname,
+                    0i64,
+                    mode,
+                    size,
+                    Option::<i64>::None,
+                    Option::<i64>::None,
+                    inv,
+                ]).unwrap();
+            }
+            let unique_n = per_host.saturating_sub(shared_baseline_n);
+            for k in 0..unique_n {
+                let path = format!("/home/user{}/data/file_{:06}.dat", h, k);
+                let mode = "-rw-r--r--";
+                let size = (((k as i64) * 31) % 65536) + 1;
+                let uid = 1000i64 + (h as i64);
+                let fname = format!("file_{:06}.dat", k);
+                let inv = crate::event_db::file_inv_checksum_for_row(fname.as_str(), Some(mode));
+                stmt.execute(params![
+                    dataset_id,
+                    host,
+                    path,
+                    format!("/home/user{}/data", h),
+                    fname,
+                    uid,
+                    mode,
+                    size,
+                    Option::<i64>::None,
+                    Option::<i64>::None,
+                    inv,
+                ]).unwrap();
+            }
+            if h == 0 {
+                let path = "/usr/sbin/.hidden_payload";
+                let mode = "-rwxr-xr-x";
+                let size = 8192i64;
+                let inv = crate::event_db::file_inv_checksum_for_row(".hidden_payload", Some(mode));
+                stmt.execute(params![
+                    dataset_id,
+                    host,
+                    path,
+                    "/usr/sbin",
+                    ".hidden_payload",
+                    0i64,
+                    mode,
+                    size,
+                    Option::<i64>::None,
+                    Option::<i64>::None,
+                    inv,
+                ]).unwrap();
+                let path = "/tmp/run_smoke_dropper.sh";
+                let mode = "-rwxrwxrwx";
+                let size = 512i64;
+                let inv =
+                    crate::event_db::file_inv_checksum_for_row("run_smoke_dropper.sh", Some(mode));
+                stmt.execute(params![
+                    dataset_id,
+                    host,
+                    path,
+                    "/tmp",
+                    "run_smoke_dropper.sh",
+                    0i64,
+                    mode,
+                    size,
+                    Option::<i64>::None,
+                    Option::<i64>::None,
+                    inv,
+                ]).unwrap();
+            }
+        }
+        drop(stmt);
+        tx.commit().unwrap();
+    }
+    let ingest_elapsed = t_ingest.elapsed();
+
+    // Run path: SQLite-streamed group-by-machine → build_file_profiles_from_grouped → fleet.
+    let t_load = Instant::now();
+    let grouped = edb.group_file_entries_by_machine(dataset_id).unwrap();
+    let load_elapsed = t_load.elapsed();
+    assert_eq!(grouped.len(), machine_n);
+    let total_rows: usize = grouped.values().map(|v| v.len()).sum();
+
+    let t_build = Instant::now();
+    let profiles = build_file_profiles_from_grouped(grouped, &cfg);
+    let build_elapsed = t_build.elapsed();
+    assert_eq!(profiles.len(), machine_n);
+
+    let t_analyze = Instant::now();
+    let report = analyze_files_fleet(&profiles, &cfg).unwrap();
+    let analyze_elapsed = t_analyze.elapsed();
+
+    assert_eq!(report.total_analyzed, machine_n);
+    assert!(
+        report.anomalies.iter().any(|a| a.machine_id == "file-host-00"),
+        "host-00 must surface as anomalous (suspicious paths injected): {:?}",
+        report.anomalies
+    );
+
+    println!(
+        "run_file_fleet_smoke: {} machines × ~{} rows = {} total | sqlite ingest {:?} | streamed load {:?} | profile build {:?} | analyze {:?} | anomalies {}",
+        machine_n,
+        per_host,
+        total_rows,
+        ingest_elapsed,
+        load_elapsed,
+        build_elapsed,
+        analyze_elapsed,
+        report.anomalies.len()
+    );
+}
+
+#[test]
+fn sigma_demo_template_yaml_parses() {
+    let templates = PlatformStore::default_sigma_rule_templates();
+    assert_eq!(templates.len(), 2);
+    for t in &templates {
+        let rule: sigma_zero::models::SigmaRule =
+            serde_yaml::from_str(&t.yaml).expect("demo rule YAML must parse");
+        assert!(!rule.title.is_empty());
+    }
 }

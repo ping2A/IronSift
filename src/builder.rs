@@ -5,12 +5,17 @@ use std::sync::Arc;
 use log;
 use chrono::{DateTime, Utc};
 use rayon::prelude::*;
+use regex::Regex;
 
 use crate::config::DetectionConfig;
 use crate::interner::{merge_pid_map_entry, SharedInterner};
 use crate::json_parse::{parse_json_log, parse_json_logs};
 use crate::types::{MachineProfile, ProcessEntry, ProcessSignature, RawLogEntry};
-use crate::utils::{calculate_shannon_entropy, is_path_suspicious, is_path_whitelisted, parse_command_line};
+use crate::utils::{
+    calculate_shannon_entropy, compile_regex_list, compile_wildcard_list,
+    is_path_suspicious_compiled, is_path_whitelisted_compiled, looks_like_kernel_thread_name,
+    parse_command_line,
+};
 
 /// Builder for collecting processes without PIDs, then auto-resolving relationships
 pub struct ProcessBuilder {
@@ -269,16 +274,18 @@ impl Default for ProcessBuilder {
 }
 
 /// Whether a row should be counted toward profiles given kernel / init / path whitelist settings.
-pub(crate) fn process_entry_passes_filters(entry: &RawLogEntry, config: &DetectionConfig) -> bool {
-    if config.exclude_kernel_threads && is_kernel_thread(&entry.name) {
+pub(crate) fn process_entry_passes_filters(
+    entry: &RawLogEntry,
+    config: &DetectionConfig,
+    whitelist_res: &[Regex],
+) -> bool {
+    if config.exclude_kernel_threads && looks_like_kernel_thread_name(&entry.name) {
         return false;
     }
     if config.exclude_init_children && entry.ppid == 1 {
         return false;
     }
-    if !config.whitelisted_path_patterns.is_empty()
-        && is_path_whitelisted(&entry.path, &config.whitelisted_path_patterns)
-    {
+    if !whitelist_res.is_empty() && is_path_whitelisted_compiled(&entry.path, whitelist_res) {
         return false;
     }
     true
@@ -292,6 +299,7 @@ pub(crate) fn merge_log_into_profile(
     config: &DetectionConfig,
     interner: &SharedInterner,
     process_counts: Option<&mut HashMap<String, u32>>,
+    suspicious_path_res: &[Regex],
 ) {
     let mid = interner.intern(&entry.machine_id);
     let parent_name = pid_to_name
@@ -311,7 +319,7 @@ pub(crate) fn merge_log_into_profile(
 
     let entropy = calculate_shannon_entropy(&entry.args);
     let is_high_entropy = entropy > config.entropy_threshold;
-    let is_suspicious_path = is_path_suspicious(&entry.path, &config.suspicious_path_patterns);
+    let is_suspicious_path = is_path_suspicious_compiled(&entry.path, suspicious_path_res);
 
     let timestamp = entry
         .timestamp
@@ -414,7 +422,7 @@ pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Ve
     let entries: Vec<RawLogEntry> = if config.exclude_kernel_threads {
         let before_count = entries.len();
         let filtered: Vec<_> = entries.into_iter()
-            .filter(|e| !is_kernel_thread(&e.name))
+            .filter(|e| !looks_like_kernel_thread_name(&e.name))
             .collect();
         let after_count = filtered.len();
         
@@ -445,17 +453,24 @@ pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Ve
     };
     
     // Filter out whitelisted paths if configured
-    let entries: Vec<RawLogEntry> = if !config.whitelisted_path_patterns.is_empty() {
+    let whitelist_res = compile_wildcard_list(&config.whitelisted_path_patterns);
+    let entries: Vec<RawLogEntry> = if !whitelist_res.is_empty() {
         let before_count = entries.len();
-        let filtered: Vec<_> = entries.into_iter()
-            .filter(|e| !is_path_whitelisted(&e.path, &config.whitelisted_path_patterns))
+        let filtered: Vec<_> = entries
+            .into_iter()
+            .filter(|e| !is_path_whitelisted_compiled(&e.path, &whitelist_res))
             .collect();
         let after_count = filtered.len();
-        
+
         if config.debug_display {
-            log::debug!("Whitelisted path filtering: before={}, after={}, filtered={}", before_count, after_count, before_count - after_count);
+            log::debug!(
+                "Whitelisted path filtering: before={}, after={}, filtered={}",
+                before_count,
+                after_count,
+                before_count - after_count
+            );
         }
-        
+
         filtered
     } else {
         entries
@@ -472,13 +487,17 @@ pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Ve
     if config.debug_display {
         log::debug!("Grouped into {} machines", machine_entries.len());
     }
-    
+
+    let suspicious_path_res = compile_regex_list(&config.suspicious_path_patterns);
+
     let profiles: Vec<MachineProfile> = machine_entries
         .par_iter()
         .map(|(machine_id, logs)| {
             let mut profile = MachineProfile::new(machine_id);
             let mut process_counts: HashMap<String, u32> = HashMap::new();
-            let interner_par = interner.clone();
+            // Per-machine interner avoids a global mutex on every field while still matching
+            // `pid_to_name` lookups (Arc<str> equality/hash use string content, not pointer).
+            let interner_par = SharedInterner::default();
             for entry in logs {
                 let pc = if config.debug_display {
                     Some(&mut process_counts)
@@ -492,6 +511,7 @@ pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Ve
                     config,
                     &interner_par,
                     pc,
+                    &suspicious_path_res,
                 );
             }
             profile
@@ -502,7 +522,3 @@ pub fn build_profiles(entries: Vec<RawLogEntry>, config: &DetectionConfig) -> Ve
     profiles
 }
 
-/// Check if a process name indicates a Linux kernel thread
-fn is_kernel_thread(name: &str) -> bool {
-    name.starts_with('[') && name.ends_with(']')
-}

@@ -194,3 +194,63 @@ pub fn compare_temporal_series(snapshots: &[MachineSnapshot]) -> Vec<TemporalDif
     }
     diffs
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::DetectionConfig;
+    use crate::types::{MachineProfile, RawLogEntry};
+    use std::collections::HashSet;
+
+    fn empty_snapshot(mid: &str, ts: &str) -> MachineSnapshot {
+        MachineSnapshot {
+            machine_id: mid.to_string(),
+            snapshot_ts: ts.to_string(),
+            process_profile: MachineProfile::new(mid),
+            file_profile: None,
+            connections: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn temporal_diff_empty_helpers() {
+        let d = TemporalDiff::default();
+        assert!(d.is_empty());
+        assert!(!d.has_changes());
+    }
+
+    #[test]
+    fn compare_temporal_series_empty_or_single_yields_no_diffs() {
+        assert!(compare_temporal_series(&[]).is_empty());
+        let s = empty_snapshot("m", "t1");
+        assert!(compare_temporal_series(std::slice::from_ref(&s)).is_empty());
+    }
+
+    #[test]
+    fn compare_temporal_mismatched_machine_returns_empty_diff_body() {
+        let a = empty_snapshot("m1", "t1");
+        let b = empty_snapshot("m2", "t2");
+        let d = compare_temporal(&a, &b);
+        assert_eq!(d.machine_id, "m2");
+        assert!(d.new_processes.is_empty());
+    }
+
+    #[test]
+    fn build_machine_snapshot_roundtrip_machine_id() {
+        let config = DetectionConfig::default();
+        let entries = vec![RawLogEntry {
+            machine_id: "host1".into(),
+            pid: 1,
+            ppid: 0,
+            name: "systemd".into(),
+            uid: 0,
+            path: "/usr/lib/systemd/systemd".into(),
+            args: "--system".into(),
+            timestamp: None,
+        }];
+        let snap = build_machine_snapshot("host1", "2024-01-01", entries, vec![], vec![], &config);
+        assert_eq!(snap.machine_id, "host1");
+        assert_eq!(snap.snapshot_ts, "2024-01-01");
+        assert!(!snap.process_profile.counts.is_empty());
+    }
+}

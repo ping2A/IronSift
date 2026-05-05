@@ -15,6 +15,7 @@ mod osquery;
 mod platform;
 mod sigma_log_export;
 mod event_db;
+mod osquery_event_ddl;
 
 // Re-export public API
 pub use config::{DetectionConfig, FileRecentMtimeConfig};
@@ -27,17 +28,22 @@ pub use report::{
     AnalysisReport, AnalysisType, AnomalyDetails, AnomalyLevel,
 };
 pub use utils::{
-    calculate_shannon_entropy, compile_regex_list, file_path_matches_exclusion,
-    is_path_suspicious, is_path_whitelisted, matches_wildcard, parse_command_line,
-    parse_log_datetime, unix_permission_flags,
+    calculate_shannon_entropy, compile_regex_list, compile_wildcard_list,
+    file_path_matches_exclusion, is_path_suspicious, is_path_suspicious_compiled,
+    is_path_whitelisted, is_path_whitelisted_compiled, looks_like_kernel_thread_name,
+    matches_wildcard, parse_command_line, parse_log_datetime, unix_permission_flags,
 };
 pub use json_parse::{
-    parse_files_json_logs, parse_json_log, parse_json_logs, parse_jsonl_logs,
-    parse_jsonl_process_line,
+    classify_json_line_shape, default_machine_fallback_for_source_file, parse_files_json_logs,
+    parse_json_log, parse_json_logs, parse_jsonl_logs, parse_jsonl_process_line,
+    sniff_json_or_jsonl_dataset_kind, JsonLineShape, JsonSniffDatasetKind,
 };
 pub use builder::{build_profiles, resolve_parent_names, ProcessBuilder};
 pub use analysis::{analyze_fleet, analyze_fleet2};
-pub use file_analysis::{analyze_files_fleet, build_file_profiles, should_ingest_file_entry};
+pub use file_analysis::{
+    analyze_files_fleet, build_file_profiles, build_file_profiles_from_grouped,
+    should_ingest_file_entry,
+};
 pub use temporal::{
     build_machine_snapshot, compare_temporal, compare_temporal_series,
     MachineSnapshot, TemporalDiff,
@@ -48,14 +54,28 @@ pub use loaders::{
 };
 pub use osquery::{normalize_osquery_file_row, normalize_osquery_process_row};
 pub use platform::{
-    AnoMarkAvailability, AnoMarkSettings, AnoMarkTrainRecord, AnoMarkTrainRequest, AnoMarkTrainResult,
-    AnoMarkTrainingAvailability,
-    AutoPipelineRequest, AutoPipelineResult, CreateDatasetRequest, CreateRunRequest, DatasetKind,
-    DatasetRecord, DetectionFinding, DetectionRunRecord, HoneycombCell, PlatformStore,
-    SigmaZeroCheckRequest, SigmaZeroCheckResult, SigmaZeroSettings,
+    AnoMarkAvailability, AnoMarkCommandScore, AnoMarkModelInspection, AnoMarkSettings,
+    AnoMarkTestDatasetHostStat, AnoMarkTestDatasetSummary, AnoMarkTestResult,
+    AnoMarkTrainRecord,
+    AnoMarkTrainRequest, AnoMarkTrainResult, AnoMarkTrainingAvailability, AnoMarkWhereGenerated,
+    CreateDatasetRequest, CreateDetectionConfigRequest, CreateRunRequest, DatasetKind,
+    DeleteDatasetEventsRequest,
+    RunDetectionFocus, RunDetectorMode,
+    DatasetRecord, DetectionFinding, DetectionRunRecord, DetectionRunRequestSnapshot,
+    DetectorReasons, HoneycombCell, MachineTriageEntry, ReasonTriageEntry, RunUserTriage,
+    TriageVerdict,
+    ParentDirTagRule,
+    PlatformStore, SelectDetectionConfigRequest, SigmaRuleInline, SigmaZeroCheckRequest,
+    SigmaZeroCheckResult, SigmaZeroEvaluationStats, SigmaZeroSettings,
+    UpdateDetectionConfigRequest,
+    parent_dir_segment_tag,
 };
-pub use event_db::EventDb;
+pub use event_db::DetectionConfigProfileMeta;
+pub use event_db::DATASET_INSPECT_MAX_SAMPLE;
+pub use event_db::DELETE_DATASET_EVENTS_MAX_IDS;
 pub use event_db::DatasetInspection;
+pub use event_db::EventDb;
+pub use event_db::IngestSummary;
 
 #[cfg(test)]
 mod tests;

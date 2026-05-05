@@ -103,3 +103,56 @@ pub fn normalize_osquery_file_row(v: &Value, default_machine: &str) -> RawFileEn
             .or_else(|| v.get("size").and_then(|x| x.as_str()?.parse::<u64>().ok())),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn normalize_process_prefers_machine_and_numeric_strings() {
+        let v = json!({
+            "machine_id": "host-a",
+            "pid": "100",
+            "parent": 1,
+            "name": "nginx",
+            "path": "/usr/sbin/nginx",
+            "cmdline": "/usr/sbin/nginx -c /etc/nginx.conf",
+            "uid": 33
+        });
+        let r = normalize_osquery_process_row(&v, "fallback");
+        assert_eq!(r.machine_id, "host-a");
+        assert_eq!(r.pid, 100);
+        assert_eq!(r.ppid, 1);
+        assert_eq!(r.name, "nginx");
+        assert_eq!(r.path, "/usr/sbin/nginx");
+        assert!(r.args.contains("nginx"));
+    }
+
+    #[test]
+    fn normalize_process_uses_default_machine_when_missing() {
+        let v = json!({
+            "pid": 1,
+            "cmdline": "/bin/bash",
+        });
+        let r = normalize_osquery_process_row(&v, "default-host");
+        assert_eq!(r.machine_id, "default-host");
+        assert_eq!(r.name, "/bin/bash"); // first whitespace-separated token from cmdline when name empty
+    }
+
+    #[test]
+    fn normalize_file_row_paths_and_size() {
+        let v = json!({
+            "machine_id": "m",
+            "path": "/etc/shadow",
+            "mode": "-rw-------",
+            "size": "4096",
+            "mtime": "2024-01-01T00:00:00Z"
+        });
+        let f = normalize_osquery_file_row(&v, "x");
+        assert_eq!(f.path, "/etc/shadow");
+        assert_eq!(f.permissions.as_deref(), Some("-rw-------"));
+        assert_eq!(f.size, Some(4096));
+        assert!(f.mtime.is_some());
+    }
+}
