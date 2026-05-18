@@ -190,35 +190,6 @@ let diffs = compare_temporal_series(&[snap1, snap2, snap3]);
 
 ---
 
-## 📜 Version History
-
-### v0.4.0 (Current) - File fleet, platform triage, and performance
-- **File fleet:** Fleet-relative **`FLEET OUTLIER`** signals (root/permissions/recent-mtime **per path** vs majority), ingest **`file_excluded_*`**, configurable **`file_recent_mtime`**, stricter recent-mtime heuristic to cut false positives.
-- **Analyst triage (Web UI / API):** Per-detection-reason labels (false positive / malicious) and a per-host final verdict, with **fleet-wide reason memory**: matching `(detector, reason)` lines from **older runs** pre-fill unset verdicts on new or reopened runs, and **effective** score/severity reflects triage while **raw** detector scores stay stored for reproducibility.
-- **Process/file profiles:** Hot strings deduplicated via **interning** (`Arc<str>` on signatures and file maps).
-- 🧪 Expanded tests for file fleet, exclusions, and triage history scoring.
-
-### v0.3.0 - Enhanced Analysis & Input Flexibility
-- ✨ **Enhanced Detailed Console Output** - Rich reporting with attack categorization
-- ✨ **Automatic Command Line Parsing** - Handles bare commands (`ls /etc/`) and full paths
-- ✨ **Native JSON Log Parsing** - Docker, Kubernetes, CloudWatch, Elasticsearch support
-- 📚 Comprehensive documentation (15+ guides)
-- 🧪 Broad test coverage
-
-### v0.2.0 - Flexible APIs & Automation
-- 🎯 Three flexible APIs (Simple, Builder, Direct)
-- 🔄 Automatic PID/PPID resolution
-- 📁 Reorganized project structure (CLI separated)
-- 📖 Extensive documentation
-
-### v0.1.0 - Initial Release
-- 🔍 Core DBSCAN clustering
-- 📊 TF-IDF feature engineering
-- 🚨 Anomaly detection
-- 📈 Basic reporting
-
----
-
 ## 📥 Multiple Input Methods
 
 IronSift accepts data in various formats - choose what works for your logs:
