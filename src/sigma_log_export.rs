@@ -35,7 +35,11 @@ fn command_line_str(e: &RawLogEntry) -> String {
 }
 
 /// Same shape as [`raw_to_sigma_json`], from a row in the ingested `processes` SQLite table (`cmdline` stored verbatim).
+///
+/// `dataset_id` is emitted as `ironsift_dataset_id` so Sigma matches can be merged into the same
+/// namespaced host keys as multi-dataset detection runs (`dataset_id/logical_host`).
 pub fn sigma_json_from_ingested_sql_row(
+    dataset_id: &str,
     machine_id: &str,
     pid: i64,
     name: &str,
@@ -49,7 +53,7 @@ pub fn sigma_json_from_ingested_sql_row(
     let uid_u = uid.max(0) as u32;
     let ppid_u = parent.max(0) as u32;
     let timestamp = start_time.map(|e| e.to_string());
-    serde_json::json!({
+    let mut v = serde_json::json!({
         "machine_id": machine_id,
         "event_type": "process_creation",
         "process_name": name,
@@ -62,7 +66,14 @@ pub fn sigma_json_from_ingested_sql_row(
         "ppid": ppid_u,
         "uid": uid_u,
         "timestamp": timestamp,
-    })
+    });
+    let ds = dataset_id.trim();
+    if !ds.is_empty() {
+        v.as_object_mut()
+            .expect("object")
+            .insert("ironsift_dataset_id".into(), serde_json::json!(ds));
+    }
+    v
 }
 
 /// One JSON line per **file inventory** row (`RawFileEntry` / SQLite `file` table): Sigma-friendly and
@@ -78,6 +89,7 @@ pub fn sigma_json_from_ingested_file_sql_row(
     size: Option<i64>,
     mtime: Option<i64>,
     atime: Option<i64>,
+    ironsift_dataset_id: Option<&str>,
 ) -> serde_json::Value {
     let uid_u = uid.max(0) as u64;
     let dir_s = directory.unwrap_or("");
@@ -107,10 +119,13 @@ pub fn sigma_json_from_ingested_file_sql_row(
     if let Some(at) = atime {
         obj.insert("atime".into(), serde_json::json!(at));
     }
+    if let Some(ds) = ironsift_dataset_id.map(str::trim).filter(|s| !s.is_empty()) {
+        obj.insert("ironsift_dataset_id".into(), serde_json::json!(ds));
+    }
     v
 }
 
-pub fn raw_file_to_sigma_json(e: &RawFileEntry) -> serde_json::Value {
+pub fn raw_file_to_sigma_json(e: &RawFileEntry, ironsift_dataset_id: Option<&str>) -> serde_json::Value {
     let path = e.path.as_str();
     let derived_dir = std::path::Path::new(path)
         .parent()
@@ -140,6 +155,7 @@ pub fn raw_file_to_sigma_json(e: &RawFileEntry) -> serde_json::Value {
         e.size.map(|s| s as i64),
         None,
         None,
+        ironsift_dataset_id,
     );
     if let Some(obj) = v.as_object_mut() {
         if let Some(ref m) = e.mtime {
@@ -159,9 +175,9 @@ pub fn raw_file_to_sigma_json(e: &RawFileEntry) -> serde_json::Value {
 }
 
 /// One JSON line per process event: Sigma synonyms plus osquery `processes` column names where they overlap.
-pub fn raw_to_sigma_json(e: &RawLogEntry) -> serde_json::Value {
+pub fn raw_to_sigma_json(e: &RawLogEntry, ironsift_dataset_id: Option<&str>) -> serde_json::Value {
     let cmd = command_line_str(e);
-    serde_json::json!({
+    let mut v = serde_json::json!({
         "machine_id": e.machine_id,
         "event_type": "process_creation",
         "process_name": e.name,
@@ -174,7 +190,13 @@ pub fn raw_to_sigma_json(e: &RawLogEntry) -> serde_json::Value {
         "ppid": e.ppid,
         "uid": e.uid,
         "timestamp": e.timestamp,
-    })
+    });
+    if let Some(ds) = ironsift_dataset_id.map(str::trim).filter(|s| !s.is_empty()) {
+        v.as_object_mut()
+            .expect("object")
+            .insert("ironsift_dataset_id".into(), serde_json::json!(ds));
+    }
+    v
 }
 
 /// Export process log files to a single JSONL file. Each `sources` entry is `(source_path, format)` where
@@ -187,20 +209,21 @@ pub fn export_process_sources_to_sigma_jsonl(
     out_path: &std::path::Path,
 ) -> Result<u64, Box<dyn Error>> {
     let mut out = File::create(out_path)?;
-    export_process_sources_to_sigma_jsonl_writer(sources, &mut out)
+    export_process_sources_to_sigma_jsonl_writer(sources, &mut out, None)
 }
 
 /// Append Sigma JSONL from on-disk process logs into an existing writer (used to merge SQLite + file exports per dataset).
 pub fn export_process_sources_to_sigma_jsonl_writer<W: Write>(
     sources: &[(String, String)],
     w: &mut W,
+    ironsift_dataset_id: Option<&str>,
 ) -> Result<u64, Box<dyn Error>> {
     let mut total: u64 = 0;
     for (path, ext) in sources {
         let n = match ext.as_str() {
-            "csv" => write_csv(path, w)?,
-            "json" => write_json_file(path, w)?,
-            "jsonl" => write_jsonl(path, w)?,
+            "csv" => write_csv(path, w, ironsift_dataset_id)?,
+            "json" => write_json_file(path, w, ironsift_dataset_id)?,
+            "jsonl" => write_jsonl(path, w, ironsift_dataset_id)?,
             other => {
                 return Err(format!(
                     "unsupported format for Sigma export: {} (path {})",
@@ -218,13 +241,14 @@ pub fn export_process_sources_to_sigma_jsonl_writer<W: Write>(
 pub fn export_file_sources_to_sigma_jsonl_writer<W: Write>(
     sources: &[(String, String)],
     w: &mut W,
+    ironsift_dataset_id: Option<&str>,
 ) -> Result<u64, Box<dyn Error>> {
     let mut total: u64 = 0;
     for (path, ext) in sources {
         let n = match ext.as_str() {
-            "csv" => write_file_csv(path, w)?,
-            "json" => write_file_json_file(path, w)?,
-            "jsonl" => write_file_jsonl(path, w)?,
+            "csv" => write_file_csv(path, w, ironsift_dataset_id)?,
+            "json" => write_file_json_file(path, w, ironsift_dataset_id)?,
+            "jsonl" => write_file_jsonl(path, w, ironsift_dataset_id)?,
             other => {
                 return Err(format!(
                     "unsupported format for Sigma file export: {} (path {})",
@@ -245,14 +269,22 @@ fn normalize_file_machine(mut e: RawFileEntry, default_mid: &str) -> RawFileEntr
     e
 }
 
-fn write_file_line<W: Write>(w: &mut W, e: &RawFileEntry) -> std::io::Result<()> {
-    let s = serde_json::to_string(&raw_file_to_sigma_json(e)).map_err(|e| {
+fn write_file_line<W: Write>(
+    w: &mut W,
+    e: &RawFileEntry,
+    ironsift_dataset_id: Option<&str>,
+) -> std::io::Result<()> {
+    let s = serde_json::to_string(&raw_file_to_sigma_json(e, ironsift_dataset_id)).map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
     })?;
     writeln!(w, "{}", s)
 }
 
-fn write_file_jsonl<W: Write>(path: &str, w: &mut W) -> Result<u64, Box<dyn Error>> {
+fn write_file_jsonl<W: Write>(
+    path: &str,
+    w: &mut W,
+    ironsift_dataset_id: Option<&str>,
+) -> Result<u64, Box<dyn Error>> {
     let fb = default_machine_fallback_for_source_file(path, None);
     let f = File::open(path)?;
     let mut reader = BufReader::with_capacity(1024 * 1024, f);
@@ -284,7 +316,7 @@ fn write_file_jsonl<W: Write>(path: &str, w: &mut W) -> Result<u64, Box<dyn Erro
                 if e.path.is_empty() {
                     continue;
                 }
-                write_file_line(w, &e)?;
+                write_file_line(w, &e, ironsift_dataset_id)?;
                 n += 1;
             }
             Err(e) => log::warn!("Sigma file export skipped line in {}: {}", path, e),
@@ -293,7 +325,11 @@ fn write_file_jsonl<W: Write>(path: &str, w: &mut W) -> Result<u64, Box<dyn Erro
     Ok(n)
 }
 
-fn write_file_json_file<W: Write>(path: &str, w: &mut W) -> Result<u64, Box<dyn Error>> {
+fn write_file_json_file<W: Write>(
+    path: &str,
+    w: &mut W,
+    ironsift_dataset_id: Option<&str>,
+) -> Result<u64, Box<dyn Error>> {
     let fb = default_machine_fallback_for_source_file(path, None);
     let content = fs::read_to_string(path)?;
     let entries = parse_files_json_logs(content.trim(), &fb)?;
@@ -302,13 +338,17 @@ fn write_file_json_file<W: Write>(path: &str, w: &mut W) -> Result<u64, Box<dyn 
         if e.path.is_empty() {
             continue;
         }
-        write_file_line(w, &e)?;
+        write_file_line(w, &e, ironsift_dataset_id)?;
         n += 1;
     }
     Ok(n)
 }
 
-fn write_file_csv<W: Write>(path: &str, w: &mut W) -> Result<u64, Box<dyn Error>> {
+fn write_file_csv<W: Write>(
+    path: &str,
+    w: &mut W,
+    ironsift_dataset_id: Option<&str>,
+) -> Result<u64, Box<dyn Error>> {
     use csv::Reader;
     let mut n: u64 = 0;
     let mut rdr = Reader::from_path(path)?;
@@ -317,20 +357,28 @@ fn write_file_csv<W: Write>(path: &str, w: &mut W) -> Result<u64, Box<dyn Error>
         if e.path.is_empty() {
             continue;
         }
-        write_file_line(w, &e)?;
+        write_file_line(w, &e, ironsift_dataset_id)?;
         n += 1;
     }
     Ok(n)
 }
 
-fn write_line<W: Write>(w: &mut W, e: &RawLogEntry) -> std::io::Result<()> {
-    let s = serde_json::to_string(&raw_to_sigma_json(e)).map_err(|e| {
+fn write_line<W: Write>(
+    w: &mut W,
+    e: &RawLogEntry,
+    ironsift_dataset_id: Option<&str>,
+) -> std::io::Result<()> {
+    let s = serde_json::to_string(&raw_to_sigma_json(e, ironsift_dataset_id)).map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
     })?;
     writeln!(w, "{}", s)
 }
 
-fn write_jsonl<W: Write>(path: &str, w: &mut W) -> Result<u64, Box<dyn Error>> {
+fn write_jsonl<W: Write>(
+    path: &str,
+    w: &mut W,
+    ironsift_dataset_id: Option<&str>,
+) -> Result<u64, Box<dyn Error>> {
     let f = File::open(path)?;
     let mut reader = BufReader::with_capacity(1024 * 1024, f);
     let mut n: u64 = 0;
@@ -347,7 +395,7 @@ fn write_jsonl<W: Write>(path: &str, w: &mut W) -> Result<u64, Box<dyn Error>> {
         }
         match parse_line_for_sigma_export(path, t) {
             Ok(e) => {
-                write_line(w, &e)?;
+                write_line(w, &e, ironsift_dataset_id)?;
                 n += 1;
             }
             Err(e) => {
@@ -358,7 +406,11 @@ fn write_jsonl<W: Write>(path: &str, w: &mut W) -> Result<u64, Box<dyn Error>> {
     Ok(n)
 }
 
-fn write_json_file<W: Write>(path: &str, w: &mut W) -> Result<u64, Box<dyn Error>> {
+fn write_json_file<W: Write>(
+    path: &str,
+    w: &mut W,
+    ironsift_dataset_id: Option<&str>,
+) -> Result<u64, Box<dyn Error>> {
     let content = fs::read_to_string(path)?;
     let json = content.trim();
     if json.is_empty() {
@@ -371,7 +423,7 @@ fn write_json_file<W: Write>(path: &str, w: &mut W) -> Result<u64, Box<dyn Error
             let line = serde_json::to_string(&value)?;
             match parse_line_for_sigma_export(path, &line) {
                 Ok(e) => {
-                    write_line(w, &e)?;
+                    write_line(w, &e, ironsift_dataset_id)?;
                     n += 1;
                 }
                 Err(e) => log::warn!("Sigma export skipped JSON entry in {}: {}", path, e),
@@ -386,7 +438,7 @@ fn write_json_file<W: Write>(path: &str, w: &mut W) -> Result<u64, Box<dyn Error
         }
         match parse_line_for_sigma_export(path, line) {
             Ok(e) => {
-                write_line(w, &e)?;
+                write_line(w, &e, ironsift_dataset_id)?;
                 n += 1;
             }
             Err(e) => log::warn!("Sigma export skipped line in {}: {}", path, e),
@@ -395,13 +447,17 @@ fn write_json_file<W: Write>(path: &str, w: &mut W) -> Result<u64, Box<dyn Error
     Ok(n)
 }
 
-fn write_csv<W: Write>(path: &str, w: &mut W) -> Result<u64, Box<dyn Error>> {
+fn write_csv<W: Write>(
+    path: &str,
+    w: &mut W,
+    ironsift_dataset_id: Option<&str>,
+) -> Result<u64, Box<dyn Error>> {
     use csv::Reader;
     let mut n: u64 = 0;
     let mut rdr = Reader::from_path(path)?;
     for result in rdr.deserialize::<RawLogEntry>() {
         let e = result?;
-        write_line(w, &e)?;
+        write_line(w, &e, ironsift_dataset_id)?;
         n += 1;
     }
     Ok(n)
@@ -438,5 +494,24 @@ mod tests {
         assert!(s.contains("process_name"));
         assert!(s.contains("command_line"));
         assert!(s.contains("\"cmdline\""));
+    }
+
+    #[test]
+    fn ingested_sql_sigma_json_carries_ironsift_dataset_id() {
+        let v = sigma_json_from_ingested_sql_row(
+            "dataset-uuid",
+            "host1",
+            1,
+            "sh",
+            "/bin/sh",
+            "sh -c id",
+            0,
+            0,
+            None,
+        );
+        assert_eq!(
+            v.get("ironsift_dataset_id").and_then(|x| x.as_str()),
+            Some("dataset-uuid")
+        );
     }
 }

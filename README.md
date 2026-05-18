@@ -192,10 +192,11 @@ let diffs = compare_temporal_series(&[snap1, snap2, snap3]);
 
 ## 📜 Version History
 
-### v0.4.0 (Current) - File fleet & performance
+### v0.4.0 (Current) - File fleet, platform triage, and performance
 - **File fleet:** Fleet-relative **`FLEET OUTLIER`** signals (root/permissions/recent-mtime **per path** vs majority), ingest **`file_excluded_*`**, configurable **`file_recent_mtime`**, stricter recent-mtime heuristic to cut false positives.
+- **Analyst triage (Web UI / API):** Per-detection-reason labels (false positive / malicious) and a per-host final verdict, with **fleet-wide reason memory**: matching `(detector, reason)` lines from **older runs** pre-fill unset verdicts on new or reopened runs, and **effective** score/severity reflects triage while **raw** detector scores stay stored for reproducibility.
 - **Process/file profiles:** Hot strings deduplicated via **interning** (`Arc<str>` on signatures and file maps).
-- 🧪 Expanded tests for file fleet and exclusions.
+- 🧪 Expanded tests for file fleet, exclusions, and triage history scoring.
 
 ### v0.3.0 - Enhanced Analysis & Input Flexibility
 - ✨ **Enhanced Detailed Console Output** - Rich reporting with attack categorization
@@ -336,6 +337,8 @@ cargo run --bin ironsift-server
 
 Then open `http://localhost:8080`.
 
+**Shareable run results:** after a detection finishes, the UI opens a dedicated **`/run/<run-id>`** page in a new tab (run summary, honeycomb, findings table, raw JSON). That URL is suitable to paste in chat or tickets; use **Copy page link** on that page. The page reads **`ironsift_theme`** from `localStorage` (same key and default as the main UI: **dark** if unset), and updates when you change theme elsewhere or refocus the tab. To jump back into the full workbench with the same run loaded, use **Open full workbench** or open `http://localhost:8080/?tab=runs&findingsRun=<run-id>`.
+
 API endpoints:
 
 - `GET /api/health`
@@ -347,6 +350,7 @@ API endpoints:
 - `GET/POST /api/run-config` (manage default detection config used by new runs)
 - `GET /api/runs/:id`
 - `GET /api/runs/:id/detections`
+- `PUT /api/runs/:id/triage` (save per-reason and per-host analyst verdicts: false positive / malicious / unset)
 - `GET /api/fleet/honeycomb?run_id=<id>&min_score=<0..1>&severity=<LOW|MEDIUM|HIGH|CRITICAL>`
 - `GET/POST /api/anomark/config` (set model/columns from UI or API)
 - `GET /api/anomark/availability` (which model files exist: platform config + saved trainings; used by “Runs & Findings” to enable AnoMark)
@@ -477,6 +481,32 @@ The Runs tab now supports:
 - selecting a run and propagating it automatically to Findings (including the hex fleet view)
 - editable default run config as full `DetectionConfig` JSON (all fields exposed)
 
+#### Analyst triage, reason memory, and severity on the platform
+
+When you use **Runs & Findings** in the web UI (or the JSON APIs below), IronSift persists analyst judgment alongside each detection run in the platform database (`db.json`).
+
+| Concept | What it does |
+|--------|----------------|
+| **Per-reason triage** | Each actionable detection line (grouped by detector: `ironsift-process`, `anomark-rs`, `ironsift-file`, etc.) can be labeled **false positive**, **malicious**, or left **unset**. Context-only lines such as `Process row: …` are excluded from per-reason triage (same rules as the UI). |
+| **Per-host final verdict** | One overall label per machine for the run (independent of the per-reason rows). |
+| **Save path** | The UI can save triage with **Save triage** or autosave; the server stores it with `PUT /api/runs/:id/triage`. |
+
+**Fleet-wide reason memory (reuse past labels):**  
+Verdicts are keyed by **`(detector, reason)`** — the exact reason string as emitted by the detectors, not by host name. When you open **findings** or the **honeycomb** for a run, the server looks at **other saved runs** (newest first by `created_at`) and, for any reason that is still **unset** on the *current* run, copies the latest non-unset verdict seen anywhere in the fleet for that same `(detector, reason)` pair. Those fills are **written** into the current run’s `user_triage` when they change something, so the dropdowns stay populated after reload. **Existing choices on the current run are never overwritten** — only gaps (`unset`) are filled from history.
+
+**New detection runs** apply the same merge **once**, at the end of run creation, before the run is appended to storage — so recurring noise reasons can start pre-labeled without opening the UI first.
+
+**Effective score and severity (triage-aware display):**  
+Each finding still stores the **raw** fused detector **score** (0–1) and its severity label from the run pipeline. What you see in the findings table, JSON from `GET /api/runs/:id/detections`, and the honeycomb uses an **effective** score and severity derived from that raw value **plus** merged per-reason triage (grouped into **actionable triage slots**: e.g. multiple `ironsift-process` lines for the same primary process name count as one slot):
+
+- If **any** actionable slot is **malicious**, the effective score stays at the **raw** fused score (and severity follows the usual score→label mapping below).
+- If **every** actionable slot is **false positive**, the effective score becomes **0** and severity **LOW** (the row remains, but risk is downgraded for review).
+- If there is a **mix** of false positive and **unset** slots, the effective score stays at the **full raw** score so open items are not downgraded just because another line on the same host was marked false positive.
+
+See **[Severity (how levels are calculated)](#severity-how-levels-are-calculated)** for the numeric thresholds.
+
+**Caveat:** If you set a reason back to **unset** and save, a later reload can fill it again from history when another run still carries a verdict for that same line — that matches “always re-apply fleet consensus.” To stop reusing history for a specific pattern, every run would need that line cleared consistently, or a future explicit “ignore history” flag (not implemented today).
+
 Behavior:
 
 1. Imports all `.csv`, `.json`, `.jsonl` files from the directory.
@@ -514,10 +544,10 @@ On first open, obsolete tables named `process_events` or `file_events` are dropp
 
 #### Honeycomb fleet map (Runs & Findings)
 
-On **Run Findings** (not a separate tab), the Web UI renders a hexagonal honeycomb map:
+On the **Runs & Findings** tab (after loading a run) and on the shareable **`/run/<run-id>`** page, the Web UI renders a hexagonal honeycomb map:
 
 - each hex cell = one machine
-- color encodes risk score/severity
+- color encodes **effective** risk score/severity (same triage-aware values as the findings table; see *Analyst triage* above)
 - tooltip shows host, severity, score
 - API filters supported:
   - `min_score` for thresholding
@@ -739,14 +769,65 @@ cargo run --bin ironsift -- --tolerance 0.03
 
 ## 📊 Understanding Results
 
-### Anomaly Severity Levels
+### Severity (how levels are calculated)
 
-| Level | Score | Meaning | Action |
-|-------|-------|---------|--------|
-| 💀 **Critical** | > 1.0 | Isolated outlier, likely compromised | **Immediate isolation** |
-| 🔴 **High** | 0.6-1.0 | Strong deviation, investigate ASAP | **Priority investigation** |
-| 🟠 **Medium** | 0.3-0.6 | Moderate anomaly, worth reviewing | **Schedule review** |
-| 🟡 **Low** | 0.0-0.3 | Minor deviation, may be benign | **Monitor** |
+IronSift uses **different numeric inputs** depending on whether you are looking at the **Rust CLI / library report** or the **web platform** findings API. The **labels** (LOW / MEDIUM / HIGH / CRITICAL) are aligned, but the **numbers** behind them are not the same field.
+
+#### 1. CLI and `analyze_fleet` console / JSON report (`AnomalyLevel`)
+
+Fleet and file-mode analysis assigns each anomalous machine a **distance** score from clustering (DBSCAN feature space). Severity is:
+
+| Label | Condition on `distance_score` | Typical meaning |
+|-------|------------------------------|-----------------|
+| **CRITICAL** | `distance_score ≥ 1.0` | Strong outlier (e.g. noise point or far from dense cluster) |
+| **HIGH** | `0.6 ≤ distance_score < 1.0` | Clear deviation from the fleet baseline |
+| **MEDIUM** | `0.3 ≤ distance_score < 0.6` | Moderate deviation |
+| **LOW** | `distance_score < 0.3` | Mild deviation |
+
+This is implemented as `AnomalyLevel::from_distance` in `src/report.rs` and is what you see in printed reports and in the `forensic_report.json` **investigation_targets** style output for library-driven workflows.
+
+#### 2. Web platform: per-host finding score and severity (`severity_from_score`)
+
+When the platform builds **detection runs**, each infected host row gets a **fused** detector score in **\[0, 1\]** (combined IronSift process/file signals plus optional AnoMark / Sigma contributions, then clamped to a finite value). The **stored** severity string on that finding is:
+
+| Label | Condition on fused `score` |
+|-------|------------------------------|
+| **CRITICAL** | `score ≥ 0.9` |
+| **HIGH** | `0.7 ≤ score < 0.9` |
+| **MEDIUM** | `0.4 ≤ score < 0.7` |
+| **LOW** | `score < 0.4` |
+
+Defined in `severity_from_score` in `src/platform.rs` and applied when the run is saved. The API still returns this raw pair on the underlying record; the detections endpoint **overrides** what you see with the effective values below.
+
+#### 3. Web platform: **effective** score and severity after analyst triage
+
+For `GET /api/runs/:id/detections` and the honeycomb, the UI uses **`effective_score_and_severity`** (`src/platform.rs`): actionable reasons on a host are grouped into **slots** (not every text line is independent—e.g. several `ironsift-process` lines for the same primary process name share one slot). Per slot, triage verdicts are aggregated (malicious wins; any unset keeps the group unset; otherwise false positive).
+
+From there:
+
+- **Any slot malicious** → effective score = **raw** fused score; severity = `severity_from_score(raw)`.
+- **All slots false positive** → effective score = **0**; severity = **LOW**.
+- **Any other mix** (e.g. false positive + unset) → effective score = **raw** fused score; severity = `severity_from_score(raw)` so unset lines are not buried by unrelated false positives.
+
+Honeycomb cells for hosts that appear in ingested data but have **no** finding use **CLEAN** / score **0** (not the same code path as triage).
+
+#### 4. Quick reference: CLI distance vs platform fused score
+
+| Context | Numeric input | CRITICAL from… |
+|---------|----------------|----------------|
+| CLI / library anomaly list | `distance_score` | `≥ 1.0` |
+| Platform finding / API display | Fused `score` in \[0, 1\] | `≥ 0.9` (before or after triage, except all-FP → 0 / LOW) |
+
+### Anomaly Severity Levels (CLI report)
+
+For the **console and JSON report** produced by `analyze_fleet` / `ironsift` on the command line, interpret severity using **distance** as in section 1 above:
+
+| Level | Distance | Meaning | Action |
+|-------|----------|---------|--------|
+| 💀 **Critical** | ≥ 1.0 | Isolated outlier, likely compromised | **Immediate isolation** |
+| 🔴 **High** | ≥ 0.6 and below 1.0 | Strong deviation, investigate ASAP | **Priority investigation** |
+| 🟠 **Medium** | ≥ 0.3 and below 0.6 | Moderate anomaly, worth reviewing | **Schedule review** |
+| 🟡 **Low** | below 0.3 | Minor deviation, may be benign | **Monitor** |
 
 ### Forensic Report Structure
 

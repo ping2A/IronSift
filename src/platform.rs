@@ -246,6 +246,10 @@ pub struct ReasonTriageEntry {
     pub reason: String,
     #[serde(default)]
     pub verdict: TriageVerdict,
+    /// When an analyst last set a non-[`TriageVerdict::Unset`] verdict for this line (RFC 3339).
+    /// Cleared when verdict is unset; omitted for fleet auto-merge until someone saves triage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -262,6 +266,57 @@ pub struct MachineTriageEntry {
 pub struct RunUserTriage {
     #[serde(default)]
     pub machines: Vec<MachineTriageEntry>,
+}
+
+/// One per-reason verdict from an **older** detection run (newest matching run wins). Used to show
+/// which past analyst decisions feed fleet-wide triage memory for the current run’s reason lines.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HistoricalReasonVerdict {
+    pub detector: String,
+    pub reason: String,
+    pub verdict: TriageVerdict,
+    pub source_run_id: String,
+    pub source_run_created_at: String,
+    /// Host on [`DetectionRunRecord::user_triage`] that contributed this precedent (audit / edit).
+    #[serde(default)]
+    pub source_machine_id: String,
+    /// When that verdict was last reviewed on the source run (`ReasonTriageEntry::reviewed_at`), if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_reviewed_at: Option<String>,
+}
+
+/// `(detector, reason)` pair stored on a run to **suppress** fleet triage memory for that line on
+/// this run only (stops auto-merge and clears saved per-reason rows for that key).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ReasonPrecedentKey {
+    pub detector: String,
+    pub reason: String,
+}
+
+/// Fleet-wide triage memory persisted **independently of** [`PlatformDb::runs`], so precedents
+/// survive `delete_all_runs` and remain available for new runs and the global fleet memory API.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FleetTriagePrecedentEntry {
+    pub detector: String,
+    pub reason: String,
+    pub verdict: TriageVerdict,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_reviewed_at: Option<String>,
+    #[serde(default)]
+    pub source_run_id: String,
+    #[serde(default)]
+    pub source_run_created_at: String,
+    #[serde(default)]
+    pub source_machine_id: String,
+    /// When this row was last updated in the fleet store (RFC 3339).
+    pub updated_at: String,
+}
+
+/// Active past verdicts plus those hidden by [`DetectionRunRecord::triage_precedent_ignore`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TriagePrecedentBundle {
+    pub entries: Vec<HistoricalReasonVerdict>,
+    pub suppressed: Vec<HistoricalReasonVerdict>,
 }
 
 fn reason_excluded_from_per_reason_triage(reason: &str) -> bool {
@@ -309,6 +364,11 @@ pub struct DetectionFinding {
     /// [`Self::reasons`] in that case.
     #[serde(default)]
     pub reasons_by_detector: Vec<DetectorReasons>,
+    /// Full Sigma (sigmazero) rule-match JSON per host when stable Sigma ran on this detection.
+    /// One entry per engine match (order follows emission before reason-string deduplication).
+    /// Empty for hosts with no Sigma hits or legacy runs.
+    #[serde(default)]
+    pub sigma_matches: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -345,6 +405,13 @@ pub struct DetectionRunRecord {
     /// Analyst triage (false positive / malicious) per reason and final decision per machine.
     #[serde(default)]
     pub user_triage: RunUserTriage,
+    /// Per-run suppressions: fleet-wide precedent is **not** applied for these `(detector, reason)`
+    /// keys, and matching per-reason triage rows are removed from this run.
+    #[serde(default)]
+    pub triage_precedent_ignore: Vec<ReasonPrecedentKey>,
+    /// Sigma (stable) engine summary when this run evaluated Sigma (`None` if disabled or legacy).
+    #[serde(default)]
+    pub sigma_stable_stats: Option<DetectionRunSigmaStats>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -360,6 +427,13 @@ pub struct PlatformDb {
     /// Each successful AnoMark `train` run: persisted model + input and request snapshot.
     #[serde(default)]
     pub anomark_trainings: Vec<AnoMarkTrainRecord>,
+    /// `(detector, reason)` pairs excluded from fleet triage memory: not listed in the global
+    /// precedent view and not merged into new runs from historical verdicts.
+    #[serde(default)]
+    pub fleet_triage_precedent_drops: Vec<ReasonPrecedentKey>,
+    /// Canonical fleet triage memory (survives deletion of all runs).
+    #[serde(default)]
+    pub fleet_triage_precedent_entries: Vec<FleetTriagePrecedentEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -390,18 +464,19 @@ fn honey_matches_default() -> bool {
     true
 }
 
-fn finding_passes(
-    f: &DetectionFinding,
+fn finding_passes_scores(
+    score: f64,
+    severity: &str,
     min_score: Option<f64>,
-    severity: Option<&str>,
+    severity_filter: Option<&str>,
 ) -> bool {
     if let Some(m) = min_score {
-        if f.score < m {
+        if score < m {
             return false;
         }
     }
-    if let Some(s) = severity {
-        if !f.severity.eq_ignore_ascii_case(s) {
+    if let Some(s) = severity_filter {
+        if !severity.eq_ignore_ascii_case(s) {
             return false;
         }
     }
@@ -490,6 +565,9 @@ pub struct CreateRunRequest {
     pub detection_focus: RunDetectionFocus,
     #[serde(default)]
     pub detector_mode: RunDetectorMode,
+    /// Run in-process Sigma (sigmazero) after fleet engines, using only rules with `status: stable`.
+    #[serde(default)]
+    pub enable_sigma_stable: bool,
 }
 
 /// Snapshot of the request body used to start a detection run (persisted for history / reproducibility).
@@ -506,6 +584,8 @@ pub struct DetectionRunRequestSnapshot {
     pub detection_config_id: Option<String>,
     pub detection_focus: RunDetectionFocus,
     pub detector_mode: RunDetectorMode,
+    #[serde(default)]
+    pub enable_sigma_stable: bool,
 }
 
 /// Create a named detection configuration profile in SQLite.
@@ -670,6 +750,16 @@ pub struct SigmaZeroCheckRequest {
     pub inline_rule_ids: Vec<String>,
     #[serde(default)]
     pub workers: Option<usize>,
+    /// Keep only rules whose YAML `status` is `stable` (case-insensitive). Used for detection runs.
+    #[serde(default)]
+    pub stable_rules_only: bool,
+}
+
+/// Sigma rule identity for UI hints (`GET /api/sigma-zero/stable-rules`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SigmaStableRuleRef {
+    pub id: String,
+    pub title: String,
 }
 
 /// Throughput and timing for one Sigma check (helps validate that evaluation ran; Rust/Rayon can be very fast).
@@ -714,6 +804,51 @@ pub struct SigmaZeroCheckResult {
     pub file_log_source: String,
     #[serde(default)]
     pub evaluation: SigmaZeroEvaluationStats,
+}
+
+/// Sigma (stable rules) evaluation summary persisted on a [`DetectionRunRecord`] when the run
+/// included Sigma. Lets the UI show engine output even when no host-level findings were raised.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct DetectionRunSigmaStats {
+    pub status: String,
+    pub rules_match_count: usize,
+    pub rules_compiled: usize,
+    pub log_entries_evaluated: usize,
+    #[serde(default)]
+    pub approx_scalar_checks: u64,
+    #[serde(default)]
+    pub evaluate_ms: u64,
+    #[serde(default)]
+    pub engine_build_ms: u64,
+    #[serde(default)]
+    pub jsonl_parse_ms: u64,
+    #[serde(default)]
+    pub line_count: u64,
+    #[serde(default)]
+    pub rules_source: String,
+    #[serde(default)]
+    pub process_log_source: String,
+    #[serde(default)]
+    pub file_log_source: String,
+}
+
+impl DetectionRunSigmaStats {
+    fn from_sigma_check(res: &SigmaZeroCheckResult) -> Self {
+        Self {
+            status: res.status.clone(),
+            rules_match_count: res.rules_match_count,
+            rules_compiled: res.evaluation.rules_compiled,
+            log_entries_evaluated: res.evaluation.log_entries_evaluated,
+            approx_scalar_checks: res.evaluation.approx_scalar_checks,
+            evaluate_ms: res.evaluation.evaluate_ms,
+            engine_build_ms: res.evaluation.engine_build_ms,
+            jsonl_parse_ms: res.evaluation.jsonl_parse_ms,
+            line_count: res.line_count,
+            rules_source: res.rules_source.clone(),
+            process_log_source: res.process_log_source.clone(),
+            file_log_source: res.file_log_source.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -972,11 +1107,16 @@ impl PlatformStore {
         if let Ok(Some(cfg)) = event_db.get_selected_detection_config() {
             db.run_config = cfg;
         }
-        Ok(Self {
+        let seeded = seed_fleet_triage_precedents_from_runs_if_empty(&mut db);
+        let store = Self {
             db_path: db_path.to_string(),
             sql_path,
             db: Arc::new(RwLock::new(db)),
-        })
+        };
+        if seeded {
+            store.save()?;
+        }
+        Ok(store)
     }
 
     /// Path to the platform metadata JSON (e.g. `db.json`).
@@ -1004,7 +1144,15 @@ impl PlatformStore {
     }
 
     pub fn list_runs(&self) -> Vec<DetectionRunRecord> {
-        self.db.read().runs.clone()
+        let mut v = self.db.read().runs.clone();
+        v.sort_by(|a, b| {
+            let by_time = b.created_at.cmp(&a.created_at);
+            if by_time != std::cmp::Ordering::Equal {
+                return by_time;
+            }
+            b.id.cmp(&a.id)
+        });
+        v
     }
 
     pub fn get_anomark_settings(&self) -> AnoMarkSettings {
@@ -1337,6 +1485,153 @@ impl PlatformStore {
         Ok(out)
     }
 
+    /// Load and filter Sigma rules for [`Self::check_sigma_zero`] (shared with stable-rule listing).
+    fn load_sigma_rules_for_check_request(
+        &self,
+        req: &SigmaZeroCheckRequest,
+        st: &SigmaZeroSettings,
+    ) -> Result<(Vec<SigmaRule>, String, String, usize), Box<dyn Error>> {
+        let has_enabled_inline = st
+            .rules_inline
+            .iter()
+            .any(|e| e.enabled && !e.yaml.trim().is_empty());
+
+        let rules_dir_override: String = req
+            .rules_dir
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| st.rules_dir.trim().to_string());
+
+        let apply_inline_rule_ids = |mut base: Vec<SigmaRuleInline>| -> Result<Vec<SigmaRuleInline>, Box<dyn Error>> {
+            if !req.inline_rule_ids.is_empty() {
+                let allow: HashSet<String> = req
+                    .inline_rule_ids
+                    .iter()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                base.retain(|e| allow.contains(&e.id));
+                if base.is_empty() {
+                    tracing::warn!(
+                        target: "ironsift::sigma",
+                        requested = ?req.inline_rule_ids,
+                        "Sigma check failed: inline_rule_ids matched no stored rules"
+                    );
+                    return Err(
+                        "no rules match inline_rule_ids (check which rules are selected for this run; bundled demo ids include ironsift-demo-recon-keywords and ironsift-suspicious-file-paths)"
+                            .into(),
+                    );
+                }
+            }
+            Ok(base)
+        };
+
+        // If the UI shows the demo but the user never saved, `rules_inline` in db.json is still
+        // empty — use the same embedded YAML as GET /api/sigma-zero/rule-templates.
+        let (all_rules, rules_dir_out, rules_source) = if has_enabled_inline {
+            let inline_for_parse = apply_inline_rule_ids(st.rules_inline.clone())?;
+            let parsed = Self::parse_stored_sigma_rules(&inline_for_parse).map_err(|e| {
+                tracing::warn!(
+                    target: "ironsift::sigma",
+                    error = %e,
+                    "Sigma check failed: parse stored Sigma rules (YAML)"
+                );
+                e
+            })?;
+            (parsed, String::new(), "database".to_string())
+        } else if !rules_dir_override.is_empty() {
+            let rpath = Path::new(&rules_dir_override);
+            if !rpath.is_dir() {
+                tracing::warn!(
+                    target: "ironsift::sigma",
+                    rules_dir = %rules_dir_override,
+                    "Sigma check failed: rules_dir is not a directory"
+                );
+                return Err(format!("Sigma rules_dir is not a directory: {}", rules_dir_override).into());
+            }
+            let all_rules = load_rules_from_directory(rpath).map_err(|e: anyhow::Error| -> Box<dyn Error> {
+                tracing::warn!(
+                    target: "ironsift::sigma",
+                    rules_dir = %rules_dir_override,
+                    error = %e,
+                    "Sigma check failed: load_rules_from_directory"
+                );
+                e.to_string().into()
+            })?;
+            (all_rules, rules_dir_override, "directory".to_string())
+        } else if st.rules_inline.is_empty() {
+            let inline_for_parse =
+                apply_inline_rule_ids(Self::default_sigma_rule_templates())?;
+            let parsed = Self::parse_stored_sigma_rules(&inline_for_parse).map_err(|e| {
+                tracing::warn!(
+                    target: "ironsift::sigma",
+                    error = %e,
+                    "Sigma check failed: parse embedded-default Sigma rules"
+                );
+                e
+            })?;
+            (parsed, String::new(), "embedded-defaults".to_string())
+        } else {
+            tracing::warn!(
+                target: "ironsift::sigma",
+                stored_inline_entries = st.rules_inline.len(),
+                "Sigma check failed: stored rules present but none enabled with YAML — cannot fall back"
+            );
+            return Err(
+                "no enabled Sigma rules: turn on \"Use in checks\" for at least one stored rule, set rules_dir to a directory of .yml files, or clear stored rules to use the bundled demo"
+                    .into(),
+            );
+        };
+
+        let rules_before_filters = all_rules.len();
+        let mut filtered = filter_rules(
+            all_rules,
+            &req.filter_tags,
+            &req.filter_levels,
+            &req.filter_rule_ids,
+        );
+        if req.stable_rules_only {
+            filtered.retain(|r| {
+                r.status
+                    .as_deref()
+                    .map(|s| s.eq_ignore_ascii_case("stable"))
+                    .unwrap_or(false)
+            });
+        }
+        let count_loaded = filtered.len();
+
+        tracing::info!(
+            target: "ironsift::sigma",
+            rules_source = %rules_source,
+            rules_dir = %rules_dir_out,
+            rules_before_filters,
+            rules_after_filters = count_loaded,
+            stable_rules_only = req.stable_rules_only,
+            "Sigma check: rules loaded and filtered"
+        );
+
+        Ok((filtered, rules_dir_out, rules_source, rules_before_filters))
+    }
+
+    /// Enabled Sigma rules with `status: stable` (for run UI). Empty when none are configured.
+    pub fn list_sigma_stable_rules(&self) -> Result<Vec<SigmaStableRuleRef>, Box<dyn Error>> {
+        let st = self.get_sigma_zero_settings();
+        let req = SigmaZeroCheckRequest {
+            stable_rules_only: true,
+            ..Default::default()
+        };
+        let (filtered, _, _, _) = self.load_sigma_rules_for_check_request(&req, &st)?;
+        Ok(filtered
+            .into_iter()
+            .map(|r| SigmaStableRuleRef {
+                id: r.id.unwrap_or_default(),
+                title: r.title,
+            })
+            .collect())
+    }
+
     /// Run [sigmazero](https://github.com/ping2A/sigmazero) on a log file or exported process datasets.
     pub fn check_sigma_zero(
         &self,
@@ -1357,6 +1652,7 @@ impl PlatformStore {
             filter_tags = req.filter_tags.len(),
             filter_levels = req.filter_levels.len(),
             filter_rule_ids = req.filter_rule_ids.len(),
+            stable_rules_only = req.stable_rules_only,
             has_enabled_inline_rules = has_enabled_inline,
             stored_rules_inline_count = st.rules_inline.len(),
             rules_dir_config_nonempty = !st.rules_dir.trim().is_empty(),
@@ -1540,102 +1836,16 @@ impl PlatformStore {
             .unwrap_or_default();
         let workers: Option<usize> = req.workers.or(st.workers);
 
-        let rules_dir_override: String = req
-            .rules_dir
-            .as_deref()
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| st.rules_dir.trim().to_string());
-
-        let apply_inline_rule_ids = |mut base: Vec<SigmaRuleInline>| -> Result<Vec<SigmaRuleInline>, Box<dyn Error>> {
-            if !req.inline_rule_ids.is_empty() {
-                let allow: HashSet<String> = req
-                    .inline_rule_ids
-                    .iter()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                base.retain(|e| allow.contains(&e.id));
-                if base.is_empty() {
-                    tracing::warn!(
-                        target: "ironsift::sigma",
-                        requested = ?req.inline_rule_ids,
-                        "Sigma check failed: inline_rule_ids matched no stored rules"
-                    );
-                    return Err(
-                        "no rules match inline_rule_ids (check which rules are selected for this run; bundled demo ids include ironsift-demo-recon-keywords and ironsift-suspicious-file-paths)"
-                            .into(),
-                    );
+        let (filtered, rules_dir_out, rules_source, rules_before_filters) =
+            match self.load_sigma_rules_for_check_request(&req, &st) {
+                Ok(x) => x,
+                Err(e) => {
+                    if cleanup_log {
+                        let _ = fs::remove_file(&log_path);
+                    }
+                    return Err(e);
                 }
-            }
-            Ok(base)
-        };
-
-        // If the UI shows the demo but the user never saved, `rules_inline` in db.json is still
-        // empty — use the same embedded YAML as GET /api/sigma-zero/rule-templates.
-        let (all_rules, rules_dir_out, rules_source) = if has_enabled_inline {
-            let inline_for_parse = apply_inline_rule_ids(st.rules_inline.clone())?;
-            let parsed = Self::parse_stored_sigma_rules(&inline_for_parse).map_err(|e| {
-                tracing::warn!(
-                    target: "ironsift::sigma",
-                    error = %e,
-                    "Sigma check failed: parse stored Sigma rules (YAML)"
-                );
-                e
-            })?;
-            (parsed, String::new(), "database".to_string())
-        } else if !rules_dir_override.is_empty() {
-            let rpath = Path::new(&rules_dir_override);
-            if !rpath.is_dir() {
-                tracing::warn!(
-                    target: "ironsift::sigma",
-                    rules_dir = %rules_dir_override,
-                    "Sigma check failed: rules_dir is not a directory"
-                );
-                return Err(format!("Sigma rules_dir is not a directory: {}", rules_dir_override).into());
-            }
-            let all_rules = load_rules_from_directory(rpath).map_err(|e: anyhow::Error| -> Box<dyn Error> {
-                tracing::warn!(
-                    target: "ironsift::sigma",
-                    rules_dir = %rules_dir_override,
-                    error = %e,
-                    "Sigma check failed: load_rules_from_directory"
-                );
-                e.to_string().into()
-            })?;
-            (all_rules, rules_dir_override, "directory".to_string())
-        } else if st.rules_inline.is_empty() {
-            let inline_for_parse =
-                apply_inline_rule_ids(Self::default_sigma_rule_templates())?;
-            let parsed = Self::parse_stored_sigma_rules(&inline_for_parse).map_err(|e| {
-                tracing::warn!(
-                    target: "ironsift::sigma",
-                    error = %e,
-                    "Sigma check failed: parse embedded-default Sigma rules"
-                );
-                e
-            })?;
-            (parsed, String::new(), "embedded-defaults".to_string())
-        } else {
-            tracing::warn!(
-                target: "ironsift::sigma",
-                stored_inline_entries = st.rules_inline.len(),
-                "Sigma check failed: stored rules present but none enabled with YAML — cannot fall back"
-            );
-            return Err(
-                "no enabled Sigma rules: turn on \"Use in checks\" for at least one stored rule, set rules_dir to a directory of .yml files, or clear stored rules to use the bundled demo"
-                    .into(),
-            );
-        };
-
-        let rules_before_filters = all_rules.len();
-        let filtered = filter_rules(
-            all_rules,
-            &req.filter_tags,
-            &req.filter_levels,
-            &req.filter_rule_ids,
-        );
+            };
         let count_loaded = filtered.len();
 
         tracing::info!(
@@ -1646,7 +1856,7 @@ impl PlatformStore {
             rules_after_filters = count_loaded,
             field_map_nonempty = !field_map.is_empty(),
             workers = ?workers,
-            "Sigma check: rules loaded and filtered"
+            "Sigma check: rules ready for engine"
         );
 
         if count_loaded == 0 {
@@ -1655,15 +1865,18 @@ impl PlatformStore {
                 filter_tags = ?req.filter_tags,
                 filter_levels = ?req.filter_levels,
                 filter_rule_ids = ?req.filter_rule_ids,
-                "Sigma check failed: zero rules after tag/level/id filters"
+                stable_rules_only = req.stable_rules_only,
+                "Sigma check failed: zero rules after filters"
             );
             if cleanup_log {
                 let _ = fs::remove_file(&log_path);
             }
-            return Err(
+            let msg = if req.stable_rules_only {
+                "no Sigma rules with status: stable after filters (add stable rules in Sigma settings on this server, or relax filters)"
+            } else {
                 "no Sigma rules to evaluate after tag/level/id filters (check stored rules, rules_dir, or filters)"
-                    .into(),
-            );
+            };
+            return Err(msg.into());
         }
 
         let rules_compiled = count_loaded;
@@ -2487,12 +2700,21 @@ impl PlatformStore {
         self.db.read().runs.iter().find(|r| r.id == id).cloned()
     }
 
-    /// Findings for `GET .../detections`: ensures `dataset_tags` is set (resolves when empty for legacy runs).
+    /// Findings for `GET .../detections`: syncs triage from history, ensures `dataset_tags`, and returns
+    /// **effective** score/severity from raw detector scores plus per-reason triage.
     pub fn findings_for_run_detections_api(&self, run_id: &str) -> Option<Vec<DetectionFinding>> {
+        if let Err(e) = self.sync_run_triage_from_history(run_id) {
+            log::warn!(
+                "sync_run_triage_from_history failed for run {}: {}; serving findings without merge",
+                run_id,
+                e
+            );
+        }
         let r = self.get_run(run_id)?;
         let db = self.db.read();
         let datasets = db.datasets.as_slice();
-        let out: Vec<DetectionFinding> = r
+        let triage = &r.user_triage;
+        let mut out: Vec<DetectionFinding> = r
             .findings
             .iter()
             .map(|f| {
@@ -2505,10 +2727,229 @@ impl PlatformStore {
                         datasets,
                     );
                 }
+                let (eff_score, eff_sev) = effective_score_and_severity(f, triage);
+                ff.score = eff_score;
+                ff.severity = eff_sev;
                 ff
             })
             .collect();
+        sort_findings_by_review_priority(&mut out);
         Some(out)
+    }
+
+    /// Past analyst per-reason verdicts for this run’s detection lines: **`entries`** are active
+    /// precedents (fleet memory may apply); **`suppressed`** are blocked by
+    /// [`DetectionRunRecord::triage_precedent_ignore`] but still shown for management.
+    pub fn triage_precedent_for_run(&self, run_id: &str) -> Option<TriagePrecedentBundle> {
+        let _ = self.sync_run_triage_from_history(run_id);
+        let r = self.get_run(run_id)?;
+        let keys = reason_keys_in_findings(&r.findings);
+        let ignore = precedent_ignore_set(&r);
+        let fleet_drops = self.fleet_precedent_drop_set_snapshot();
+        let (runs_sorted, persistent) = {
+            let db = self.db.read();
+            let mut v = db.runs.clone();
+            v.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            (v, db.fleet_triage_precedent_entries.clone())
+        };
+        let prov = build_reason_verdict_provenance_combined(
+            &runs_sorted,
+            Some(run_id),
+            &fleet_drops,
+            &persistent,
+        );
+        let mut entries = Vec::new();
+        let mut suppressed = Vec::new();
+        for (k, v) in prov {
+            if !keys.contains(&k) {
+                continue;
+            }
+            if ignore.contains(&k) {
+                suppressed.push(v);
+            } else {
+                entries.push(v);
+            }
+        }
+        let sort_fn = |a: &HistoricalReasonVerdict, b: &HistoricalReasonVerdict| {
+            a.detector
+                .cmp(&b.detector)
+                .then_with(|| a.reason.cmp(&b.reason))
+        };
+        entries.sort_by(sort_fn);
+        suppressed.sort_by(sort_fn);
+        Some(TriagePrecedentBundle { entries, suppressed })
+    }
+
+    /// Latest saved per-reason verdict for each `(detector, reason)` in **persisted fleet memory**
+    /// (survives deleting all runs). Keys in [`PlatformDb::fleet_triage_precedent_drops`] are omitted.
+    /// Per-run “suppress precedent” still lives on each [`DetectionRunRecord`].
+    pub fn triage_precedent_fleet_global(&self) -> Vec<HistoricalReasonVerdict> {
+        let fleet_drops = self.fleet_precedent_drop_set_snapshot();
+        let persistent = self.db.read().fleet_triage_precedent_entries.clone();
+        let mut entries: Vec<_> = persistent
+            .iter()
+            .filter(|e| !fleet_drops.contains(&(e.detector.clone(), e.reason.clone())))
+            .filter(|e| !reason_excluded_from_per_reason_triage(&e.reason))
+            .filter(|e| !matches!(e.verdict, TriageVerdict::Unset))
+            .map(fleet_precedent_entry_to_historical)
+            .collect();
+        entries.sort_by(|a, b| {
+            a.detector
+                .cmp(&b.detector)
+                .then_with(|| a.reason.cmp(&b.reason))
+        });
+        entries
+    }
+
+    fn fleet_precedent_drop_set_snapshot(&self) -> HashSet<(String, String)> {
+        self.db
+            .read()
+            .fleet_triage_precedent_drops
+            .iter()
+            .map(|k| (k.detector.clone(), k.reason.clone()))
+            .collect()
+    }
+
+    /// Keys removed from fleet triage memory (see [`PlatformDb::fleet_triage_precedent_drops`]).
+    pub fn fleet_triage_precedent_drops(&self) -> Vec<ReasonPrecedentKey> {
+        self.db.read().fleet_triage_precedent_drops.clone()
+    }
+
+    /// Exclude this `(detector, reason)` from fleet precedent listing and from merge-into-new-runs.
+    pub fn add_fleet_triage_precedent_drop(&self, key: ReasonPrecedentKey) -> Result<(), Box<dyn Error>> {
+        let det = key.detector.trim();
+        if det.is_empty() {
+            return Err("detector must not be empty".into());
+        }
+        let key = ReasonPrecedentKey {
+            detector: det.to_string(),
+            reason: key.reason,
+        };
+        let mut db = self.db.write();
+        let dup = db
+            .fleet_triage_precedent_drops
+            .iter()
+            .any(|k| k.detector == key.detector && k.reason == key.reason);
+        if !dup {
+            db.fleet_triage_precedent_drops.push(key);
+        }
+        drop(db);
+        self.save()?;
+        Ok(())
+    }
+
+    /// Put a pair back into fleet triage memory (undo [`Self::add_fleet_triage_precedent_drop`]).
+    pub fn remove_fleet_triage_precedent_drop(
+        &self,
+        key: &ReasonPrecedentKey,
+    ) -> Result<bool, Box<dyn Error>> {
+        let mut db = self.db.write();
+        let n = db.fleet_triage_precedent_drops.len();
+        db.fleet_triage_precedent_drops.retain(|k| {
+            !(k.detector == key.detector && k.reason == key.reason)
+        });
+        let changed = db.fleet_triage_precedent_drops.len() != n;
+        drop(db);
+        if changed {
+            self.save()?;
+        }
+        Ok(changed)
+    }
+
+    /// Permanently remove this `(detector, reason)` from persisted fleet triage memory
+    /// ([`PlatformDb::fleet_triage_precedent_entries`]) and from [`PlatformDb::fleet_triage_precedent_drops`]
+    /// if present. The pair can reappear later if triage on a saved run upserts it again.
+    pub fn delete_fleet_triage_precedent_entry(
+        &self,
+        key: ReasonPrecedentKey,
+    ) -> Result<bool, Box<dyn Error>> {
+        let det = key.detector.trim();
+        if det.is_empty() {
+            return Err("detector must not be empty".into());
+        }
+        let reason = key.reason;
+        let mut db = self.db.write();
+        let n_entries = db.fleet_triage_precedent_entries.len();
+        db.fleet_triage_precedent_entries.retain(|e| {
+            !(e.detector.trim() == det && e.reason == reason)
+        });
+        let removed_entry = db.fleet_triage_precedent_entries.len() != n_entries;
+        let n_drops = db.fleet_triage_precedent_drops.len();
+        db.fleet_triage_precedent_drops.retain(|k| {
+            !(k.detector.trim() == det && k.reason == reason)
+        });
+        let removed_drop = db.fleet_triage_precedent_drops.len() != n_drops;
+        let changed = removed_entry || removed_drop;
+        drop(db);
+        if changed {
+            self.save()?;
+        }
+        Ok(changed)
+    }
+
+    /// Stop using fleet precedent for one `(detector, reason)` on this run: add to ignore list and
+    /// remove matching per-reason triage rows (so effective severity recomputes).
+    pub fn add_triage_precedent_ignore(
+        &self,
+        run_id: &str,
+        key: ReasonPrecedentKey,
+    ) -> Result<(), Box<dyn Error>> {
+        let keys_in_run = {
+            let db = self.db.read();
+            let rec = db
+                .runs
+                .iter()
+                .find(|r| r.id == run_id)
+                .ok_or_else(|| format!("run not found: {}", run_id))?;
+            reason_keys_in_findings(&rec.findings)
+        };
+        let pair = (key.detector.clone(), key.reason.clone());
+        if !keys_in_run.contains(&pair) {
+            return Err("reason key does not appear in this run's findings".into());
+        }
+        let mut db = self.db.write();
+        let rec = db
+            .runs
+            .iter_mut()
+            .find(|r| r.id == run_id)
+            .ok_or_else(|| format!("run not found: {}", run_id))?;
+        if !rec
+            .triage_precedent_ignore
+            .iter()
+            .any(|k| k.detector == key.detector && k.reason == key.reason)
+        {
+            rec.triage_precedent_ignore.push(key.clone());
+        }
+        strip_reason_decisions_for_key(&mut rec.user_triage, &key.detector, &key.reason);
+        drop(db);
+        self.save()?;
+        Ok(())
+    }
+
+    /// Allow fleet precedent again for this `(detector, reason)` on this run; then re-sync merge.
+    pub fn remove_triage_precedent_ignore(
+        &self,
+        run_id: &str,
+        key: &ReasonPrecedentKey,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut db = self.db.write();
+        let rec = db
+            .runs
+            .iter_mut()
+            .find(|r| r.id == run_id)
+            .ok_or_else(|| format!("run not found: {}", run_id))?;
+        let n = rec.triage_precedent_ignore.len();
+        rec.triage_precedent_ignore.retain(|k| {
+            !(k.detector == key.detector && k.reason == key.reason)
+        });
+        if rec.triage_precedent_ignore.len() == n {
+            drop(db);
+            return Ok(());
+        }
+        drop(db);
+        self.save()?;
+        let _ = self.sync_run_triage_from_history(run_id);
+        Ok(())
     }
 
     /// Remove a single saved detection run from `db.json` (ingested datasets are unchanged).
@@ -2555,15 +2996,93 @@ impl PlatformStore {
             }
         }
         let mut db = self.db.write();
-        let rec = db
+        {
+            let rec = db
+                .runs
+                .iter_mut()
+                .find(|r| r.id == run_id)
+                .ok_or_else(|| format!("run not found: {}", run_id))?;
+            let old_triage = rec.user_triage.clone();
+            let mut triage = triage;
+            stamp_reason_review_times_on_triage_put(&old_triage, &mut triage);
+            rec.user_triage = triage;
+            let _ = normalize_triage_groups_and_auto_final_for_run(rec);
+            align_reviewed_at_for_normalized_reason_groups(rec);
+        }
+        let lifted = {
+            let rec = db
+                .runs
+                .iter()
+                .find(|r| r.id == run_id)
+                .ok_or_else(|| format!("run not found: {}", run_id))?;
+            non_unset_triage_reason_keys(&rec.user_triage)
+        };
+        if !lifted.is_empty() {
+            db.fleet_triage_precedent_drops.retain(|k| {
+                !lifted.contains(&(k.detector.clone(), k.reason.clone()))
+            });
+        }
+        let rec_snapshot = db
             .runs
-            .iter_mut()
+            .iter()
             .find(|r| r.id == run_id)
-            .ok_or_else(|| format!("run not found: {}", run_id))?;
-        rec.user_triage = triage;
+            .ok_or_else(|| format!("run not found: {}", run_id))?
+            .clone();
+        upsert_fleet_precedents_from_run(&mut db.fleet_triage_precedent_entries, &rec_snapshot);
         drop(db);
         self.save()?;
         Ok(())
+    }
+
+    /// Copy per-reason triage from older runs when the same `(detector, reason)` was already judged
+    /// (latest verdict wins). Persists only when something changes. Does not alter raw finding scores.
+    pub fn sync_run_triage_from_history(&self, run_id: &str) -> Result<bool, Box<dyn Error>> {
+        let fleet_drops = self.fleet_precedent_drop_set_snapshot();
+        let (runs_sorted, persistent) = {
+            let db = self.db.read();
+            let mut v = db.runs.clone();
+            v.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            (v, db.fleet_triage_precedent_entries.clone())
+        };
+        let history = build_reason_verdict_history_from_runs(
+            &runs_sorted,
+            run_id,
+            &fleet_drops,
+            &persistent,
+        );
+        let mut db = self.db.write();
+        let (merge_changed, norm_changed) = {
+            let rec = db
+                .runs
+                .iter_mut()
+                .find(|r| r.id == run_id)
+                .ok_or_else(|| format!("run not found: {}", run_id))?;
+            let ignore = precedent_ignore_set(rec);
+            let (merged, merge_changed) = merge_history_into_user_triage(
+                &rec.findings,
+                &rec.user_triage,
+                &history,
+                &ignore,
+            );
+            if merge_changed {
+                rec.user_triage = merged;
+            }
+            let norm_changed = normalize_triage_groups_and_auto_final_for_run(rec);
+            (merge_changed, norm_changed)
+        };
+        if !merge_changed && !norm_changed {
+            return Ok(false);
+        }
+        let rec_snapshot = db
+            .runs
+            .iter()
+            .find(|r| r.id == run_id)
+            .ok_or_else(|| format!("run not found: {}", run_id))?
+            .clone();
+        upsert_fleet_precedents_from_run(&mut db.fleet_triage_precedent_entries, &rec_snapshot);
+        drop(db);
+        self.save()?;
+        Ok(true)
     }
 
     /// Remove all detection runs (same storage as `delete_all_datasets` — only the run list in `db.json`).
@@ -2987,6 +3506,87 @@ impl PlatformStore {
         }
     }
 
+    #[inline]
+    fn sigma_match_level_score(level: Option<&str>) -> f64 {
+        let lv = level.map(|s| s.to_ascii_lowercase());
+        match lv.as_deref() {
+            Some("critical") => 1.0,
+            Some("high") => 0.75,
+            Some("medium") => 0.5,
+            Some("low") | Some("informational") => 0.25,
+            _ => 0.35,
+        }
+    }
+
+    /// Map a Sigma [`RuleMatch`] JSON blob to the same `machine_id` key used in [`Self::run_detection`]
+    /// (`dataset_id/host` when multiple process or multiple file datasets are merged).
+    fn sigma_match_namespaced_machine_id(
+        m: &serde_json::Value,
+        multi_process: bool,
+        multi_file: bool,
+    ) -> Option<String> {
+        let log = m.get("matched_log")?;
+        let raw = log
+            .get("machine_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        let event_type = log
+            .get("event_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("process_creation");
+        let multi_ns = if event_type == "file_information" {
+            multi_file
+        } else {
+            multi_process
+        };
+        let ds = log
+            .get("ironsift_dataset_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        Some(match ds {
+            Some(did) => namespace_run_machine_id(did, raw, multi_ns),
+            None => raw.to_string(),
+        })
+    }
+
+    fn apply_sigma_matches_to_findings(
+        matches: &[serde_json::Value],
+        finding_by_host: &mut HashMap<String, DetectionFinding>,
+        multi_process: bool,
+        multi_file: bool,
+    ) {
+        for m in matches {
+            let Some(mid) = Self::sigma_match_namespaced_machine_id(m, multi_process, multi_file) else {
+                continue;
+            };
+            let rule_id = m
+                .get("rule_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(no id)");
+            let title = m.get("rule_title").and_then(|v| v.as_str()).unwrap_or("");
+            let level = m.get("level").and_then(|v| v.as_str()).unwrap_or("-");
+            let reason = format!("Sigma match: rule={} title={} level={}", rule_id, title, level);
+            let sev_score =
+                Self::sigma_match_level_score(m.get("level").and_then(|v| v.as_str()));
+            let e = finding_by_host.entry(mid.clone()).or_insert_with(|| DetectionFinding {
+                machine_id: mid.clone(),
+                severity: "LOW".to_string(),
+                score: 0.0,
+                reasons: Vec::new(),
+                detectors: Vec::new(),
+                dataset_tags: Vec::new(),
+                reasons_by_detector: Vec::new(),
+                sigma_matches: Vec::new(),
+            });
+            e.score = e.score.max(sev_score);
+            Self::push_detector_reason(e, "sigma-zero", reason);
+            e.detectors.push("sigma-zero".to_string());
+            e.sigma_matches.push(m.clone());
+        }
+    }
+
     /// Bulk version of [`Self::push_detector_reason`] for cases that already build a `Vec`
     /// (e.g. `analyze_*_fleet` returning `anomalous_features`).
     fn extend_detector_reasons<I: IntoIterator<Item = String>>(
@@ -3064,6 +3664,7 @@ impl PlatformStore {
                             detectors: Vec::new(),
                             dataset_tags: Vec::new(),
                             reasons_by_detector: Vec::new(),
+                            sigma_matches: Vec::new(),
                         });
                     e.score = e.score.max(sev_score);
                     Self::extend_detector_reasons(e, "ironsift-process", an.anomalous_features);
@@ -3162,6 +3763,7 @@ impl PlatformStore {
                             detectors: Vec::new(),
                             dataset_tags: Vec::new(),
                             reasons_by_detector: Vec::new(),
+                            sigma_matches: Vec::new(),
                         });
                         e.score = e
                             .score
@@ -3243,11 +3845,34 @@ impl PlatformStore {
                         detectors: Vec::new(),
                         dataset_tags: Vec::new(),
                         reasons_by_detector: Vec::new(),
+                        sigma_matches: Vec::new(),
                     });
                 e.score = e.score.max(sev_score);
                 Self::extend_detector_reasons(e, "ironsift-file", an.anomalous_features);
                 e.detectors.push("ironsift-file".to_string());
             }
+        }
+
+        let sigma_multi_process = process_sets.len() > 1;
+        let sigma_multi_file = file_sets.len() > 1;
+        let mut sigma_stable_stats: Option<DetectionRunSigmaStats> = None;
+        if req.enable_sigma_stable {
+            let sigma_dataset_ids: Vec<String> = datasets.iter().map(|d| d.id.clone()).collect();
+            let sigma_req = SigmaZeroCheckRequest {
+                dataset_ids: sigma_dataset_ids,
+                stable_rules_only: true,
+                ..Default::default()
+            };
+            let sigma_res = self
+                .check_sigma_zero(sigma_req)
+                .map_err(|e| format!("Sigma (stable rules only): {}", e))?;
+            sigma_stable_stats = Some(DetectionRunSigmaStats::from_sigma_check(&sigma_res));
+            Self::apply_sigma_matches_to_findings(
+                &sigma_res.matches,
+                &mut finding_by_host,
+                sigma_multi_process,
+                sigma_multi_file,
+            );
         }
 
         let mut findings: Vec<_> = finding_by_host
@@ -3270,8 +3895,9 @@ impl PlatformStore {
                     match d {
                         "ironsift-process" => 0,
                         "anomark-rs" => 1,
-                        "ironsift-file" => 2,
-                        _ => 3,
+                        "sigma-zero" => 2,
+                        "ironsift-file" => 3,
+                        _ => 4,
                     }
                 }
                 f.reasons_by_detector.sort_by(|a, b| {
@@ -3302,8 +3928,9 @@ impl PlatformStore {
             detection_config_id: dc_id.clone(),
             detection_focus: req.detection_focus,
             detector_mode: req.detector_mode,
+            enable_sigma_stable: req.enable_sigma_stable,
         };
-        let rec = DetectionRunRecord {
+        let mut rec = DetectionRunRecord {
             id: Uuid::new_v4().to_string(),
             created_at: Utc::now().to_rfc3339(),
             dataset_ids: selected_ids,
@@ -3320,8 +3947,34 @@ impl PlatformStore {
             anomark_suspect_percent,
             request,
             user_triage: RunUserTriage::default(),
+            triage_precedent_ignore: vec![],
+            sigma_stable_stats,
         };
-        self.db.write().runs.push(rec.clone());
+        let fleet_drops = self.fleet_precedent_drop_set_snapshot();
+        let (runs_sorted, persistent) = {
+            let db = self.db.read();
+            let mut v = db.runs.clone();
+            v.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            (v, db.fleet_triage_precedent_entries.clone())
+        };
+        let history = build_reason_verdict_history_from_runs(
+            &runs_sorted,
+            &rec.id,
+            &fleet_drops,
+            &persistent,
+        );
+        let ignore = precedent_ignore_set(&rec);
+        let (merged, _) = merge_history_into_user_triage(
+            &rec.findings,
+            &rec.user_triage,
+            &history,
+            &ignore,
+        );
+        rec.user_triage = merged;
+        let mut db = self.db.write();
+        db.runs.push(rec.clone());
+        upsert_fleet_precedents_from_run(&mut db.fleet_triage_precedent_entries, &rec);
+        drop(db);
         self.save()?;
         Ok(rec)
     }
@@ -3339,6 +3992,13 @@ impl PlatformStore {
         min_score: Option<f64>,
         severity: Option<&str>,
     ) -> Option<Vec<HoneycombCell>> {
+        if let Err(e) = self.sync_run_triage_from_history(run_id) {
+            log::warn!(
+                "sync_run_triage_from_history failed before honeycomb (run {}): {}",
+                run_id,
+                e
+            );
+        }
         let r = self.get_run(run_id)?;
         let from_db: Vec<String> = EventDb::new(&self.sql_path)
             .and_then(|db| db.distinct_machine_ids_for_datasets(&r.dataset_ids))
@@ -3372,11 +4032,13 @@ impl PlatformStore {
                     ),
                 };
                 if let Some(f) = by_machine.get(&name) {
-                    let matches_filter = finding_passes(f, min_score, severity);
+                    let (eff_score, eff_sev) = effective_score_and_severity(f, &r.user_triage);
+                    let matches_filter =
+                        finding_passes_scores(eff_score, &eff_sev, min_score, severity);
                     HoneycombCell {
                         name,
-                        value: f.score,
-                        severity: f.severity.clone(),
+                        value: eff_score,
+                        severity: eff_sev,
                         infected: true,
                         matches_filter,
                         reasons: f.reasons.clone(),
@@ -3443,6 +4105,749 @@ fn severity_from_score(score: f64) -> &'static str {
     } else {
         "LOW"
     }
+}
+
+/// Same prefix rules as the findings UI (`classifyLegacyReason`) when `reasons_by_detector` is empty.
+fn classify_legacy_reason_line(reason: &str) -> &'static str {
+    let s = reason.trim_start();
+    if s.starts_with("Sigma match:") {
+        return "sigma-zero";
+    }
+    if s.starts_with("AnoMark suspect:")
+        || s.starts_with("AnoMark suspicious command ratio")
+    {
+        return "anomark-rs";
+    }
+    if s.starts_with("RISK DETECTED:")
+        || s.starts_with("Process row:")
+        || s.starts_with("Rare process:")
+    {
+        return "ironsift-process";
+    }
+    if s.starts_with("Rare file access:")
+        || s.starts_with("MTIME ANOMALY")
+        || s.starts_with("METADATA ANOMALY")
+        || s.starts_with("FLEET OUTLIER")
+        || s.starts_with("(+")
+        || s.contains("more rare files matched")
+    {
+        return "ironsift-file";
+    }
+    "other"
+}
+
+/// `(detector, reason)` rows in UI order for triage and history lookup.
+fn finding_detector_reason_pairs(f: &DetectionFinding) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    const GROUP_ORDER: &[&str] = &["ironsift-process", "anomark-rs", "sigma-zero", "ironsift-file", "other"];
+    if !f.reasons_by_detector.is_empty() {
+        let mut by_det: HashMap<String, Vec<String>> = HashMap::new();
+        for b in &f.reasons_by_detector {
+            if b.reasons.is_empty() {
+                continue;
+            }
+            by_det
+                .entry(b.detector.clone())
+                .or_default()
+                .extend(b.reasons.iter().cloned());
+        }
+        for det in GROUP_ORDER {
+            if let Some(list) = by_det.remove(*det) {
+                for reason in list {
+                    out.push(((*det).to_string(), reason));
+                }
+            }
+        }
+        let mut rest: Vec<_> = by_det.into_iter().collect();
+        rest.sort_by(|a, b| a.0.cmp(&b.0));
+        for (det, list) in rest {
+            for reason in list {
+                out.push((det.clone(), reason));
+            }
+        }
+    } else {
+        for reason in &f.reasons {
+            let det = classify_legacy_reason_line(reason).to_string();
+            out.push((det, reason.clone()));
+        }
+    }
+    out
+}
+
+/// Primary process `name=` token for grouping related `ironsift-process` lines (RISK, Rare process,
+/// Process row) into one triage decision in the UI and for effective severity.
+fn extract_ironsift_process_primary_name(reason: &str) -> Option<String> {
+    let s = reason.trim_start();
+    if s.starts_with("RISK DETECTED:") {
+        let after = s["RISK DETECTED:".len()..].trim_start();
+        for tok in after.split_whitespace() {
+            if let Some(v) = tok.strip_prefix("name=") {
+                let v = v.trim_end_matches(',').trim();
+                if !v.is_empty() {
+                    return Some(v.to_ascii_lowercase());
+                }
+            }
+        }
+        return None;
+    }
+    if s.starts_with("Rare process:") {
+        let rest = s["Rare process:".len()..].trim();
+        let name = rest
+            .split(|c: char| c == ' ' || c == '(' || c == '\t')
+            .next()
+            .unwrap_or("")
+            .trim();
+        return if name.is_empty() {
+            None
+        } else {
+            Some(name.to_ascii_lowercase())
+        };
+    }
+    if s.starts_with("Process row:") {
+        for tok in s.split_whitespace() {
+            if let Some(v) = tok.strip_prefix("name=") {
+                let v = v.trim_end_matches(',').trim();
+                if !v.is_empty() {
+                    return Some(v.to_ascii_lowercase());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Stable key: same for all `ironsift-process` lines that describe the same primary process name.
+fn triage_group_key(detector: &str, reason: &str) -> String {
+    if detector == "ironsift-process" {
+        if let Some(n) = extract_ironsift_process_primary_name(reason) {
+            return format!("ironsift-process::g::{n}");
+        }
+    }
+    format!("{detector}::{reason}")
+}
+
+fn aggregate_verdicts_for_group(vers: &[TriageVerdict]) -> TriageVerdict {
+    if vers.is_empty() {
+        return TriageVerdict::Unset;
+    }
+    if vers
+        .iter()
+        .any(|v| matches!(v, TriageVerdict::Malicious))
+    {
+        return TriageVerdict::Malicious;
+    }
+    if vers.iter().any(|v| matches!(v, TriageVerdict::Unset)) {
+        return TriageVerdict::Unset;
+    }
+    TriageVerdict::FalsePositive
+}
+
+fn upsert_reason_verdict(m: &mut MachineTriageEntry, detector: &str, reason: &str, verdict: TriageVerdict) {
+    if let Some(rd) = m
+        .reason_decisions
+        .iter_mut()
+        .find(|e| e.detector == detector && e.reason == reason)
+    {
+        rd.verdict = verdict;
+        if matches!(verdict, TriageVerdict::Unset) {
+            rd.reviewed_at = None;
+        }
+    } else {
+        m.reason_decisions.push(ReasonTriageEntry {
+            detector: detector.to_string(),
+            reason: reason.to_string(),
+            verdict,
+            reviewed_at: None,
+        });
+    }
+}
+
+/// Unique actionable `(detector, triage_group_key)` pairs for a finding (Process row excluded).
+fn actionable_triage_group_slots(f: &DetectionFinding) -> Vec<(String, String)> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for (det, reason) in finding_detector_reason_pairs(f) {
+        if reason_excluded_from_per_reason_triage(&reason) {
+            continue;
+        }
+        let gk = triage_group_key(&det, &reason);
+        let slot = (det.clone(), gk.clone());
+        if seen.insert(slot.clone()) {
+            out.push(slot);
+        }
+    }
+    out
+}
+
+fn history_verdict_for_line_or_process_group(
+    detector: &str,
+    reason: &str,
+    history: &HashMap<(String, String), TriageVerdict>,
+) -> Option<TriageVerdict> {
+    if let Some(v) = history.get(&(detector.to_string(), reason.to_string())) {
+        return Some(*v);
+    }
+    if detector != "ironsift-process" {
+        return None;
+    }
+    let gk = triage_group_key(detector, reason);
+    let mut collected = Vec::new();
+    for ((d, r), v) in history {
+        if d != detector {
+            continue;
+        }
+        if triage_group_key(d, r) == gk {
+            collected.push(*v);
+        }
+    }
+    if collected.is_empty() {
+        None
+    } else {
+        Some(aggregate_verdicts_for_group(&collected))
+    }
+}
+
+/// Unify per-line verdicts within each triage group, then set `final_verdict` when exactly one
+/// actionable group exists on the host.
+fn normalize_triage_groups_and_auto_final_for_run(rec: &mut DetectionRunRecord) -> bool {
+    let mut changed = false;
+    for f in &rec.findings {
+        let mid = f.machine_id.clone();
+        let mut buckets: HashMap<(String, String), Vec<String>> = HashMap::new();
+        for (det, reason) in finding_detector_reason_pairs(f) {
+            if reason_excluded_from_per_reason_triage(&reason) {
+                continue;
+            }
+            let gk = triage_group_key(&det, &reason);
+            buckets
+                .entry((det.clone(), gk))
+                .or_default()
+                .push(reason.clone());
+        }
+        for ((det, _gk), reasons) in buckets {
+            let vers: Vec<TriageVerdict> = reasons
+                .iter()
+                .map(|r| verdict_for_reason_on_machine(&rec.user_triage, &mid, &det, r))
+                .collect();
+            let agg = aggregate_verdicts_for_group(&vers);
+            for r in &reasons {
+                let cur = verdict_for_reason_on_machine(&rec.user_triage, &mid, &det, r);
+                if cur != agg {
+                    changed = true;
+                }
+            }
+            if let Some(m) = rec
+                .user_triage
+                .machines
+                .iter_mut()
+                .find(|x| x.machine_id == mid)
+            {
+                for r in &reasons {
+                    upsert_reason_verdict(m, &det, r, agg);
+                }
+            }
+        }
+    }
+    for f in &rec.findings {
+        let mid = f.machine_id.as_str();
+        let slots = actionable_triage_group_slots(f);
+        if slots.len() != 1 {
+            continue;
+        }
+        let (det, gk) = &slots[0];
+        let reasons: Vec<String> = finding_detector_reason_pairs(f)
+            .into_iter()
+            .filter(|(_, r)| !reason_excluded_from_per_reason_triage(r))
+            .filter(|(d, r)| d == det && triage_group_key(d, r) == *gk)
+            .map(|(_, r)| r)
+            .collect();
+        if reasons.is_empty() {
+            continue;
+        }
+        let vers: Vec<TriageVerdict> = reasons
+            .iter()
+            .map(|r| verdict_for_reason_on_machine(&rec.user_triage, mid, det, r))
+            .collect();
+        let agg = aggregate_verdicts_for_group(&vers);
+        if let Some(m) = rec
+            .user_triage
+            .machines
+            .iter_mut()
+            .find(|x| x.machine_id.as_str() == mid)
+        {
+            if m.final_verdict != agg {
+                m.final_verdict = agg;
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+fn fleet_precedent_entry_to_historical(e: &FleetTriagePrecedentEntry) -> HistoricalReasonVerdict {
+    HistoricalReasonVerdict {
+        detector: e.detector.clone(),
+        reason: e.reason.clone(),
+        verdict: e.verdict,
+        source_run_id: e.source_run_id.clone(),
+        source_run_created_at: e.source_run_created_at.clone(),
+        source_machine_id: e.source_machine_id.clone(),
+        source_reviewed_at: e.source_reviewed_at.clone(),
+    }
+}
+
+/// Overwrites existing keys: **newest runs first** in the slice should be passed so the first
+/// contributing run wins (same as legacy `or_insert` scan order).
+fn merge_run_precedents_into_provenance_map(
+    map: &mut HashMap<(String, String), HistoricalReasonVerdict>,
+    runs_newest_first: &[DetectionRunRecord],
+    exclude_run_id: Option<&str>,
+    fleet_drops: &HashSet<(String, String)>,
+) {
+    for run in runs_newest_first {
+        if exclude_run_id == Some(run.id.as_str()) {
+            continue;
+        }
+        for m in &run.user_triage.machines {
+            for e in &m.reason_decisions {
+                if matches!(e.verdict, TriageVerdict::Unset) {
+                    continue;
+                }
+                if reason_excluded_from_per_reason_triage(&e.reason) {
+                    continue;
+                }
+                let key = (e.detector.clone(), e.reason.clone());
+                if fleet_drops.contains(&key) {
+                    continue;
+                }
+                map.entry(key).or_insert_with(|| HistoricalReasonVerdict {
+                    detector: e.detector.clone(),
+                    reason: e.reason.clone(),
+                    verdict: e.verdict,
+                    source_run_id: run.id.clone(),
+                    source_run_created_at: run.created_at.clone(),
+                    source_machine_id: m.machine_id.clone(),
+                    source_reviewed_at: e.reviewed_at.clone(),
+                });
+            }
+        }
+    }
+}
+
+/// Latest non-unset verdict per `(detector, reason)` from **runs only** (newest contributing run wins).
+#[cfg(test)]
+fn build_reason_verdict_provenance_from_runs(
+    runs_newest_first: &[DetectionRunRecord],
+    exclude_run_id: Option<&str>,
+    fleet_drops: &HashSet<(String, String)>,
+) -> HashMap<(String, String), HistoricalReasonVerdict> {
+    let mut map = HashMap::new();
+    merge_run_precedents_into_provenance_map(&mut map, runs_newest_first, exclude_run_id, fleet_drops);
+    map
+}
+
+/// Persisted fleet memory plus other runs; **runs override** the store for the same `(detector, reason)`.
+fn build_reason_verdict_provenance_combined(
+    runs_newest_first: &[DetectionRunRecord],
+    exclude_run_id: Option<&str>,
+    fleet_drops: &HashSet<(String, String)>,
+    persistent: &[FleetTriagePrecedentEntry],
+) -> HashMap<(String, String), HistoricalReasonVerdict> {
+    let mut run_map = HashMap::new();
+    merge_run_precedents_into_provenance_map(
+        &mut run_map,
+        runs_newest_first,
+        exclude_run_id,
+        fleet_drops,
+    );
+    let mut out = HashMap::new();
+    for e in persistent {
+        if fleet_drops.contains(&(e.detector.clone(), e.reason.clone())) {
+            continue;
+        }
+        if reason_excluded_from_per_reason_triage(&e.reason) {
+            continue;
+        }
+        if matches!(e.verdict, TriageVerdict::Unset) {
+            continue;
+        }
+        out.insert(
+            (e.detector.clone(), e.reason.clone()),
+            fleet_precedent_entry_to_historical(e),
+        );
+    }
+    for (k, v) in run_map {
+        out.insert(k, v);
+    }
+    out
+}
+
+/// Verdict map for merging into a run: persisted fleet memory plus other runs (runs override store).
+fn build_reason_verdict_history_from_runs(
+    runs_newest_first: &[DetectionRunRecord],
+    exclude_run_id: &str,
+    fleet_drops: &HashSet<(String, String)>,
+    persistent: &[FleetTriagePrecedentEntry],
+) -> HashMap<(String, String), TriageVerdict> {
+    build_reason_verdict_provenance_combined(
+        runs_newest_first,
+        Some(exclude_run_id),
+        fleet_drops,
+        persistent,
+    )
+    .into_iter()
+    .map(|(k, v)| (k, v.verdict))
+    .collect()
+}
+
+fn upsert_fleet_precedents_from_run(entries: &mut Vec<FleetTriagePrecedentEntry>, run: &DetectionRunRecord) {
+    let now = Utc::now().to_rfc3339();
+    for m in &run.user_triage.machines {
+        for e in &m.reason_decisions {
+            if matches!(e.verdict, TriageVerdict::Unset) {
+                continue;
+            }
+            if reason_excluded_from_per_reason_triage(&e.reason) {
+                continue;
+            }
+            let det = e.detector.trim();
+            if det.is_empty() {
+                continue;
+            }
+            let reason = e.reason.clone();
+            if let Some(existing) = entries
+                .iter_mut()
+                .find(|x| x.detector == det && x.reason == reason)
+            {
+                existing.verdict = e.verdict;
+                existing.source_reviewed_at = e.reviewed_at.clone();
+                existing.source_run_id = run.id.clone();
+                existing.source_run_created_at = run.created_at.clone();
+                existing.source_machine_id = m.machine_id.clone();
+                existing.updated_at = now.clone();
+            } else {
+                entries.push(FleetTriagePrecedentEntry {
+                    detector: det.to_string(),
+                    reason,
+                    verdict: e.verdict,
+                    source_reviewed_at: e.reviewed_at.clone(),
+                    source_run_id: run.id.clone(),
+                    source_run_created_at: run.created_at.clone(),
+                    source_machine_id: m.machine_id.clone(),
+                    updated_at: now.clone(),
+                });
+            }
+        }
+    }
+}
+
+fn seed_fleet_triage_precedents_from_runs_if_empty(db: &mut PlatformDb) -> bool {
+    if !db.fleet_triage_precedent_entries.is_empty() {
+        return false;
+    }
+    if db.runs.is_empty() {
+        return false;
+    }
+    let drops: HashSet<(String, String)> = db
+        .fleet_triage_precedent_drops
+        .iter()
+        .map(|k| (k.detector.clone(), k.reason.clone()))
+        .collect();
+    let mut runs = db.runs.clone();
+    runs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    let now = Utc::now().to_rfc3339();
+    let mut map: HashMap<(String, String), HistoricalReasonVerdict> = HashMap::new();
+    merge_run_precedents_into_provenance_map(&mut map, &runs, None, &drops);
+    if map.is_empty() {
+        return false;
+    }
+    db.fleet_triage_precedent_entries = map
+        .into_values()
+        .map(|h| FleetTriagePrecedentEntry {
+            detector: h.detector,
+            reason: h.reason,
+            verdict: h.verdict,
+            source_reviewed_at: h.source_reviewed_at,
+            source_run_id: h.source_run_id,
+            source_run_created_at: h.source_run_created_at,
+            source_machine_id: h.source_machine_id,
+            updated_at: now.clone(),
+        })
+        .collect();
+    true
+}
+
+fn reason_keys_in_findings(findings: &[DetectionFinding]) -> HashSet<(String, String)> {
+    let mut keys = HashSet::new();
+    for f in findings {
+        for (det, reason) in finding_detector_reason_pairs(f) {
+            if reason_excluded_from_per_reason_triage(&reason) {
+                continue;
+            }
+            keys.insert((det, reason));
+        }
+    }
+    keys
+}
+
+fn precedent_ignore_set(rec: &DetectionRunRecord) -> HashSet<(String, String)> {
+    rec.triage_precedent_ignore
+        .iter()
+        .map(|k| (k.detector.clone(), k.reason.clone()))
+        .collect()
+}
+
+fn strip_reason_decisions_for_key(triage: &mut RunUserTriage, detector: &str, reason: &str) {
+    for m in &mut triage.machines {
+        m.reason_decisions
+            .retain(|e| !(e.detector == detector && e.reason == reason));
+    }
+}
+
+/// `(detector, reason)` pairs with a non-[`TriageVerdict::Unset`] verdict in this triage snapshot.
+/// Used to clear matching [`PlatformDb::fleet_triage_precedent_drops`] when an analyst explicitly
+/// saves triage again after removing a pair from fleet memory.
+fn non_unset_triage_reason_keys(triage: &RunUserTriage) -> HashSet<(String, String)> {
+    let mut keys = HashSet::new();
+    for m in &triage.machines {
+        for e in &m.reason_decisions {
+            if matches!(e.verdict, TriageVerdict::Unset) {
+                continue;
+            }
+            if reason_excluded_from_per_reason_triage(&e.reason) {
+                continue;
+            }
+            keys.insert((e.detector.clone(), e.reason.clone()));
+        }
+    }
+    keys
+}
+
+/// Set `reviewed_at` when an analyst changes a per-reason verdict; preserve prior timestamps when unchanged.
+fn stamp_reason_review_times_on_triage_put(old: &RunUserTriage, incoming: &mut RunUserTriage) {
+    let now = Utc::now().to_rfc3339();
+    for m in &mut incoming.machines {
+        let old_m = old.machines.iter().find(|x| x.machine_id == m.machine_id);
+        for e in &mut m.reason_decisions {
+            if matches!(e.verdict, TriageVerdict::Unset) {
+                e.reviewed_at = None;
+                continue;
+            }
+            let old_e = old_m.and_then(|om| {
+                om.reason_decisions
+                    .iter()
+                    .find(|r| r.detector == e.detector && r.reason == e.reason)
+            });
+            let unchanged = old_e.map(|o| o.verdict == e.verdict).unwrap_or(false);
+            e.reviewed_at = if unchanged {
+                old_e.and_then(|o| o.reviewed_at.clone())
+            } else {
+                Some(now.clone())
+            };
+        }
+    }
+}
+
+/// After group normalization, use one timestamp per triage group (latest RFC 3339) when any line was reviewed.
+fn align_reviewed_at_for_normalized_reason_groups(rec: &mut DetectionRunRecord) {
+    for f in &rec.findings {
+        let mid = f.machine_id.clone();
+        let Some(m_entry) = rec
+            .user_triage
+            .machines
+            .iter_mut()
+            .find(|x| x.machine_id == mid)
+        else {
+            continue;
+        };
+        let mut buckets: HashMap<(String, String), Vec<usize>> = HashMap::new();
+        for (i, e) in m_entry.reason_decisions.iter().enumerate() {
+            if reason_excluded_from_per_reason_triage(&e.reason) {
+                continue;
+            }
+            if matches!(e.verdict, TriageVerdict::Unset) {
+                continue;
+            }
+            let gk = triage_group_key(&e.detector, &e.reason);
+            buckets
+                .entry((e.detector.clone(), gk))
+                .or_default()
+                .push(i);
+        }
+        for indices in buckets.into_values() {
+            let mut best: Option<String> = None;
+            for &i in &indices {
+                if let Some(ref t) = m_entry.reason_decisions[i].reviewed_at {
+                    best = Some(match &best {
+                        None => t.clone(),
+                        Some(b) if t > b => t.clone(),
+                        Some(b) => b.clone(),
+                    });
+                }
+            }
+            if let Some(unified) = best {
+                for i in indices {
+                    m_entry.reason_decisions[i].reviewed_at = Some(unified.clone());
+                }
+            }
+        }
+    }
+}
+
+/// Fills per-reason `Unset` slots from fleet-wide history. Never overwrites an analyst choice on this run.
+fn merge_history_into_user_triage(
+    findings: &[DetectionFinding],
+    current: &RunUserTriage,
+    history: &HashMap<(String, String), TriageVerdict>,
+    precedent_ignore: &HashSet<(String, String)>,
+) -> (RunUserTriage, bool) {
+    let mut changed = false;
+    let mut machines: HashMap<String, MachineTriageEntry> = HashMap::new();
+    // Keep every machine row from the saved triage first. Previously we only overlaid `current`
+    // onto hosts that appeared in `findings`, which dropped orphan rows (e.g. legacy data,
+    // hand-edited db, or findings that no longer list every host that still has saved verdicts).
+    // That made fleet-wide precedent appear to vanish after routine sync (e.g. post-ingest changes).
+    for m in &current.machines {
+        machines.insert(m.machine_id.clone(), m.clone());
+    }
+    for f in findings {
+        machines
+            .entry(f.machine_id.clone())
+            .or_insert_with(|| MachineTriageEntry {
+                machine_id: f.machine_id.clone(),
+                reason_decisions: vec![],
+                final_verdict: TriageVerdict::Unset,
+            });
+    }
+    for f in findings {
+        let entry = machines
+            .get_mut(&f.machine_id)
+            .expect("machine from findings");
+        for (det, reason) in finding_detector_reason_pairs(f) {
+            if reason_excluded_from_per_reason_triage(&reason) {
+                continue;
+            }
+            let key = (det.clone(), reason.clone());
+            if precedent_ignore.contains(&key) {
+                continue;
+            }
+            let cur_v = entry
+                .reason_decisions
+                .iter()
+                .find(|e| e.detector == det && e.reason == reason)
+                .map(|e| e.verdict)
+                .unwrap_or(TriageVerdict::Unset);
+            if !matches!(cur_v, TriageVerdict::Unset) {
+                continue;
+            }
+            let Some(hv) = history_verdict_for_line_or_process_group(&det, &reason, history) else {
+                continue;
+            };
+            if let Some(rd) = entry
+                .reason_decisions
+                .iter_mut()
+                .find(|e| e.detector == det && e.reason == reason)
+            {
+                rd.verdict = hv;
+                rd.reviewed_at = None;
+            } else {
+                entry.reason_decisions.push(ReasonTriageEntry {
+                    detector: det,
+                    reason,
+                    verdict: hv,
+                    reviewed_at: None,
+                });
+            }
+            changed = true;
+        }
+    }
+    let mut list: Vec<_> = machines.into_values().collect();
+    list.sort_by(|a, b| a.machine_id.cmp(&b.machine_id));
+    (RunUserTriage { machines: list }, changed)
+}
+
+fn verdict_for_reason_on_machine(
+    triage: &RunUserTriage,
+    machine_id: &str,
+    detector: &str,
+    reason: &str,
+) -> TriageVerdict {
+    triage
+        .machines
+        .iter()
+        .find(|m| m.machine_id == machine_id)
+        .and_then(|m| {
+            m.reason_decisions
+                .iter()
+                .find(|e| e.detector == detector && e.reason == reason)
+        })
+        .map(|e| e.verdict)
+        .unwrap_or(TriageVerdict::Unset)
+}
+
+/// Uses the **stored** detector fusion score on the finding and per-reason triage: all actionable
+/// groups marked false positive → score 0 / LOW; any malicious → keep the raw score; if **any** group
+/// is still unset, keep the full raw score (analysts have not yet decided to downgrade other lines on
+/// this host, so the detector severity must not be diluted by unrelated FP groups).
+fn effective_score_and_severity(f: &DetectionFinding, triage: &RunUserTriage) -> (f64, String) {
+    let raw = finite_f64(f.score);
+    let slots = actionable_triage_group_slots(f);
+    if slots.is_empty() {
+        return (raw, f.severity.clone());
+    }
+    let mid = f.machine_id.as_str();
+    let mut n_mal = 0usize;
+    let mut n_fp = 0usize;
+    for (det, gk) in &slots {
+        let reasons: Vec<String> = finding_detector_reason_pairs(f)
+            .into_iter()
+            .filter(|(_, r)| !reason_excluded_from_per_reason_triage(r))
+            .filter(|(d, r)| d == det && triage_group_key(d, r) == *gk)
+            .map(|(_, r)| r)
+            .collect();
+        let vers: Vec<TriageVerdict> = reasons
+            .iter()
+            .map(|r| verdict_for_reason_on_machine(triage, mid, det, r))
+            .collect();
+        match aggregate_verdicts_for_group(&vers) {
+            TriageVerdict::Malicious => n_mal += 1,
+            TriageVerdict::FalsePositive => n_fp += 1,
+            TriageVerdict::Unset => {}
+        }
+    }
+    let n_act = slots.len();
+    let new_score = if n_mal > 0 {
+        raw
+    } else if n_fp == n_act {
+        0.0
+    } else {
+        raw
+    };
+    let sev = severity_from_score(new_score).to_string();
+    (new_score, sev)
+}
+
+#[inline]
+fn severity_bucket_for_sort(sev: &str) -> u8 {
+    match sev.to_ascii_uppercase().as_str() {
+        "CRITICAL" => 4,
+        "HIGH" => 3,
+        "MEDIUM" => 2,
+        _ => 1,
+    }
+}
+
+/// Order hosts for analyst review: highest **effective** risk first (score after triage), then
+/// severity label, then stable machine id.
+fn sort_findings_by_review_priority(findings: &mut [DetectionFinding]) {
+    findings.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| {
+                severity_bucket_for_sort(&b.severity).cmp(&severity_bucket_for_sort(&a.severity))
+            })
+            .then_with(|| a.machine_id.cmp(&b.machine_id))
+    });
 }
 
 fn collect_jsonl_paths(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Box<dyn Error>> {
@@ -4372,6 +5777,7 @@ mod detector_reason_helpers_tests {
             detectors: Vec::new(),
             dataset_tags: Vec::new(),
             reasons_by_detector: Vec::new(),
+            sigma_matches: Vec::new(),
         }
     }
 
@@ -4459,11 +5865,13 @@ mod run_user_triage_filter_tests {
                         detector: "ironsift-process".into(),
                         reason: "Process row: dataset=x pid=1".into(),
                         verdict: TriageVerdict::Malicious,
+                        reviewed_at: None,
                     },
                     ReasonTriageEntry {
                         detector: "ironsift-process".into(),
                         reason: "RISK DETECTED: uid=0".into(),
                         verdict: TriageVerdict::FalsePositive,
+                        reviewed_at: None,
                     },
                 ],
                 final_verdict: TriageVerdict::Unset,
@@ -4472,5 +5880,708 @@ mod run_user_triage_filter_tests {
         let f = t.without_excluded_reason_decisions();
         assert_eq!(f.machines[0].reason_decisions.len(), 1);
         assert!(f.machines[0].reason_decisions[0].reason.starts_with("RISK"));
+    }
+}
+
+#[cfg(test)]
+mod reason_history_triage_tests {
+    use super::{
+        effective_score_and_severity, merge_history_into_user_triage, DetectionFinding,
+        DetectorReasons, MachineTriageEntry, PlatformStore, ReasonTriageEntry, RunUserTriage,
+        TriageVerdict,
+    };
+    use std::collections::{HashMap, HashSet};
+
+    fn sample_finding() -> DetectionFinding {
+        DetectionFinding {
+            machine_id: "host-a".into(),
+            severity: "HIGH".into(),
+            score: 0.75,
+            reasons: vec![],
+            detectors: vec!["anomark-rs".into()],
+            dataset_tags: vec![],
+            reasons_by_detector: vec![DetectorReasons {
+                detector: "anomark-rs".into(),
+                reasons: vec!["AnoMark suspect: /bin/touch (ll=-1.0, margin=0.1)".into()],
+            }],
+            sigma_matches: vec![],
+        }
+    }
+
+    #[test]
+    fn history_fills_unset_reason_verdict() {
+        let f = sample_finding();
+        let current = RunUserTriage::default();
+        let mut hist = HashMap::new();
+        hist.insert(
+            (
+                "anomark-rs".into(),
+                "AnoMark suspect: /bin/touch (ll=-1.0, margin=0.1)".into(),
+            ),
+            TriageVerdict::FalsePositive,
+        );
+        let empty_ignore = HashSet::new();
+        let (merged, changed) =
+            merge_history_into_user_triage(&[f.clone()], &current, &hist, &empty_ignore);
+        assert!(changed);
+        let m = merged.machines.iter().find(|x| x.machine_id == "host-a").unwrap();
+        assert_eq!(m.reason_decisions.len(), 1);
+        assert_eq!(m.reason_decisions[0].verdict, TriageVerdict::FalsePositive);
+        assert!(
+            m.reason_decisions[0].reviewed_at.is_none(),
+            "fleet merge must not set human review time"
+        );
+    }
+
+    #[test]
+    fn history_does_not_override_existing_verdict() {
+        let f = sample_finding();
+        let current = RunUserTriage {
+            machines: vec![MachineTriageEntry {
+                machine_id: "host-a".into(),
+                reason_decisions: vec![ReasonTriageEntry {
+                    detector: "anomark-rs".into(),
+                    reason: "AnoMark suspect: /bin/touch (ll=-1.0, margin=0.1)".into(),
+                    verdict: TriageVerdict::Malicious,
+                    reviewed_at: None,
+                }],
+                final_verdict: TriageVerdict::Unset,
+            }],
+        };
+        let mut hist = HashMap::new();
+        hist.insert(
+            (
+                "anomark-rs".into(),
+                "AnoMark suspect: /bin/touch (ll=-1.0, margin=0.1)".into(),
+            ),
+            TriageVerdict::FalsePositive,
+        );
+        let empty_ignore = HashSet::new();
+        let (merged, changed) = merge_history_into_user_triage(&[f], &current, &hist, &empty_ignore);
+        assert!(!changed);
+        assert_eq!(
+            merged.machines[0].reason_decisions[0].verdict,
+            TriageVerdict::Malicious
+        );
+    }
+
+    /// Saved triage for a host must survive merge even if that host is missing from the current
+    /// `findings` slice (fleet precedent is derived from all `user_triage` rows).
+    #[test]
+    fn merge_preserves_triage_for_machines_not_in_findings() {
+        let f = sample_finding();
+        let current = RunUserTriage {
+            machines: vec![
+                MachineTriageEntry {
+                    machine_id: "host-a".into(),
+                    reason_decisions: vec![],
+                    final_verdict: TriageVerdict::Unset,
+                },
+                MachineTriageEntry {
+                    machine_id: "host-orphan".into(),
+                    reason_decisions: vec![ReasonTriageEntry {
+                        detector: "anomark-rs".into(),
+                        reason: "AnoMark suspect: /bin/legacy (ll=-2.0, margin=0.2)".into(),
+                        verdict: TriageVerdict::FalsePositive,
+                        reviewed_at: None,
+                    }],
+                    final_verdict: TriageVerdict::Unset,
+                },
+            ],
+        };
+        let empty_hist = HashMap::new();
+        let empty_ignore = HashSet::new();
+        let (merged, changed) =
+            merge_history_into_user_triage(&[f], &current, &empty_hist, &empty_ignore);
+        assert!(!changed);
+        let ids: Vec<_> = merged.machines.iter().map(|m| m.machine_id.as_str()).collect();
+        assert!(ids.contains(&"host-a"));
+        assert!(ids.contains(&"host-orphan"));
+        let orphan = merged
+            .machines
+            .iter()
+            .find(|m| m.machine_id == "host-orphan")
+            .unwrap();
+        assert_eq!(orphan.reason_decisions.len(), 1);
+        assert_eq!(orphan.reason_decisions[0].verdict, TriageVerdict::FalsePositive);
+    }
+
+    #[test]
+    fn effective_score_zero_when_all_actionable_reasons_fp() {
+        let f = sample_finding();
+        let triage = RunUserTriage {
+            machines: vec![MachineTriageEntry {
+                machine_id: "host-a".into(),
+                reason_decisions: vec![ReasonTriageEntry {
+                    detector: "anomark-rs".into(),
+                    reason: "AnoMark suspect: /bin/touch (ll=-1.0, margin=0.1)".into(),
+                    verdict: TriageVerdict::FalsePositive,
+                    reviewed_at: None,
+                }],
+                final_verdict: TriageVerdict::Unset,
+            }],
+        };
+        let (s, sev) = effective_score_and_severity(&f, &triage);
+        assert_eq!(s, 0.0);
+        assert_eq!(sev, "LOW");
+    }
+
+    #[test]
+    fn effective_score_keeps_raw_when_any_malicious() {
+        let f = sample_finding();
+        let triage = RunUserTriage {
+            machines: vec![MachineTriageEntry {
+                machine_id: "host-a".into(),
+                reason_decisions: vec![
+                    ReasonTriageEntry {
+                        detector: "anomark-rs".into(),
+                        reason: "AnoMark suspect: /bin/touch (ll=-1.0, margin=0.1)".into(),
+                        verdict: TriageVerdict::Malicious,
+                        reviewed_at: None,
+                    },
+                    ReasonTriageEntry {
+                        detector: "anomark-rs".into(),
+                        reason: "AnoMark suspicious command ratio 0.50 (suspect 95.0%)".into(),
+                        verdict: TriageVerdict::FalsePositive,
+                        reviewed_at: None,
+                    },
+                ],
+                final_verdict: TriageVerdict::Unset,
+            }],
+        };
+        let mut f2 = f;
+        PlatformStore::push_detector_reason(
+            &mut f2,
+            "anomark-rs",
+            "AnoMark suspicious command ratio 0.50 (suspect 95.0%)".into(),
+        );
+        let (s, _) = effective_score_and_severity(&f2, &triage);
+        assert_eq!(s, 0.75);
+    }
+
+    /// Unset triage on one actionable group must not dilute severity because another group is FP
+    /// (e.g. `RISK DETECTED: sh …` still open while "cluster outlier" was marked false positive).
+    #[test]
+    fn effective_score_keeps_raw_when_mixed_fp_and_unset_groups() {
+        let mut f = DetectionFinding {
+            machine_id: "host-a".into(),
+            severity: "HIGH".into(),
+            score: 0.75,
+            reasons: vec![],
+            detectors: vec!["ironsift-process".into()],
+            dataset_tags: vec![],
+            reasons_by_detector: vec![],
+            sigma_matches: vec![],
+        };
+        let risk =
+            "RISK DETECTED: name=sh path=sh parent=dscockpitd uid=0 count=1 reasons=root_no_whitelist,high_entropy_args"
+                .to_string();
+        let cluster = "Process mix differs from fleet majority cluster (no behavioral/root/rare-process flags)."
+            .to_string();
+        PlatformStore::push_detector_reason(&mut f, "ironsift-process", risk.clone());
+        PlatformStore::push_detector_reason(&mut f, "ironsift-process", cluster.clone());
+        let triage = RunUserTriage {
+            machines: vec![MachineTriageEntry {
+                machine_id: "host-a".into(),
+                reason_decisions: vec![ReasonTriageEntry {
+                    detector: "ironsift-process".into(),
+                    reason: cluster,
+                    verdict: TriageVerdict::FalsePositive,
+                    reviewed_at: None,
+                }],
+                final_verdict: TriageVerdict::Unset,
+            }],
+        };
+        let (s, sev) = effective_score_and_severity(&f, &triage);
+        assert_eq!(s, 0.75);
+        assert_eq!(sev, "HIGH");
+    }
+
+    #[test]
+    fn merge_skips_keys_in_precedent_ignore_set() {
+        let f = sample_finding();
+        let current = RunUserTriage::default();
+        let mut hist = HashMap::new();
+        hist.insert(
+            (
+                "anomark-rs".into(),
+                "AnoMark suspect: /bin/touch (ll=-1.0, margin=0.1)".into(),
+            ),
+            TriageVerdict::FalsePositive,
+        );
+        let mut ign = HashSet::new();
+        ign.insert((
+            "anomark-rs".into(),
+            "AnoMark suspect: /bin/touch (ll=-1.0, margin=0.1)".into(),
+        ));
+        let (merged, changed) = merge_history_into_user_triage(&[f], &current, &hist, &ign);
+        assert!(!changed);
+        let m = merged.machines.iter().find(|x| x.machine_id == "host-a").unwrap();
+        assert!(m.reason_decisions.is_empty());
+    }
+
+    #[test]
+    fn effective_score_ironsift_process_counts_one_slot_per_process_name() {
+        let mut f = DetectionFinding {
+            machine_id: "host-a".into(),
+            severity: "HIGH".into(),
+            score: 0.9,
+            reasons: vec![],
+            detectors: vec!["ironsift-process".into()],
+            dataset_tags: vec![],
+            reasons_by_detector: vec![],
+            sigma_matches: vec![],
+        };
+        let risk = "RISK DETECTED:name=lsof path=/usr/sbin/lsof parent=lsof uid=0 count=1 reasons=root_no_whitelist".to_string();
+        let rare = "Rare process:lsof (explanation)".to_string();
+        PlatformStore::push_detector_reason(&mut f, "ironsift-process", risk.clone());
+        PlatformStore::push_detector_reason(&mut f, "ironsift-process", rare.clone());
+        let triage = RunUserTriage {
+            machines: vec![MachineTriageEntry {
+                machine_id: "host-a".into(),
+                reason_decisions: vec![
+                    ReasonTriageEntry {
+                        detector: "ironsift-process".into(),
+                        reason: risk,
+                        verdict: TriageVerdict::FalsePositive,
+                        reviewed_at: None,
+                    },
+                    ReasonTriageEntry {
+                        detector: "ironsift-process".into(),
+                        reason: rare,
+                        verdict: TriageVerdict::FalsePositive,
+                        reviewed_at: None,
+                    },
+                ],
+                final_verdict: TriageVerdict::Unset,
+            }],
+        };
+        let (s, sev) = effective_score_and_severity(&f, &triage);
+        assert_eq!(s, 0.0);
+        assert_eq!(sev, "LOW");
+    }
+
+    #[test]
+    fn history_fills_risk_line_from_rare_process_line_same_group() {
+        let mut f = DetectionFinding {
+            machine_id: "host-a".into(),
+            severity: "HIGH".into(),
+            score: 0.9,
+            reasons: vec![],
+            detectors: vec!["ironsift-process".into()],
+            dataset_tags: vec![],
+            reasons_by_detector: vec![],
+            sigma_matches: vec![],
+        };
+        let risk = "RISK DETECTED:name=lsof path=/usr/sbin/lsof parent=lsof uid=0 count=1 reasons=root_no_whitelist".to_string();
+        let rare = "Rare process:lsof (explanation)".to_string();
+        PlatformStore::push_detector_reason(&mut f, "ironsift-process", risk.clone());
+        PlatformStore::push_detector_reason(&mut f, "ironsift-process", rare.clone());
+        let current = RunUserTriage::default();
+        let mut hist = HashMap::new();
+        hist.insert(
+            ("ironsift-process".into(), rare.clone()),
+            TriageVerdict::FalsePositive,
+        );
+        let empty_ignore = HashSet::new();
+        let (merged, changed) =
+            merge_history_into_user_triage(&[f], &current, &hist, &empty_ignore);
+        assert!(changed);
+        let m = merged.machines.iter().find(|x| x.machine_id == "host-a").unwrap();
+        let v_risk = m
+            .reason_decisions
+            .iter()
+            .find(|e| e.reason == risk)
+            .map(|e| e.verdict);
+        let v_rare = m
+            .reason_decisions
+            .iter()
+            .find(|e| e.reason == rare)
+            .map(|e| e.verdict);
+        assert_eq!(v_risk, Some(TriageVerdict::FalsePositive));
+        assert_eq!(v_rare, Some(TriageVerdict::FalsePositive));
+    }
+}
+
+#[cfg(test)]
+mod fleet_triage_precedent_drop_tests {
+    use super::{
+        build_reason_verdict_provenance_from_runs, DetectionFinding, DetectionRunRecord,
+        MachineTriageEntry, PlatformStore, ReasonPrecedentKey, ReasonTriageEntry,
+        RunDetectionFocus, RunDetectorMode, RunUserTriage, TriageVerdict,
+    };
+    use std::collections::HashSet;
+    use tempfile::tempdir;
+
+    fn run_with_reason(det: &str, reason: &str, verdict: TriageVerdict) -> DetectionRunRecord {
+        DetectionRunRecord {
+            id: "run-test-1".into(),
+            created_at: "2026-01-02T12:00:00Z".into(),
+            dataset_ids: vec![],
+            baseline_tags: vec![],
+            candidate_tags: vec![],
+            baseline_finding_count: 0,
+            candidate_finding_count: 0,
+            findings: vec![],
+            summary: "test".into(),
+            detection_config_id: None,
+            detection_config_name: None,
+            detection_focus: RunDetectionFocus::Auto,
+            detector_mode: RunDetectorMode::Both,
+            anomark_suspect_percent: 95.0,
+            request: Default::default(),
+            user_triage: RunUserTriage {
+                machines: vec![MachineTriageEntry {
+                    machine_id: "host-1".into(),
+                    reason_decisions: vec![ReasonTriageEntry {
+                        detector: det.into(),
+                        reason: reason.into(),
+                        verdict,
+                        reviewed_at: None,
+                    }],
+                    final_verdict: TriageVerdict::Unset,
+                }],
+            },
+            triage_precedent_ignore: vec![],
+            sigma_stable_stats: None,
+        }
+    }
+
+    #[test]
+    fn fleet_drop_set_hides_pair_from_provenance() {
+        let runs = [run_with_reason("sigma-zero", "Suspicious: foo", TriageVerdict::Malicious)];
+        let mut drops = HashSet::new();
+        drops.insert(("sigma-zero".into(), "Suspicious: foo".into()));
+        let m = build_reason_verdict_provenance_from_runs(&runs, None, &drops);
+        assert!(m.is_empty());
+        let m2 = build_reason_verdict_provenance_from_runs(&runs, None, &HashSet::new());
+        assert_eq!(m2.len(), 1);
+    }
+
+    #[test]
+    fn saving_triage_clears_fleet_drop_for_that_reason_key() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("db.json");
+        let store = PlatformStore::load_or_create(db_path.to_str().unwrap()).expect("store");
+        let run_id = "run-fleet-drop-lift".to_string();
+        let mut rec = run_with_reason("sigma-zero", "line a", TriageVerdict::Malicious);
+        rec.id = run_id.clone();
+        rec.candidate_finding_count = 1;
+        rec.findings = vec![DetectionFinding {
+            machine_id: "host-1".into(),
+            severity: "HIGH".into(),
+            score: 0.9,
+            reasons: vec![],
+            detectors: vec!["sigma-zero".into()],
+            dataset_tags: vec![],
+            reasons_by_detector: vec![],
+            sigma_matches: vec![],
+        }];
+        {
+            let mut db = store.db.write();
+            db.runs.push(rec);
+        }
+        store.save().expect("save");
+        store
+            .add_fleet_triage_precedent_drop(ReasonPrecedentKey {
+                detector: "sigma-zero".into(),
+                reason: "line a".into(),
+            })
+            .expect("drop");
+        assert!(store.triage_precedent_fleet_global().is_empty());
+        let triage = RunUserTriage {
+            machines: vec![MachineTriageEntry {
+                machine_id: "host-1".into(),
+                reason_decisions: vec![ReasonTriageEntry {
+                    detector: "sigma-zero".into(),
+                    reason: "line a".into(),
+                    verdict: TriageVerdict::FalsePositive,
+                    reviewed_at: None,
+                }],
+                final_verdict: TriageVerdict::Unset,
+            }],
+        };
+        store
+            .update_run_user_triage(&run_id, triage)
+            .expect("update triage");
+        let global = store.triage_precedent_fleet_global();
+        assert_eq!(global.len(), 1);
+        assert_eq!(global[0].verdict, TriageVerdict::FalsePositive);
+        assert_eq!(global[0].source_run_id, run_id);
+        assert!(
+            global[0].source_reviewed_at.is_some(),
+            "fleet precedent should carry review time after save"
+        );
+    }
+
+    #[test]
+    fn fleet_memory_survives_delete_all_runs() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("db.json");
+        let store = PlatformStore::load_or_create(db_path.to_str().unwrap()).expect("store");
+        let run_id = "run-fleet-persist".to_string();
+        let mut rec = run_with_reason("sigma-zero", "line persist", TriageVerdict::FalsePositive);
+        rec.id = run_id.clone();
+        rec.candidate_finding_count = 1;
+        rec.findings = vec![DetectionFinding {
+            machine_id: "host-1".into(),
+            severity: "HIGH".into(),
+            score: 0.9,
+            reasons: vec![],
+            detectors: vec!["sigma-zero".into()],
+            dataset_tags: vec![],
+            reasons_by_detector: vec![],
+            sigma_matches: vec![],
+        }];
+        store.db.write().runs.push(rec);
+        store.save().expect("save");
+        store
+            .update_run_user_triage(
+                &run_id,
+                RunUserTriage {
+                    machines: vec![MachineTriageEntry {
+                        machine_id: "host-1".into(),
+                        reason_decisions: vec![ReasonTriageEntry {
+                            detector: "sigma-zero".into(),
+                            reason: "line persist".into(),
+                            verdict: TriageVerdict::FalsePositive,
+                            reviewed_at: None,
+                        }],
+                        final_verdict: TriageVerdict::Unset,
+                    }],
+                },
+            )
+            .expect("triage");
+        assert_eq!(store.triage_precedent_fleet_global().len(), 1);
+        store.delete_all_runs().expect("delete all");
+        assert!(store.db.read().runs.is_empty());
+        let global = store.triage_precedent_fleet_global();
+        assert_eq!(global.len(), 1);
+        assert_eq!(global[0].verdict, TriageVerdict::FalsePositive);
+        assert_eq!(global[0].reason, "line persist");
+    }
+
+    #[test]
+    fn delete_fleet_triage_precedent_entry_clears_store_and_drop_list() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("db.json");
+        let store = PlatformStore::load_or_create(db_path.to_str().unwrap()).expect("store");
+        let run_id = "run-del-fleet".to_string();
+        let mut rec = run_with_reason("sigma-zero", "unique-reason-line", TriageVerdict::Malicious);
+        rec.id = run_id.clone();
+        rec.candidate_finding_count = 1;
+        rec.findings = vec![DetectionFinding {
+            machine_id: "host-1".into(),
+            severity: "HIGH".into(),
+            score: 0.9,
+            reasons: vec![],
+            detectors: vec!["sigma-zero".into()],
+            dataset_tags: vec![],
+            reasons_by_detector: vec![],
+            sigma_matches: vec![],
+        }];
+        store.db.write().runs.push(rec);
+        store.save().expect("save");
+        store
+            .update_run_user_triage(
+                &run_id,
+                RunUserTriage {
+                    machines: vec![MachineTriageEntry {
+                        machine_id: "host-1".into(),
+                        reason_decisions: vec![ReasonTriageEntry {
+                            detector: "sigma-zero".into(),
+                            reason: "unique-reason-line".into(),
+                            verdict: TriageVerdict::Malicious,
+                            reviewed_at: None,
+                        }],
+                        final_verdict: TriageVerdict::Unset,
+                    }],
+                },
+            )
+            .expect("triage");
+        assert_eq!(store.triage_precedent_fleet_global().len(), 1);
+        store
+            .add_fleet_triage_precedent_drop(ReasonPrecedentKey {
+                detector: "sigma-zero".into(),
+                reason: "unique-reason-line".into(),
+            })
+            .expect("drop");
+        assert!(store.triage_precedent_fleet_global().is_empty());
+        assert_eq!(store.fleet_triage_precedent_drops().len(), 1);
+        let changed = store
+            .delete_fleet_triage_precedent_entry(ReasonPrecedentKey {
+                detector: "sigma-zero".into(),
+                reason: "unique-reason-line".into(),
+            })
+            .expect("delete");
+        assert!(changed);
+        assert!(store.db.read().fleet_triage_precedent_entries.is_empty());
+        assert!(store.db.read().fleet_triage_precedent_drops.is_empty());
+        assert!(store.triage_precedent_fleet_global().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod triage_review_time_tests {
+    use super::{
+        DetectionFinding, DetectionRunRecord, MachineTriageEntry, PlatformStore, ReasonTriageEntry,
+        RunDetectionFocus, RunDetectorMode, RunUserTriage, TriageVerdict,
+    };
+    use tempfile::tempdir;
+
+    fn finding(mid: &str) -> DetectionFinding {
+        DetectionFinding {
+            machine_id: mid.into(),
+            severity: "HIGH".into(),
+            score: 0.9,
+            reasons: vec![],
+            detectors: vec!["sigma-zero".into()],
+            dataset_tags: vec![],
+            reasons_by_detector: vec![],
+            sigma_matches: vec![],
+        }
+    }
+
+    fn run_record(run_id: &str) -> DetectionRunRecord {
+        DetectionRunRecord {
+            id: run_id.into(),
+            created_at: "2026-01-02T12:00:00Z".into(),
+            dataset_ids: vec![],
+            baseline_tags: vec![],
+            candidate_tags: vec![],
+            baseline_finding_count: 0,
+            candidate_finding_count: 1,
+            findings: vec![finding("host-1")],
+            summary: "test".into(),
+            detection_config_id: None,
+            detection_config_name: None,
+            detection_focus: RunDetectionFocus::Auto,
+            detector_mode: RunDetectorMode::Both,
+            anomark_suspect_percent: 95.0,
+            request: Default::default(),
+            user_triage: RunUserTriage::default(),
+            triage_precedent_ignore: vec![],
+            sigma_stable_stats: None,
+        }
+    }
+
+    #[test]
+    fn triage_put_stamps_reviewed_at_on_new_verdict() {
+        let dir = tempdir().expect("tempdir");
+        let store =
+            PlatformStore::load_or_create(dir.path().join("db.json").to_str().unwrap()).expect("store");
+        let run_id = "r-review-1".to_string();
+        let mut rec = run_record(&run_id);
+        rec.user_triage = RunUserTriage {
+            machines: vec![MachineTriageEntry {
+                machine_id: "host-1".into(),
+                reason_decisions: vec![],
+                final_verdict: TriageVerdict::Unset,
+            }],
+        };
+        store.db.write().runs.push(rec);
+        store.save().expect("save");
+        let triage = RunUserTriage {
+            machines: vec![MachineTriageEntry {
+                machine_id: "host-1".into(),
+                reason_decisions: vec![ReasonTriageEntry {
+                    detector: "sigma-zero".into(),
+                    reason: "hit".into(),
+                    verdict: TriageVerdict::FalsePositive,
+                    reviewed_at: None,
+                }],
+                final_verdict: TriageVerdict::Unset,
+            }],
+        };
+        store.update_run_user_triage(&run_id, triage).expect("put");
+        let r = store.get_run(&run_id).expect("run");
+        let e = r.user_triage.machines[0]
+            .reason_decisions
+            .iter()
+            .find(|x| x.reason == "hit")
+            .expect("row");
+        assert!(
+            e.reviewed_at.as_deref().unwrap_or("").len() >= 10,
+            "expected RFC3339 reviewed_at"
+        );
+    }
+
+    #[test]
+    fn triage_put_preserves_reviewed_at_when_verdict_unchanged() {
+        let dir = tempdir().expect("tempdir");
+        let store =
+            PlatformStore::load_or_create(dir.path().join("db.json").to_str().unwrap()).expect("store");
+        let run_id = "r-review-2".to_string();
+        let mut rec = run_record(&run_id);
+        rec.user_triage = RunUserTriage {
+            machines: vec![MachineTriageEntry {
+                machine_id: "host-1".into(),
+                reason_decisions: vec![ReasonTriageEntry {
+                    detector: "sigma-zero".into(),
+                    reason: "hit".into(),
+                    verdict: TriageVerdict::FalsePositive,
+                    reviewed_at: Some("2026-03-01T10:00:00Z".into()),
+                }],
+                final_verdict: TriageVerdict::Unset,
+            }],
+        };
+        store.db.write().runs.push(rec);
+        store.save().expect("save");
+        let triage = RunUserTriage {
+            machines: vec![MachineTriageEntry {
+                machine_id: "host-1".into(),
+                reason_decisions: vec![ReasonTriageEntry {
+                    detector: "sigma-zero".into(),
+                    reason: "hit".into(),
+                    verdict: TriageVerdict::FalsePositive,
+                    reviewed_at: None,
+                }],
+                final_verdict: TriageVerdict::Unset,
+            }],
+        };
+        store.update_run_user_triage(&run_id, triage).expect("put");
+        let r = store.get_run(&run_id).expect("run");
+        let e = &r.user_triage.machines[0].reason_decisions[0];
+        assert_eq!(e.reviewed_at.as_deref(), Some("2026-03-01T10:00:00Z"));
+    }
+}
+
+#[cfg(test)]
+mod findings_priority_sort_tests {
+    use super::{sort_findings_by_review_priority, DetectionFinding};
+
+    fn row(mid: &str, score: f64, severity: &str) -> DetectionFinding {
+        DetectionFinding {
+            machine_id: mid.into(),
+            severity: severity.into(),
+            score,
+            reasons: vec![],
+            detectors: vec![],
+            dataset_tags: vec![],
+            reasons_by_detector: vec![],
+            sigma_matches: vec![],
+        }
+    }
+
+    #[test]
+    fn sorts_by_effective_score_most_severe_first() {
+        let mut v = vec![
+            row("low-host", 0.1, "LOW"),
+            row("crit-host", 0.95, "CRITICAL"),
+            row("mid-host", 0.45, "MEDIUM"),
+        ];
+        sort_findings_by_review_priority(&mut v);
+        assert_eq!(
+            v.iter().map(|f| f.machine_id.as_str()).collect::<Vec<_>>(),
+            vec!["crit-host", "mid-host", "low-host"]
+        );
+    }
+
+    #[test]
+    fn tie_breaker_machine_id_when_score_equal() {
+        let mut v = vec![row("zebra", 0.5, "MEDIUM"), row("alpha", 0.5, "MEDIUM")];
+        sort_findings_by_review_priority(&mut v);
+        assert_eq!(v[0].machine_id, "alpha");
+        assert_eq!(v[1].machine_id, "zebra");
     }
 }

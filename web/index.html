@@ -157,6 +157,12 @@
       padding: 8px 12px;
       max-width: min(420px, 100%);
     }
+    @media (min-width: 900px) {
+      .app-header-toolbar .global-activity-strip--toolbar:not([hidden]) {
+        flex: 1 1 100%;
+        max-width: min(720px, 100%);
+      }
+    }
     .global-activity-strip--toolbar .global-activity-strip__beacon {
       margin-top: 0;
     }
@@ -516,6 +522,57 @@
     html[data-theme="light"] .run-create-status--ok { color: #15803d; }
     .run-create-status--err { color: #fecaca; font-weight: 500; }
     html[data-theme="light"] .run-create-status--err { color: #b91c1c; }
+    .run-create-progress {
+      margin-top: 12px;
+      padding: 12px 14px;
+      border-radius: 10px;
+      border: 1px solid color-mix(in srgb, var(--link) 35%, var(--border));
+      background: color-mix(in srgb, var(--link) 10%, var(--bg-card));
+    }
+    .run-create-progress__row { display: flex; align-items: flex-start; gap: 10px; }
+    .run-create-progress__beacon {
+      flex-shrink: 0;
+      width: 10px;
+      height: 10px;
+      margin-top: 4px;
+      border-radius: 50%;
+      background: var(--link);
+      animation: global-act-beacon 1s ease-in-out infinite;
+    }
+    .run-create-progress__text { font-size: 13px; line-height: 1.5; color: var(--text); }
+    .run-create-progress__bar {
+      margin-top: 10px;
+      height: 5px;
+      border-radius: 99px;
+      background: var(--bg-page);
+      border: 1px solid var(--border);
+      overflow: hidden;
+    }
+    .run-create-progress__bar-fill {
+      display: block;
+      height: 100%;
+      width: 38%;
+      border-radius: 99px;
+      background: var(--link);
+      opacity: 0.9;
+      animation: run-create-indet 1.35s ease-in-out infinite;
+    }
+    @keyframes run-create-indet {
+      0% { transform: translateX(-120%); }
+      100% { transform: translateX(320%); }
+    }
+    .run-open-results-link {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--link);
+      text-decoration: none;
+      border: 1px solid color-mix(in srgb, var(--link) 40%, var(--border));
+      padding: 6px 12px;
+      border-radius: 8px;
+      background: color-mix(in srgb, var(--link) 12%, var(--bg-card));
+      white-space: nowrap;
+    }
+    .run-open-results-link:hover { filter: brightness(1.08); text-decoration: underline; }
     .dataset-inspection-mount { margin-top: 16px; }
     .inspection-shell {
       border: 1px solid var(--border);
@@ -722,34 +779,41 @@
     .sigma-rules-stats__levels { display: inline-flex; flex-wrap: wrap; gap: 6px; }
     .sigma-rules-stats__levels .sigma-rule-level-chip { font-size: 10px; padding: 1px 8px; }
     .sigma-rules-editor { display: flex; flex-direction: column; gap: 10px; }
-    /* Each rule is a `<details>` so the YAML stays collapsed by default; the summary surfaces
-       the title + level/status chips + tag chips so 20+ rules stay scannable on screen. */
-    details.sigma-rule-card {
+    /* Rule cards use a custom disclosure (expand button + body) so checkboxes/buttons are not
+       inside `<summary>`, which is unreliable for keyboard and assistive tech. */
+    div.sigma-rule-card {
       border-radius: 12px; border: 1px solid var(--picker-border);
       background: var(--bg-card);
       border-left: 4px solid var(--accent);
       overflow: hidden;
       transition: border-color 0.15s ease, opacity 0.15s ease;
     }
-    details.sigma-rule-card[open] {
+    div.sigma-rule-card.sigma-rule-card--open {
       box-shadow: 0 1px 0 0 color-mix(in srgb, var(--accent) 18%, transparent),
                   0 0 0 1px color-mix(in srgb, var(--accent) 24%, transparent);
     }
-    details.sigma-rule-card.sigma-rule-card--inactive {
+    div.sigma-rule-card.sigma-rule-card--inactive {
       border-left-color: var(--border-strong);
       opacity: 0.85;
     }
-    details.sigma-rule-card.sigma-rule-card--inactive .sigma-rule-summary-title { color: var(--text-muted); }
-    summary.sigma-rule-card-summary {
+    div.sigma-rule-card.sigma-rule-card--inactive .sigma-rule-summary-title { color: var(--text-muted); }
+    .sigma-rule-card-header {
       display: flex; flex-wrap: nowrap; align-items: center; gap: 10px;
-      padding: 10px 14px; cursor: pointer;
-      list-style: none;
+      padding: 10px 14px;
       background: color-mix(in srgb, var(--bg-elevated) 55%, transparent);
       transition: background 0.12s ease;
     }
-    summary.sigma-rule-card-summary:hover { background: color-mix(in srgb, var(--bg-elevated) 90%, transparent); }
-    summary.sigma-rule-card-summary::-webkit-details-marker { display: none; }
-    summary.sigma-rule-card-summary::marker { content: ""; }
+    .sigma-rule-card-header:hover { background: color-mix(in srgb, var(--bg-elevated) 90%, transparent); }
+    .sigma-rule-expand {
+      display: inline-flex; align-items: center; justify-content: center;
+      margin: 0; padding: 0; border: none; background: transparent; cursor: pointer;
+      border-radius: 8px; flex-shrink: 0;
+      color: inherit;
+      font: inherit;
+    }
+    .sigma-rule-expand:focus-visible {
+      outline: 2px solid var(--accent); outline-offset: 2px;
+    }
     .sigma-rule-summary-checkbox {
       width: 1.05rem; height: 1.05rem; cursor: pointer; accent-color: var(--accent);
       flex-shrink: 0;
@@ -840,8 +904,8 @@
       color: var(--text-hint); font-size: 12px; transition: transform 0.15s ease, color 0.12s ease;
       flex-shrink: 0;
     }
-    summary.sigma-rule-card-summary:hover .sigma-rule-chevron { color: var(--link); }
-    details.sigma-rule-card[open] .sigma-rule-chevron { transform: rotate(180deg); color: var(--link); }
+    .sigma-rule-card-header:hover .sigma-rule-expand .sigma-rule-chevron { color: var(--link); }
+    div.sigma-rule-card.sigma-rule-card--open .sigma-rule-chevron { transform: rotate(180deg); color: var(--link); }
     .sigma-rule-card-body { padding: 14px 16px 16px; border-top: 1px solid var(--border); }
     .sigma-rule-title-label, .sigma-rule-yaml-label {
       display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em;
@@ -1351,7 +1415,256 @@
     .data-table .cell-actions a { color: var(--link); text-decoration: none; }
     .data-table .cell-actions a:hover { text-decoration: underline; }
     .data-table .btn-row-inspect { font-size: 12px; padding: 6px 12px; }
+    /* —— Fleet triage memory tab —— */
+    .fleet-mem-page { max-width: 1120px; margin: 0 auto; }
+    .fleet-mem-hero {
+      display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 16px 24px;
+      border-left: 4px solid var(--accent);
+      background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 8%, var(--bg-card)) 0%, var(--bg-card) 48%, var(--bg-elevated) 100%);
+      box-shadow: 0 2px 14px rgba(0, 0, 0, 0.1);
+    }
+    html[data-theme="light"] .fleet-mem-hero { box-shadow: 0 2px 12px rgba(15, 23, 42, 0.06); }
+    .fleet-mem-hero__text { flex: 1; min-width: min(100%, 280px); }
+    .fleet-mem-hero__text h2 { margin: 0 0 8px; font-size: 1.35rem; letter-spacing: -0.02em; }
+    .fleet-mem-lead { margin: 0; max-width: 56rem; line-height: 1.55; font-size: 13px; }
+    .fleet-mem-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; flex-shrink: 0; }
+    .fleet-mem-status { font-size: 12px; color: var(--text-muted); min-height: 1.25em; max-width: 36ch; }
+    .fleet-mem-card {
+      margin-bottom: 0; display: flex; flex-direction: column; gap: 0; padding: 0; overflow: hidden;
+      border-radius: 12px; border: 1px solid var(--border);
+      background: var(--bg-card);
+    }
+    .fleet-mem-card__toolbar {
+      display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+      padding: 12px 16px 12px; border-bottom: 1px solid var(--border);
+      background: color-mix(in srgb, var(--bg-elevated) 40%, transparent);
+    }
+    .fleet-mem-search-input {
+      flex: 1; min-width: min(100%, 220px); max-width: 520px;
+      padding: 8px 12px; border-radius: 8px; border: 1px solid var(--border-strong);
+      background: var(--bg-input); color: var(--text); font-size: 13px;
+    }
+    .fleet-mem-search-input::placeholder { color: var(--text-hint); }
+    .fleet-mem-search-input:focus {
+      outline: none; border-color: color-mix(in srgb, var(--accent) 55%, var(--border-strong));
+      box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 22%, transparent);
+    }
+    .fleet-mem-card__body { padding: 0 4px 14px; }
+    .fleet-mem-scroll { max-height: min(52vh, 420px); overflow: auto; margin: 12px 14px 16px; border-radius: 10px; }
+    .fleet-mem-divider {
+      height: 1px; margin: 4px 0 0; background: linear-gradient(90deg, transparent, var(--border), transparent);
+    }
+    .fleet-mem-mini-head {
+      margin: 14px 18px 8px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.07em; color: var(--text-muted);
+    }
+    .fleet-mem-mini-head--dropped { color: color-mix(in srgb, var(--danger-t) 85%, var(--text-muted)); }
+    .fleet-mem-table-wrap {
+      border: 1px solid var(--border); border-radius: 10px; overflow: hidden;
+      background: color-mix(in srgb, var(--bg-page) 55%, var(--bg-card));
+    }
+    .fleet-mem-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .fleet-mem-table th,
+    .fleet-mem-table td { text-align: left; border-bottom: 1px solid var(--table-row-b); padding: 10px 12px; vertical-align: top; }
+    .fleet-mem-table tbody tr:last-child td { border-bottom: 0; }
+    .fleet-mem-table tbody tr:hover td { background: color-mix(in srgb, var(--pill-bg) 45%, transparent); }
+    .fleet-mem-table th {
+      font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted);
+      background: var(--table-head); font-weight: 600; white-space: nowrap;
+    }
+    .fleet-mem-th-sort {
+      display: inline-flex; align-items: center; gap: 4px; margin: 0; padding: 2px 0; border: 0; background: none;
+      color: inherit; font: inherit; font-weight: 600; letter-spacing: inherit; text-transform: inherit;
+      cursor: pointer; white-space: nowrap; text-align: left; max-width: 100%;
+    }
+    .fleet-mem-th-sort:hover { color: var(--text); }
+    .fleet-mem-th-sort:focus-visible {
+      outline: 2px solid color-mix(in srgb, var(--accent) 65%, transparent); outline-offset: 2px; border-radius: 4px;
+    }
+    .fleet-mem-sort-ind { font-size: 9px; opacity: 0.9; font-weight: 700; }
+    .fleet-mem-table td.fleet-mem-col--mono code { font-size: 11px; color: var(--code-accent); word-break: break-all; }
+    .fleet-mem-reason code { font-size: 11px; white-space: pre-wrap; word-break: break-word; line-height: 1.45; }
+    .fleet-mem-det {
+      display: inline-block; font-size: 10px; font-weight: 600; font-family: ui-monospace, Menlo, monospace;
+      padding: 3px 8px; border-radius: 6px; border: 1px solid var(--border); background: var(--pill-bg); color: var(--text-muted);
+    }
+    .fleet-mem-det--ironsift-process { border-color: color-mix(in srgb, #38bdf8 45%, var(--border)); color: #7dd3fc; }
+    .fleet-mem-det--anomark-rs { border-color: color-mix(in srgb, #fb923c 50%, var(--border)); color: #fdba74; }
+    .fleet-mem-det--sigma-zero { border-color: color-mix(in srgb, #a78bfa 50%, var(--border)); color: #c4b5fd; }
+    .fleet-mem-det--ironsift-file { border-color: color-mix(in srgb, #4ade80 45%, var(--border)); color: #86efac; }
+    .fleet-mem-verdict {
+      display: inline-flex; align-items: center; padding: 3px 10px; border-radius: 999px; font-size: 11px; font-weight: 600;
+      border: 1px solid transparent; white-space: nowrap;
+    }
+    .fleet-mem-verdict--unset {
+      background: color-mix(in srgb, var(--text-hint) 16%, var(--bg-card));
+      border-color: var(--border); color: var(--text-muted);
+    }
+    .fleet-mem-verdict--fp {
+      background: color-mix(in srgb, #22c55e 14%, var(--bg-card)); border-color: color-mix(in srgb, #22c55e 42%, var(--border)); color: #86efac;
+    }
+    .fleet-mem-verdict--mal {
+      background: color-mix(in srgb, #ef4444 18%, var(--bg-card)); border-color: color-mix(in srgb, #ef4444 48%, var(--border)); color: #fca5a5;
+    }
+    html[data-theme="light"] .fleet-mem-verdict--fp { color: #166534; }
+    html[data-theme="light"] .fleet-mem-verdict--mal { color: #991b1b; }
+    .fleet-mem-action {
+      font-size: 11px; padding: 6px 12px; margin: 0; border-radius: 8px; font-weight: 500; white-space: nowrap;
+      border: 1px solid var(--border-strong); background: var(--bg-input); color: var(--text); cursor: pointer;
+      transition: background 0.12s ease, border-color 0.12s ease, filter 0.12s ease;
+    }
+    .fleet-mem-action:hover:not(:disabled) { filter: brightness(1.06); }
+    .fleet-mem-action:disabled { opacity: 0.55; cursor: not-allowed; }
+    .fleet-mem-action--danger {
+      border-color: color-mix(in srgb, var(--danger-b) 65%, var(--border));
+      background: color-mix(in srgb, var(--danger-b) 12%, var(--bg-card)); color: var(--danger-t);
+    }
+    .fleet-mem-action--warn {
+      border-color: color-mix(in srgb, #f59e0b 55%, var(--border));
+      background: color-mix(in srgb, #f59e0b 12%, var(--bg-card)); color: #fcd34d;
+    }
+    html[data-theme="light"] .fleet-mem-action--warn { color: #92400e; }
+    .fleet-mem-action--success {
+      border-color: color-mix(in srgb, #22c55e 45%, var(--border));
+      background: color-mix(in srgb, #22c55e 10%, var(--bg-card)); color: #86efac;
+    }
+    html[data-theme="light"] .fleet-mem-action--success { color: #166534; }
+    .fleet-mem-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; justify-content: flex-end; }
+    .fleet-mem-action--delete {
+      border-color: color-mix(in srgb, var(--danger-b) 45%, var(--border));
+      background: color-mix(in srgb, var(--bg-card) 92%, var(--danger-b) 8%); color: var(--text-muted);
+    }
+    .fleet-mem-action--delete:hover:not(:disabled) { color: var(--danger-t); }
+    html[data-theme="light"] .fleet-mem-action--delete { color: #57534e; }
+    html[data-theme="light"] .fleet-mem-action--delete:hover:not(:disabled) { color: #991b1b; }
+    .fleet-mem-empty { margin: 12px 18px; padding: 14px 16px; border-radius: 10px; border: 1px dashed var(--border); font-size: 13px; color: var(--text-muted); text-align: center; }
     .ds-picker-box { border: 1px solid var(--picker-border); border-radius: 8px; padding: 8px; }
+    /* —— Detection run list cards (Runs tab) —— */
+    .run-list-card {
+      position: relative;
+      margin-bottom: 14px;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: linear-gradient(165deg, color-mix(in srgb, var(--bg-card) 88%, var(--bg-elevated)) 0%, var(--bg-card) 55%, var(--bg-elevated) 100%);
+      box-shadow: 0 2px 12px rgba(0, 0, 0, 0.12);
+      overflow: hidden;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.12s ease;
+    }
+    html[data-theme="light"] .run-list-card { box-shadow: 0 2px 10px rgba(15, 23, 42, 0.06); }
+    .run-list-card:hover {
+      border-color: color-mix(in srgb, var(--link) 35%, var(--border));
+      box-shadow: 0 6px 22px rgba(0, 0, 0, 0.16);
+      transform: translateY(-1px);
+    }
+    .run-list-card::before {
+      content: "";
+      position: absolute; left: 0; top: 0; bottom: 0; width: 4px;
+      background: var(--run-accent, var(--border-strong));
+      border-radius: 14px 0 0 14px;
+    }
+    .run-list-card--max-critical { --run-accent: #b91c1c; }
+    .run-list-card--max-high { --run-accent: #dc2626; }
+    .run-list-card--max-medium { --run-accent: #f59e0b; }
+    .run-list-card--max-low { --run-accent: #16a34a; }
+    .run-list-card__inner { padding: 12px 14px 12px 16px; }
+    .run-list-card__head {
+      display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px 12px;
+      margin-bottom: 2px;
+    }
+    .run-list-card__head code {
+      font-size: 12px; font-weight: 600; color: var(--code-accent);
+      background: color-mix(in srgb, var(--bg-input) 85%, transparent);
+      padding: 2px 8px; border-radius: 6px; border: 1px solid var(--border);
+    }
+    .run-list-card__time { font-size: 11px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+    .run-list-card__summary { font-size: 14px; line-height: 1.45; margin-top: 6px; color: var(--text); font-weight: 600; }
+    .run-list-card__summary .run-list-profile { font-weight: 500; color: var(--text-muted); font-size: 12px; }
+    .run-sev-bar {
+      display: flex; height: 7px; border-radius: 99px; overflow: hidden; margin-top: 10px;
+      background: var(--bg-page); border: 1px solid var(--border);
+    }
+    .run-sev-seg { min-width: 3px; height: 100%; transition: width 0.2s ease; }
+    .run-sev-seg--critical { background: #b91c1c; }
+    .run-sev-seg--high { background: #dc2626; }
+    .run-sev-seg--medium { background: #f59e0b; }
+    .run-sev-seg--low { background: #16a34a; }
+    .run-list-kpis {
+      display: flex; flex-wrap: wrap; gap: 6px 8px; margin-top: 10px; align-items: center;
+      font-size: 11px; color: var(--text-muted);
+    }
+    .run-list-kpis .sev-badge { font-size: 10px; padding: 2px 8px; }
+    .run-list-detectors {
+      display: flex; flex-wrap: wrap; gap: 5px; margin-top: 10px; align-items: center;
+    }
+    .run-list-det-pill {
+      font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em;
+      padding: 3px 9px; border-radius: 999px; border: 1px solid var(--border);
+      font-family: ui-monospace, Menlo, monospace; color: var(--text);
+      background: var(--pill-bg);
+    }
+    .run-list-det-pill--ironsift-process { background: rgba(99, 179, 237, 0.2); border-color: rgba(99, 179, 237, 0.45); }
+    .run-list-det-pill--anomark-rs { background: rgba(245, 159, 86, 0.22); border-color: rgba(245, 159, 86, 0.45); }
+    .run-list-det-pill--sigma-zero { background: rgba(167, 139, 250, 0.22); border-color: rgba(167, 139, 250, 0.45); }
+    .run-list-det-pill--ironsift-file { background: rgba(120, 200, 130, 0.22); border-color: rgba(120, 200, 130, 0.45); }
+    .run-list-badges { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; align-items: center; }
+    .run-list-badges .pill { font-size: 11px; margin: 0; background: color-mix(in srgb, var(--bg-input) 70%, var(--bg-card)); }
+    .run-card-reasons { margin-top: 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg-elevated); overflow: hidden; }
+    .run-card-reasons > summary.run-card-reasons-sum {
+      list-style: none; cursor: pointer; display: flex; align-items: center; gap: 8px;
+      padding: 9px 11px; font-size: 12px; font-weight: 600; color: var(--link);
+      user-select: none; background: color-mix(in srgb, var(--bg-input) 55%, transparent);
+    }
+    .run-card-reasons > summary.run-card-reasons-sum::-webkit-details-marker { display: none; }
+    .run-card-reasons > summary.run-card-reasons-sum::marker { content: ""; }
+    .run-card-reasons-chev {
+      width: 1.35rem; height: 1.35rem; border-radius: 6px; border: 1px solid var(--border);
+      display: inline-flex; align-items: center; justify-content: center; font-size: 10px; flex-shrink: 0;
+      background: var(--bg-card); color: var(--link); transition: transform 0.15s ease;
+    }
+    .run-card-reasons[open] .run-card-reasons-chev { transform: rotate(90deg); }
+    .run-card-reasons-hint { font-weight: 400; font-size: 11px; }
+    .run-card-reasons-body {
+      padding: 10px 11px 12px; max-height: min(38vh, 280px); overflow: auto;
+      display: flex; flex-direction: column; gap: 12px; border-top: 1px solid var(--border);
+    }
+    .run-card-reasons-pending {
+      font-size: 12px; line-height: 1.45; margin: 0;
+      padding: 8px 10px; border-radius: 8px;
+      background: color-mix(in srgb, #f59e0b 14%, var(--bg-card));
+      border: 1px solid color-mix(in srgb, #f59e0b 38%, var(--border));
+    }
+    html[data-theme="light"] .run-card-reasons-pending {
+      background: color-mix(in srgb, #f59e0b 10%, var(--bg-card));
+    }
+    .run-card-reasons-pending__lbl { font-weight: 600; color: var(--text); margin-right: 6px; }
+    .run-card-reasons-pending__mid { font-size: 11px; margin-right: 6px; word-break: break-all; }
+    .run-reason-group {
+      border-radius: 8px; padding: 8px 10px;
+      background: color-mix(in srgb, var(--bg-card) 92%, var(--bg-page));
+      border: 1px solid var(--border);
+    }
+    .run-reason-group__label {
+      font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+      margin-bottom: 6px; color: var(--text-muted); font-family: ui-monospace, Menlo, monospace;
+    }
+    .run-reason-group--ironsift-process .run-reason-group__label { color: #7dd3fc; }
+    .run-reason-group--anomark-rs .run-reason-group__label { color: #fdba74; }
+    .run-reason-group--sigma-zero .run-reason-group__label { color: #c4b5fd; }
+    .run-reason-group--ironsift-file .run-reason-group__label { color: #86efac; }
+    .run-reason-ul { margin: 0; padding-left: 14px; font-size: 11px; line-height: 1.45; color: var(--text); }
+    .run-reason-li { margin: 3px 0; word-break: break-word; }
+    .run-list-meta { margin-top: 10px; font-size: 11px; line-height: 1.5; color: var(--text-muted); }
+    .run-list-meta .pill { font-size: 10px; margin: 1px 4px 1px 0; }
+    .run-list-detail { margin-top: 6px; font-size: 11px; line-height: 1.45; color: var(--tab-inactive-text); }
+    .run-list-card__actions {
+      display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; padding-top: 10px;
+      border-top: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
+    }
+    .run-list-card__actions .run-select-btn {
+      font-weight: 600; padding: 8px 14px; border-radius: 8px; border: 1px solid #2563eb;
+      background: linear-gradient(180deg, #2563eb, #1d4ed8); color: #eff6ff; cursor: pointer; font: inherit;
+    }
+    .run-list-card__actions .run-select-btn:hover { filter: brightness(1.08); }
+    .run-list-card__actions .run-delete-btn { margin: 0 !important; }
     @media (max-width: 560px) {
       .inspect-dl { grid-template-columns: 1fr; }
       .inspect-hero { flex-direction: column; }
@@ -1401,6 +1714,7 @@
     <button class="tab-btn" data-tab="runs" onclick="switchTab('runs', this)"><span data-i18n="tab.runs">Runs & Findings</span></button>
     <button class="tab-btn" data-tab="anomark-tab" onclick="switchTab('anomark-tab', this)"><span data-i18n="tab.anomark">AnoMark</span></button>
     <button class="tab-btn" data-tab="sigma-tab" onclick="switchTab('sigma-tab', this)"><span data-i18n="tab.sigma">Sigma</span></button>
+    <button class="tab-btn" data-tab="fleet-memory" onclick="switchTab('fleet-memory', this)"><span data-i18n="tab.fleetMemory">Fleet triage memory</span></button>
   </div>
 
   <section id="dashboard" class="tab-content active">
@@ -1450,6 +1764,7 @@
         <button onclick="switchTab('runs', document.querySelector('[data-tab=runs]'))"><span data-i18n="dash.goRuns">Go to Runs &amp; Findings (fleet view)</span></button>
         <button onclick="switchTab('anomark-tab', document.querySelector('[data-tab=anomark-tab]'))"><span data-i18n="dash.goAnomark">Go to AnoMark</span></button>
         <button onclick="switchTab('sigma-tab', document.querySelector('[data-tab=sigma-tab]'))"><span data-i18n="dash.goSigma">Go to Sigma</span></button>
+        <button onclick="switchTab('fleet-memory', document.querySelector('[data-tab=fleet-memory]'))"><span data-i18n="dash.goFleetMemory">Fleet triage memory</span></button>
       </div>
     </div>
   </section>
@@ -1702,9 +2017,37 @@
         </div>
       </div>
       <p class="muted" id="runAnomarkHint" style="font-size:12px; margin:6px 0 0; max-width: 900px;"></p>
+      <div id="runSigmaStableBlock" style="margin-top:12px;">
+        <div class="row" style="flex-wrap:wrap; align-items:flex-start; gap:12px;">
+          <span class="muted" style="font-size:12px; align-self:center; flex:0 0 auto;" data-i18n="runs.sigmaStableLbl">Sigma (stable)</span>
+          <div class="dataset-kind-seg" role="radiogroup" data-i18n-aria="runs.sigmaStableAria" aria-label="Sigma stable rules for this run" id="runSigmaStableSeg">
+            <label class="dataset-kind-seg__item" data-i18n-title="runs.sigmaStableTipOff">
+              <input type="radio" name="runSigmaStableSeg" value="off" checked />
+              <span data-i18n="runs.sigmaStableOff">Off</span>
+            </label>
+            <label class="dataset-kind-seg__item" data-i18n-title="runs.sigmaStableTipOn">
+              <input type="radio" name="runSigmaStableSeg" value="on" />
+              <span data-i18n="runs.sigmaStableOn">On</span>
+            </label>
+          </div>
+        </div>
+        <p class="muted" style="font-size:11px; margin:6px 0 0; max-width:920px; line-height:1.45;" data-i18n="runs.sigmaStableHint">When On, the run evaluates the stable rules listed below (exported process logs). Large datasets can take longer.</p>
+        <div id="runSigmaStableRulesWrap" style="margin-top:8px;">
+          <div class="muted" style="font-size:11px; margin:0 0 4px;" data-i18n="runs.sigmaStableRulesLead">Stable rules included when Sigma is On:</div>
+          <ul id="runSigmaStableRulesList" class="run-sigma-stable-rules" style="margin:0; padding-left:18px; font-size:12px; line-height:1.45; max-height:min(28vh,220px); overflow:auto;"></ul>
+        </div>
+      </div>
       <div class="row run-create-actions" style="margin-top:14px; align-items:center; gap:12px; flex-wrap:wrap;">
         <button type="button" id="runCreateSubmitBtn" class="run-create-submit" onclick="createRun()"><span data-i18n="runs.runBtn">Start detection run</span></button>
         <span id="runCreateStatus" class="run-create-status muted" role="status" aria-live="polite"></span>
+        <a id="runOpenResultsLink" class="run-open-results-link" href="#" target="_blank" rel="noopener noreferrer" data-i18n="runs.openResultsNewTab" style="display:none;">Open results in new tab</a>
+      </div>
+      <div id="runCreateProgress" class="run-create-progress" hidden role="status" aria-live="polite">
+        <div class="run-create-progress__row">
+          <span class="run-create-progress__beacon" aria-hidden="true"></span>
+          <span id="runCreateProgressText" class="run-create-progress__text"></span>
+        </div>
+        <div class="run-create-progress__bar" aria-hidden="true"><span class="run-create-progress__bar-fill"></span></div>
       </div>
       <p class="muted" data-i18n="runs.createHint">The preview lists datasets only when you use checkboxes, comma-separated ids, and/or baseline or candidate tags. It stays empty until then; starting a run with ids and tags both empty still applies to every dataset on the server. Baseline and candidate fields restrict inclusion (a dataset is included if any of its tags match a tag you list in either field). The preview updates as you type. If tag filters match nothing, the server returns 400—check spelling and Ingestion tagging. If you select more than one dataset, the same host name in two files is analyzed as two separate machines (snapshots are not merged).</p>
         </div>
@@ -1719,51 +2062,6 @@
             <button type="button" class="btn-danger" onclick="deleteAllRuns()"><span data-i18n="runs.deleteAllRuns">Delete all runs</span></button>
           </div>
           <div id="runsList"></div>
-        </div>
-      </details>
-    </div>
-    <div class="card">
-      <details class="section-collapse" id="runsFindingsSection" open>
-        <summary><span data-i18n="runs.findingsTitle">Run Findings</span> <span class="section-caret" aria-hidden="true">▼</span></summary>
-        <div class="section-body">
-      <div class="row" style="flex-wrap:wrap;align-items:center;gap:8px;">
-        <input id="runIdFindings" data-i18n-placeholder="ph.runId" placeholder="Run id" style="min-width: 320px;" />
-        <button onclick="loadFindings()"><span data-i18n="runs.loadFindings">Load findings</span></button>
-        <button type="button" id="findingsSaveTriage" style="display:none" onclick="saveFindingsTriage()"><span data-i18n="triage.save">Save triage</span></button>
-        <span id="findingsTriageStatus" class="muted" role="status" aria-live="polite" style="font-size:13px;"></span>
-      </div>
-      <div class="kpis" style="margin-top:8px;">
-        <div class="kpi"><div class="label" data-i18n="runs.kpi.critical">Critical</div><div class="value" id="rfCritical">0</div></div>
-        <div class="kpi"><div class="label" data-i18n="runs.kpi.high">High</div><div class="value" id="rfHigh">0</div></div>
-        <div class="kpi"><div class="label" data-i18n="runs.kpi.medium">Medium</div><div class="value" id="rfMedium">0</div></div>
-        <div class="kpi"><div class="label" data-i18n="runs.kpi.low">Low</div><div class="value" id="rfLow">0</div></div>
-      </div>
-      <div class="honey-ui">
-        <div class="honey-toolbar row" style="margin-top:4px;">
-          <button type="button" class="honey-zin" data-honey="findingsHoneycomb" data-i18n-title="runs.honey.zoomIn" title="Zoom in">+</button>
-          <button type="button" class="honey-zout" data-honey="findingsHoneycomb" data-i18n-title="runs.honey.zoomOut" title="Zoom out">−</button>
-          <button type="button" class="honey-zreset" data-honey="findingsHoneycomb" data-i18n-title="runs.honey.reset" title="Reset view">Reset</button>
-          <span class="muted" data-i18n="runs.honey.help">Drag to pan · wheel to zoom. Hover a hex for the host name; click for details.</span>
-        </div>
-        <div class="honey-clip" style="min-height: 200px; max-height: 320px;">
-          <svg id="findingsHoneycomb" class="honey-svg honey-svg--compact" preserveAspectRatio="xMidYMid meet"></svg>
-        </div>
-        <div id="findingsHoneyHoverHint" class="honey-hover-hint muted" aria-live="polite"></div>
-        <div id="findingsHoneyPanel" class="honey-panel" style="display:none" hidden></div>
-        <div class="legend" style="margin-top:6px">
-          <span><i style="background:#166534"></i><span data-i18n="runs.legend.clean">Clean (no finding)</span></span>
-          <span><i style="background:#16a34a"></i><span data-i18n="runs.legend.low">Low</span></span>
-          <span><i style="background:#f59e0b"></i><span data-i18n="runs.legend.medium">Medium</span></span>
-          <span><i style="background:#dc2626"></i><span data-i18n="runs.legend.high">High</span></span>
-          <span><i style="background:#b91c1c"></i><span data-i18n="runs.legend.critical">Critical</span></span>
-        </div>
-      </div>
-      <div id="findingsTable" style="margin-top:8px;"></div>
-      <div id="findingsError" class="findings-error-banner" style="display:none;" role="alert" aria-live="polite"></div>
-      <details id="findingsRawWrap" class="findings-raw-details">
-        <summary><span data-i18n="findings.toggleRaw">Raw JSON (advanced)</span></summary>
-        <pre id="findings" class="findings-raw-pre"></pre>
-      </details>
         </div>
       </details>
     </div>
@@ -1897,6 +2195,41 @@
     </div>
   </section>
 
+  <section id="fleet-memory" class="tab-content fleet-mem-page">
+    <header class="card fleet-mem-hero">
+      <div class="fleet-mem-hero__text">
+        <h2 data-i18n="fleet.title">Fleet triage memory</h2>
+        <p class="fleet-mem-lead muted" data-i18n="fleet.intro"></p>
+      </div>
+      <div class="fleet-mem-toolbar">
+        <button type="button" class="btn-inspect" onclick="loadFleetMemoryWorkbenchAll()"><span data-i18n="fleet.refresh">Refresh</span></button>
+        <span id="fleetMemWbStatus" class="fleet-mem-status" role="status" aria-live="polite"></span>
+      </div>
+    </header>
+    <section class="card fleet-mem-card" data-i18n-aria="fleet.cardRegionAria">
+        <div class="fleet-mem-card__toolbar">
+          <input
+            type="search"
+            id="fleetMemSearchInput"
+            class="fleet-mem-search-input"
+            autocomplete="off"
+            data-i18n-placeholder="fleet.searchPlaceholder"
+            placeholder="Search detector, reason, verdict, source…"
+          />
+        </div>
+        <div class="fleet-mem-card__body">
+          <div class="fleet-mem-scroll">
+            <div id="wbFleetMemGlobalActive"></div>
+          </div>
+          <div class="fleet-mem-divider"></div>
+          <h4 class="fleet-mem-mini-head fleet-mem-mini-head--dropped" data-i18n="fleet.droppedTitle">Dropped (excluded)</h4>
+          <div class="fleet-mem-scroll">
+            <div id="wbFleetMemGlobalDropped"></div>
+          </div>
+        </div>
+      </section>
+  </section>
+
   <section id="sigma-tab" class="tab-content">
     <div class="card">
       <h2 data-i18n="sigma.title">Sigma (sigmazero)</h2>
@@ -2025,6 +2358,7 @@
         "tab.runs": "Runs & Findings",
         "tab.anomark": "AnoMark",
         "tab.sigma": "Sigma",
+        "tab.fleetMemory": "Fleet triage memory",
         "dash.overview": "Overview",
         "dash.quickActions": "Quick Actions",
         "dash.kpi.datasets": "Datasets",
@@ -2034,6 +2368,31 @@
         "dash.goRuns": "Go to Runs & Findings (fleet view)",
         "dash.goAnomark": "Go to AnoMark",
         "dash.goSigma": "Go to Sigma",
+        "dash.goFleetMemory": "Fleet triage memory",
+        "fleet.title": "Fleet triage memory",
+        "fleet.intro": "Manage the fleet-wide store of analyst verdicts for each (detector, reason) pair. These entries persist even if you delete every saved run, and control how unset triage slots are filled on new detection runs. Per-run suppress/allow is done from each run’s findings view.",
+        "fleet.refresh": "Refresh",
+        "fleet.cardRegionAria": "Fleet memory entries and dropped pairs",
+        "fleet.searchPlaceholder": "Search detector, reason, verdict, source run, host…",
+        "fleet.searchNoMatch": "No entries match your search.",
+        "fleet.sortByColumn": "Sort by this column",
+        "fleet.droppedTitle": "Dropped (excluded from merge)",
+        "fleet.none": "None.",
+        "fleet.statusUpdated": "Updated.",
+        "fleet.verdictFp": "False positive",
+        "fleet.verdictMal": "Malicious",
+        "fleet.verdictUnset": "Unset",
+        "fleet.btnDropGlobal": "Drop from fleet memory",
+        "fleet.btnDeleteEntry": "Delete entry",
+        "fleet.deleteConfirm": "Permanently remove this (detector, reason) from fleet memory? It can reappear if you save triage for it again on a run.",
+        "fleet.btnRestore": "Restore",
+        "fleet.colDetector": "Detector",
+        "fleet.colReason": "Reason",
+        "fleet.colVerdict": "Verdict",
+        "fleet.colSourceRun": "Source run",
+        "fleet.colReviewed": "Reviewed",
+        "fleet.colSourceHost": "Source host",
+        "fleet.colAction": "Action",
         "dash.intro": "IronSift ingests host telemetry (process and/or file inventory), runs fleet clustering and optional AnoMark scoring, and surfaces findings on a honeycomb. Use the tabs above for each phase.",
         "dash.workflow": "Typical workflow",
         "dash.step1": "Import CSV / JSON / JSONL under Ingestion and confirm rows in Inspect.",
@@ -2131,8 +2490,10 @@
         "ph.candidateTags": "candidate tags",
         "runs.runBtn": "Start detection run",
         "runs.runProgress": "Running detection…",
+        "runs.runProgressDetail": "The server is running fleet detection (and optional AnoMark / Sigma) on your selection. Large datasets or broad tag filters can take several minutes — you can keep working in other tabs.",
+        "runs.openResultsNewTab": "Open results in new tab",
         "global.runBusy": "Detection run in progress — the server is analyzing your datasets. Large fleets can take several minutes; keep this tab open.",
-        "global.runOk": "Detection finished (run %id). Use “Load findings” below to refresh results.",
+        "global.runOk": "Detection finished — run %id. A results tab should open automatically; use the “Open results in new tab” link if it did not.",
         "global.runErr": "Detection run failed — see the alert or the Runs tab.",
         "global.findingsBusy": "Loading findings and fleet honeycomb for this run…",
         "global.findingsOk": "Findings loaded: %n row(s).",
@@ -2149,16 +2510,58 @@
         "global.anomarkScoreBusy": "Scoring command with AnoMark…",
         "global.anomarkScoreOk": "AnoMark quick score finished — see results in the panel.",
         "global.anomarkScoreErr": "AnoMark scoring failed.",
-        "runs.runSuccess": "Done. Run id %id — results are loaded below in Run Findings.",
+        "runs.runSuccess": "Done. Run id %id.",
         "runs.runFailedBrief": "Run failed.",
         "runs.runNoId": "Could not read run id from the response. Try Refresh runs.",
         "runs.anomarkChk": "Include AnoMark (command-line Markov) on process data",
+        "runs.sigmaStableLbl": "Sigma (stable)",
+        "runs.sigmaStableAria": "Sigma stable rules for this run",
+        "runs.sigmaStableOff": "Off",
+        "runs.sigmaStableOn": "On",
+        "runs.sigmaStableTipOff": "Do not run Sigma on this detection",
+        "runs.sigmaStableTipOn": "Run Sigma (stable rules only) after fleet engines",
+        "runs.sigmaStableHint": "When On, the run evaluates the stable rules listed below (exported process logs). Large datasets can take longer.",
+        "runs.sigmaStableRulesLead": "Stable rules included when Sigma is On:",
+        "runs.sigmaNoStableRules": "No stable rules are enabled for checks — add or enable rules on the Sigma tab, or Sigma will stay unavailable.",
+        "runs.sigmaRulesLoadErr": "Could not load stable rules list.",
+        "runs.sigmaRulesLoading": "Loading stable rules…",
+        "runs.sigmaRunBadge": "Sigma",
+        "runs.sigmaRunBadgeTitle": "Sigma (stable rules) ran on this detection",
         "runs.anomarkSuspectPctLbl": "AnoMark sensitivity (%)",
         "runs.anomarkSuspectPctHint": "Lower values flag more commands as suspicious (55–99.999). Same scale as AnoMark quick test.",
         "runs.anomarkSuspectRunBadge": "AnoMark suspect %s%",
         "runs.anomarkSuspectRunBadgeTitle": "Suspect threshold (% of ln prior) used for AnoMark in this run",
         "runs.savedOptionsSummary": "Saved run options",
         "runs.savedOptionsLegacy": "No option snapshot for this run (saved with an older build). Badges above still show engines, scope, and AnoMark threshold when present.",
+        "runs.runListHosts": "%n host(s) with findings",
+        "runs.runListNoFindings": "No findings rows on this run record.",
+        "runs.runListKpiCr": "%n critical",
+        "runs.runListKpiHi": "%n high",
+        "runs.runListKpiMd": "%n medium",
+        "runs.runListKpiLo": "%n low",
+        "runs.runListBadgeScope": "Scope: %s",
+        "runs.runListBadgeEngines": "Engines: %s",
+        "runs.runListBadgeAno": "AnoMark: %s",
+        "runs.runListBadgeSigma": "Sigma: %s",
+        "runs.runListOn": "On",
+        "runs.runListOff": "Off",
+        "runs.runListUnknown": "—",
+        "runs.runListSigmaStats": "Sigma stats: %m match group(s) · %r rules · %l JSONL lines · %ms ms eval",
+        "runs.runListTriage": "Triage: saved for %n host(s)",
+        "runs.runListBaselineLbl": "Baseline tags:",
+        "runs.runListCandidateLbl": "Candidate tags:",
+        "runs.runListDatasetLbl": "Dataset ids:",
+        "runs.runListDatasetCount": "%n dataset(s) in this run",
+        "runs.runListReasonsSummary": "Sample detection reasons",
+        "runs.runListReasonsHint": "by detector · capped in list",
+        "runs.runListPendingReviewLead": "Hosts awaiting triage:",
+        "runs.runListPendingReviewMore": "+%n more",
+        "runs.runReasonDetProcess": "Process",
+        "runs.runReasonDetAnomark": "AnoMark",
+        "runs.runReasonDetSigma": "Sigma",
+        "runs.runReasonDetFile": "File",
+        "runs.runReasonDetOther": "Other",
+        "runs.runReasonDetFmt": "%s",
         "runs.model": "Model",
         "runs.inspectModel": "Inspect model",
         "runs.createHint": "The preview lists datasets only when you use checkboxes, comma-separated ids, and/or baseline or candidate tags. It stays empty until then; starting a run with ids and tags both empty still applies to every dataset on the server. Baseline and candidate fields restrict inclusion (a dataset is included if any of its tags match a tag you list in either field). The preview updates as you type. If tag filters match nothing, the server returns 400—check spelling and Ingestion tagging. If you select more than one dataset, the same host name in two files is analyzed as two separate machines (snapshots are not merged).",
@@ -2327,6 +2730,8 @@
         "sigma.ruleDemo": "Load demo rules (process + file)",
         "sigma.ruleLabel": "Label (optional)",
         "sigma.ruleRemove": "Remove",
+        "sigma.ruleExpandCard": "Expand rule editor",
+        "sigma.ruleCollapseCard": "Collapse rule editor",
         "sigma.ruleIdLabel": "Rule id:",
         "sigma.ruleUntitled": "(untitled rule)",
         "sigma.ruleLevelUnknown": "no level",
@@ -2526,6 +2931,7 @@
         "tab.runs": "Exécutions & résultats",
         "tab.anomark": "AnoMark",
         "tab.sigma": "Sigma",
+        "tab.fleetMemory": "Mémoire triage flotte",
         "dash.overview": "Vue d’ensemble",
         "dash.quickActions": "Actions rapides",
         "dash.kpi.datasets": "Jeux de données",
@@ -2535,6 +2941,31 @@
         "dash.goRuns": "Aller aux exécutions (vue flotte)",
         "dash.goAnomark": "Aller à AnoMark",
         "dash.goSigma": "Aller à Sigma",
+        "dash.goFleetMemory": "Mémoire triage flotte",
+        "fleet.title": "Mémoire triage flotte",
+        "fleet.intro": "Gérez le stockage global des verdicts analyste pour chaque paire (détecteur, raison). Ces entrées survivent à la suppression de toutes les exécutions et pilotent le préremplissage des champs de triage encore non décidés sur les nouvelles détections. Le blocage ou la réactivation par exécution se fait depuis la page de résultats de chaque exécution.",
+        "fleet.refresh": "Actualiser",
+        "fleet.cardRegionAria": "Entrées mémoire flotte et paires retirées",
+        "fleet.searchPlaceholder": "Rechercher détecteur, raison, verdict, exécution source, hôte…",
+        "fleet.searchNoMatch": "Aucune entrée ne correspond à la recherche.",
+        "fleet.sortByColumn": "Trier par cette colonne",
+        "fleet.droppedTitle": "Retirées (exclues de la fusion)",
+        "fleet.none": "Aucune.",
+        "fleet.statusUpdated": "Mis à jour.",
+        "fleet.verdictFp": "Faux positif",
+        "fleet.verdictMal": "Malveillant",
+        "fleet.verdictUnset": "Non défini",
+        "fleet.btnDropGlobal": "Retirer de la mémoire flotte",
+        "fleet.btnDeleteEntry": "Supprimer l’entrée",
+        "fleet.deleteConfirm": "Supprimer définitivement cette paire (détecteur, raison) de la mémoire flotte ? Elle peut réapparaître si vous enregistrez à nouveau le triage sur une exécution.",
+        "fleet.btnRestore": "Restaurer",
+        "fleet.colDetector": "Détecteur",
+        "fleet.colReason": "Raison",
+        "fleet.colVerdict": "Verdict",
+        "fleet.colSourceRun": "Exécution source",
+        "fleet.colReviewed": "Revu",
+        "fleet.colSourceHost": "Hôte source",
+        "fleet.colAction": "Action",
         "dash.intro": "IronSift ingère la télémétrie des hôtes (processus et/ou inventaire fichiers), exécute le clustering de flotte et AnoMark en option, et affiche les résultats en nid d’abeille. Utilisez les onglets pour chaque étape.",
         "dash.workflow": "Parcours type",
         "dash.step1": "Importer CSV / JSON / JSONL dans Ingestion et vérifier les lignes dans Inspect.",
@@ -2632,8 +3063,10 @@
         "ph.candidateTags": "étiquettes candidat",
         "runs.runBtn": "Lancer la détection",
         "runs.runProgress": "Exécution en cours…",
+        "runs.runProgressDetail": "Le serveur exécute la détection flotte (AnoMark / Sigma en option) sur votre sélection. Les gros jeux ou filtres larges peuvent prendre plusieurs minutes — vous pouvez continuer dans d’autres onglets.",
+        "runs.openResultsNewTab": "Ouvrir les résultats dans un nouvel onglet",
         "global.runBusy": "Détection en cours — le serveur analyse vos jeux de données. Les grosses flottes peuvent prendre plusieurs minutes ; gardez cet onglet ouvert.",
-        "global.runOk": "Détection terminée (exécution %id). Chargez les résultats ci‑dessous avec « Charger les résultats ».",
+        "global.runOk": "Détection terminée — exécution %id. Un onglet de résultats devrait s’ouvrir ; sinon utilisez le lien « Ouvrir les résultats dans un nouvel onglet ».",
         "global.runErr": "Échec de la détection — voir l’alerte ou l’onglet Exécutions.",
         "global.findingsBusy": "Chargement des résultats et du honeycomb pour cette exécution…",
         "global.findingsOk": "Résultats chargés : %n ligne(s).",
@@ -2650,16 +3083,58 @@
         "global.anomarkScoreBusy": "Notation de la commande avec AnoMark…",
         "global.anomarkScoreOk": "Test rapide AnoMark terminé — voir le panneau des résultats.",
         "global.anomarkScoreErr": "Échec de la notation AnoMark.",
-        "runs.runSuccess": "Terminé. Id %id — résultats chargés ci-dessous (Résultats d’exécution).",
+        "runs.runSuccess": "Terminé. Id %id.",
         "runs.runFailedBrief": "Échec de l’exécution.",
         "runs.runNoId": "Impossible de lire l’id d’exécution. Actualisez la liste des exécutions.",
         "runs.anomarkChk": "Inclure AnoMark (Markov sur ligne de commande) sur les processus",
+        "runs.sigmaStableLbl": "Sigma (stable)",
+        "runs.sigmaStableAria": "Règles Sigma stables pour cette exécution",
+        "runs.sigmaStableOff": "Désactivé",
+        "runs.sigmaStableOn": "Activé",
+        "runs.sigmaStableTipOff": "Ne pas exécuter Sigma sur cette détection",
+        "runs.sigmaStableTipOn": "Exécuter Sigma (règles stables uniquement) après les moteurs fleet",
+        "runs.sigmaStableHint": "Si activé, l’exécution évalue les règles stables listées ci-dessous (export des journaux processus). Les gros jeux peuvent prendre plus de temps.",
+        "runs.sigmaStableRulesLead": "Règles stables incluses lorsque Sigma est activé :",
+        "runs.sigmaNoStableRules": "Aucune règle stable n’est activée pour les contrôles — ajoutez ou activez des règles dans l’onglet Sigma.",
+        "runs.sigmaRulesLoadErr": "Impossible de charger la liste des règles stables.",
+        "runs.sigmaRulesLoading": "Chargement des règles stables…",
+        "runs.sigmaRunBadge": "Sigma",
+        "runs.sigmaRunBadgeTitle": "Sigma (règles stables) exécuté sur cette détection",
         "runs.anomarkSuspectPctLbl": "Sensibilité AnoMark (%)",
         "runs.anomarkSuspectPctHint": "Une valeur plus basse marque davantage de commandes comme suspectes (55–99.999). Même échelle que le test rapide.",
         "runs.anomarkSuspectRunBadge": "AnoMark suspect %s%",
         "runs.anomarkSuspectRunBadgeTitle": "Seuil suspect (% du ln prior) AnoMark pour cette exécution",
         "runs.savedOptionsSummary": "Options d’exécution enregistrées",
         "runs.savedOptionsLegacy": "Aucun instantané des options pour cette exécution (version plus ancienne). Les badges ci-dessus indiquent tout de même moteurs, périmètre et seuil AnoMark le cas échéant.",
+        "runs.runListHosts": "%n hôte(s) avec résultats",
+        "runs.runListNoFindings": "Aucune ligne de résultat sur cette exécution.",
+        "runs.runListKpiCr": "%n critique(s)",
+        "runs.runListKpiHi": "%n haute(s)",
+        "runs.runListKpiMd": "%n moyenne(s)",
+        "runs.runListKpiLo": "%n basse(s)",
+        "runs.runListBadgeScope": "Périmètre : %s",
+        "runs.runListBadgeEngines": "Moteurs : %s",
+        "runs.runListBadgeAno": "AnoMark : %s",
+        "runs.runListBadgeSigma": "Sigma : %s",
+        "runs.runListOn": "Activé",
+        "runs.runListOff": "Désactivé",
+        "runs.runListUnknown": "—",
+        "runs.runListSigmaStats": "Sigma : %m groupe(s) de correspondances · %r règles · %l lignes JSONL · %ms ms d’éval.",
+        "runs.runListTriage": "Triage : %n hôte(s) enregistré(s)",
+        "runs.runListBaselineLbl": "Étiquettes référence :",
+        "runs.runListCandidateLbl": "Étiquettes candidat :",
+        "runs.runListDatasetLbl": "Ids de jeux :",
+        "runs.runListDatasetCount": "%n jeu(x) dans cette exécution",
+        "runs.runListReasonsSummary": "Exemple de raisons de détection",
+        "runs.runListReasonsHint": "par détecteur · tronqué dans la liste",
+        "runs.runListPendingReviewLead": "Hôtes en attente de triage :",
+        "runs.runListPendingReviewMore": "+%n autres",
+        "runs.runReasonDetProcess": "Process",
+        "runs.runReasonDetAnomark": "AnoMark",
+        "runs.runReasonDetSigma": "Sigma",
+        "runs.runReasonDetFile": "Fichier",
+        "runs.runReasonDetOther": "Autre",
+        "runs.runReasonDetFmt": "%s",
         "runs.model": "Modèle",
         "runs.inspectModel": "Inspecter le modèle",
         "runs.createHint": "L’aperçu ne liste des jeux que si vous cochez des lignes, saisissez des ids séparés par des virgules et/ou des étiquettes référence ou candidat. Il reste vide tant que ce n’est pas le cas ; lancer une exécution sans ids ni étiquettes s’applique tout de même à tous les jeux côté serveur. Les champs référence et candidat restreignent l’inclusion (un jeu est inclus si une de ses étiquettes correspond). L’aperçu se met à jour pendant la saisie. Si les filtres d’étiquettes ne correspondent à rien, erreur 400 — vérifiez l’orthographe et l’étiquetage à l’import. Avec plusieurs jeux, le même nom d’hôte dans deux fichiers est analysé comme deux machines distinctes (pas de fusion des instantanés).",
@@ -2828,6 +3303,8 @@
         "sigma.ruleDemo": "Charger les démos (processus + fichier)",
         "sigma.ruleLabel": "Libellé (optionnel)",
         "sigma.ruleRemove": "Supprimer",
+        "sigma.ruleExpandCard": "Développer l’éditeur de règle",
+        "sigma.ruleCollapseCard": "Replier l’éditeur de règle",
         "sigma.ruleIdLabel": "Identifiant :",
         "sigma.ruleUntitled": "(règle sans titre)",
         "sigma.ruleLevelUnknown": "sans niveau",
@@ -3027,6 +3504,7 @@
         "tab.runs": "运行与结果",
         "tab.anomark": "AnoMark",
         "tab.sigma": "Sigma",
+        "tab.fleetMemory": "研判记忆（机队）",
         "dash.overview": "概览",
         "dash.quickActions": "快捷操作",
         "dash.kpi.datasets": "数据集",
@@ -3036,6 +3514,31 @@
         "dash.goRuns": "前往运行（机队视图）",
         "dash.goAnomark": "前往 AnoMark",
         "dash.goSigma": "前往 Sigma",
+        "dash.goFleetMemory": "机队研判记忆",
+        "fleet.title": "机队研判记忆",
+        "fleet.intro": "管理「检测器 + 原因」条目的机队级研判记忆。这些记录不会因删除全部运行而消失，并会在新的检测运行中自动填入仍为「未设置」的研判位。若需按某次运行屏蔽或恢复先例，请在该运行的结果页操作。",
+        "fleet.refresh": "刷新",
+        "fleet.cardRegionAria": "机队记忆条目与已移除项",
+        "fleet.searchPlaceholder": "搜索检测器、原因、结论、来源运行、主机…",
+        "fleet.searchNoMatch": "没有与搜索匹配的条目。",
+        "fleet.sortByColumn": "按此列排序",
+        "fleet.droppedTitle": "已移除（不参与合并）",
+        "fleet.none": "无。",
+        "fleet.statusUpdated": "已更新。",
+        "fleet.verdictFp": "误报",
+        "fleet.verdictMal": "恶意",
+        "fleet.verdictUnset": "未设置",
+        "fleet.btnDropGlobal": "从机队记忆中移除",
+        "fleet.btnDeleteEntry": "删除条目",
+        "fleet.deleteConfirm": "从机队记忆中永久删除此（检测器，原因）对吗？若之后在某次运行中再次保存该条的研判，它仍可能重新出现。",
+        "fleet.btnRestore": "恢复",
+        "fleet.colDetector": "检测器",
+        "fleet.colReason": "原因",
+        "fleet.colVerdict": "结论",
+        "fleet.colSourceRun": "来源运行",
+        "fleet.colReviewed": "审阅时间",
+        "fleet.colSourceHost": "来源主机",
+        "fleet.colAction": "操作",
         "dash.intro": "IronSift 导入主机遥测（进程与/或文件清单），运行机队聚类与可选的 AnoMark 打分，并在蜂窝图上展示结果。请按上方标签分阶段操作。",
         "dash.workflow": "典型流程",
         "dash.step1": "在「导入」页导入 CSV / JSON / JSONL，并在检查面板确认行数据。",
@@ -3133,8 +3636,10 @@
         "ph.candidateTags": "候选标签",
         "runs.runBtn": "开始检测运行",
         "runs.runProgress": "正在运行检测…",
+        "runs.runProgressDetail": "服务器正在对所选数据集执行机群检测（可选 AnoMark / Sigma）。数据量大或筛选范围宽时可能需数分钟，您可切换到其他标签页继续操作。",
+        "runs.openResultsNewTab": "在新标签页打开结果",
         "global.runBusy": "检测运行进行中 — 服务器正在分析数据集。大型机群可能需要数分钟，请保持此标签页打开。",
-        "global.runOk": "检测完成（运行 %id）。请在下方使用「加载结果」刷新发现项。",
+        "global.runOk": "检测完成 — 运行 %id。应已自动打开结果标签页；若未打开，请点击「在新标签页打开结果」。",
         "global.runErr": "检测运行失败 — 请查看提示或「运行」标签页。",
         "global.findingsBusy": "正在加载此运行的结果与机群蜂窝图…",
         "global.findingsOk": "已加载结果：%n 条。",
@@ -3151,16 +3656,58 @@
         "global.anomarkScoreBusy": "正在使用 AnoMark 对命令打分…",
         "global.anomarkScoreOk": "AnoMark 快速测试完成 — 请查看面板结果。",
         "global.anomarkScoreErr": "AnoMark 打分失败。",
-        "runs.runSuccess": "已完成。运行 id %id — 结果已加载至下方「运行结果」。",
+        "runs.runSuccess": "已完成。运行 id %id。",
         "runs.runFailedBrief": "运行失败。",
         "runs.runNoId": "无法从响应读取运行 id。请刷新运行列表。",
         "runs.anomarkChk": "在进程数据上包含 AnoMark（命令行 Markov）",
+        "runs.sigmaStableLbl": "Sigma（稳定）",
+        "runs.sigmaStableAria": "本次检测是否运行 Sigma 稳定规则",
+        "runs.sigmaStableOff": "关",
+        "runs.sigmaStableOn": "开",
+        "runs.sigmaStableTipOff": "本次检测不运行 Sigma",
+        "runs.sigmaStableTipOn": "在 fleet 引擎之后运行 Sigma（仅稳定规则）",
+        "runs.sigmaStableHint": "开启时，会按下列稳定规则评估已导出的进程日志；数据量大时耗时会增加。",
+        "runs.sigmaStableRulesLead": "Sigma 开启时将包含的稳定规则：",
+        "runs.sigmaNoStableRules": "没有已启用用于检查的稳定规则 — 请在 Sigma 标签页添加或启用规则。",
+        "runs.sigmaRulesLoadErr": "无法加载稳定规则列表。",
+        "runs.sigmaRulesLoading": "正在加载稳定规则…",
+        "runs.sigmaRunBadge": "Sigma",
+        "runs.sigmaRunBadgeTitle": "此次检测运行了 Sigma（稳定规则）",
         "runs.anomarkSuspectPctLbl": "AnoMark 灵敏度 (%)",
         "runs.anomarkSuspectPctHint": "数值越低，越多命令会被判为可疑（55–99.999）。与快速测试使用同一尺度。",
         "runs.anomarkSuspectRunBadge": "AnoMark 可疑阈值 %s%",
         "runs.anomarkSuspectRunBadgeTitle": "本次运行 AnoMark 使用的可疑阈值（相对 ln prior 的百分比）",
         "runs.savedOptionsSummary": "已保存的运行选项",
         "runs.savedOptionsLegacy": "此运行没有保存的选项快照（旧版本保存）。上方徽章仍会显示引擎、范围及 AnoMark 阈值（若有）。",
+        "runs.runListHosts": "%n 台主机有结果",
+        "runs.runListNoFindings": "此运行记录上没有结果行。",
+        "runs.runListKpiCr": "%n 严重",
+        "runs.runListKpiHi": "%n 高",
+        "runs.runListKpiMd": "%n 中",
+        "runs.runListKpiLo": "%n 低",
+        "runs.runListBadgeScope": "范围：%s",
+        "runs.runListBadgeEngines": "引擎：%s",
+        "runs.runListBadgeAno": "AnoMark：%s",
+        "runs.runListBadgeSigma": "Sigma：%s",
+        "runs.runListOn": "开",
+        "runs.runListOff": "关",
+        "runs.runListUnknown": "—",
+        "runs.runListSigmaStats": "Sigma：%m 个规则命中分组 · %r 条规则 · %l 行 JSONL · 评估 %ms ms",
+        "runs.runListTriage": "研判：已为 %n 台主机保存",
+        "runs.runListBaselineLbl": "基线标签：",
+        "runs.runListCandidateLbl": "候选标签：",
+        "runs.runListDatasetLbl": "数据集 id：",
+        "runs.runListDatasetCount": "本运行包含 %n 个数据集",
+        "runs.runListReasonsSummary": "检测原因示例",
+        "runs.runListReasonsHint": "按检测器分组 · 列表中已截断",
+        "runs.runListPendingReviewLead": "尚待研判的主机：",
+        "runs.runListPendingReviewMore": "其余 %n 台",
+        "runs.runReasonDetProcess": "进程",
+        "runs.runReasonDetAnomark": "AnoMark",
+        "runs.runReasonDetSigma": "Sigma",
+        "runs.runReasonDetFile": "文件",
+        "runs.runReasonDetOther": "其他",
+        "runs.runReasonDetFmt": "%s",
         "runs.model": "模型",
         "runs.inspectModel": "检查模型",
         "runs.createHint": "仅当您勾选行、填写逗号分隔的数据集 id 和/或基线、候选标签时，预览才会列出数据集；在此之前预览为空。若 id 与标签都留空仍点击开始，服务器端仍会针对全部数据集执行。基线与候选字段用于限制范围（若数据集任一标签与任一字段中的标签匹配则包含）。预览会随输入更新。若标签条件无匹配，服务器返回 400——请检查拼写及导入时的标签。若选择多个数据集，不同文件中的相同主机名会作为两台独立主机分析（不会合并快照）。",
@@ -3329,6 +3876,8 @@
         "sigma.ruleDemo": "加载演示规则（进程 + 文件）",
         "sigma.ruleLabel": "标签（可选）",
         "sigma.ruleRemove": "删除",
+        "sigma.ruleExpandCard": "展开规则编辑器",
+        "sigma.ruleCollapseCard": "收起规则编辑器",
         "sigma.ruleIdLabel": "规则 ID：",
         "sigma.ruleUntitled": "（无标题规则）",
         "sigma.ruleLevelUnknown": "未设级别",
@@ -3596,8 +4145,10 @@
       if (typeof loadRunAnomarkAvailability === "function") loadRunAnomarkAvailability();
       if (typeof loadAnomarkTrainings === "function") loadAnomarkTrainings();
       if (typeof loadRuns === "function") loadRuns();
-      const rid = document.getElementById("runIdFindings") && document.getElementById("runIdFindings").value.trim();
-      if (rid && typeof loadFindings === "function") loadFindings();
+      const fleetMem = document.getElementById("fleet-memory");
+      if (fleetMem && fleetMem.classList.contains("active") && typeof loadFleetMemoryWorkbenchAll === "function") {
+        void loadFleetMemoryWorkbenchAll();
+      }
     }
 
     function paintDashboardLivePlaceholders() {
@@ -3746,6 +4297,9 @@
       if (tabId === "dashboard" && typeof refreshDashboardSnapshot === "function") {
         refreshDashboardSnapshot();
       }
+      if (tabId === "fleet-memory" && typeof loadFleetMemoryWorkbenchPage === "function") {
+        void loadFleetMemoryWorkbenchPage();
+      }
     }
 
     /** AnoMark scores process data inside detection runs; jump user to Create run with AnoMark enabled. */
@@ -3766,121 +4320,6 @@
       }
     }
 
-    function severityColor(v) {
-      if (v >= 0.9) return "#b91c1c";
-      if (v >= 0.7) return "#dc2626";
-      if (v >= 0.4) return "#f59e0b";
-      return "#16a34a";
-    }
-
-    function cellFill(c) {
-      if (c && c.infected === false) return "#166534";
-      return severityColor(Number(c && c.value != null ? c.value : 0));
-    }
-
-    const HONEY_HINTS = { findingsHoneycomb: "findingsHoneyHoverHint" };
-    function honeyGetHintEl(svg) {
-      const i = HONEY_HINTS[svg && svg.id];
-      return i ? document.getElementById(i) : null;
-    }
-
-    /** One line for the hover strip + SVG &lt;title&gt; (native tooltip on pause). */
-    function honeyDatasetTagsPlain(tags) {
-      if (!tags || !tags.length) return "";
-      const short =
-        tags.length > 4 ? tags.slice(0, 4).join(", ") + "…" : tags.map(String).join(", ");
-      return short;
-    }
-
-    function honeyDatasetTagsPanelHtml(tags) {
-      if (!tags || !tags.length) return "";
-      const pills = tags.map((tag) => `<span class="pill">${escHtml(String(tag))}</span>`).join(" ");
-      return `<p class="muted" style="margin:8px 0 0; font-size:12px;"><span style="margin-right:6px;">${escHtml(t("findings.datasetTagsLbl"))}:</span>${pills}</p>`;
-    }
-
-    function findingsDatasetTagsHtml(tags) {
-      if (!tags || !tags.length) return "";
-      const pills = tags.map((tag) => `<span class="pill">${escHtml(String(tag))}</span>`).join(" ");
-      return `<div class="findings-dataset-tags" style="margin-top:6px;line-height:1.45;">${pills}</div>`;
-    }
-
-    /** Resolve `dataset_id/host` vs single-dataset unprefixed ids for opening dataset inspect. */
-    function parseFindingMachineInspect(machineId, runDatasetIds) {
-      const mid = String(machineId || "").trim();
-      const ids = Array.isArray(runDatasetIds) ? runDatasetIds : [];
-      if (!mid) return { datasetId: null, machineFilter: "" };
-      const slash = mid.indexOf("/");
-      if (slash > 0) {
-        const prefix = mid.slice(0, slash);
-        const rest = mid.slice(slash + 1);
-        if (ids.includes(prefix)) {
-          return { datasetId: prefix, machineFilter: rest };
-        }
-      }
-      if (ids.length === 1) {
-        return { datasetId: ids[0], machineFilter: mid };
-      }
-      return { datasetId: null, machineFilter: mid };
-    }
-
-    /** Relative query string so new-tab navigation stays on the same path (avoids broken absolute URLs). */
-    function findingsInspectUrl(datasetId, machineFilter) {
-      const u = new URLSearchParams();
-      u.set("tab", "ingestion");
-      if (datasetId) u.set("inspect", datasetId);
-      const mf = machineFilter != null ? String(machineFilter).trim() : "";
-      if (mf) u.set("machine", mf);
-      return "?" + u.toString();
-    }
-
-    function findingsMachineCellHtml(f, runDatasetIds) {
-      const mid = String(f.machine_id || "");
-      const insp = parseFindingMachineInspect(mid, runDatasetIds);
-      const code = `<code class="findings-machine">${escHtml(mid)}</code>`;
-      if (!insp.datasetId) {
-        return `${code}${findingsDatasetTagsHtml(f.dataset_tags)}`;
-      }
-      const href = findingsInspectUrl(insp.datasetId, insp.machineFilter);
-      const hint = escHtml(t("findings.openInspectHint"));
-      return `<a href="${href}" target="_blank" rel="noopener noreferrer" class="findings-machine-link" title="${hint}">${code}</a>${findingsDatasetTagsHtml(f.dataset_tags)}`;
-    }
-
-    function honeyStatusLine(c) {
-      if (!c) return "";
-      const name = c.name != null && c.name !== "" ? String(c.name) : "(unknown host)";
-      const tagBit = honeyDatasetTagsPlain(c.dataset_tags);
-      if (c.infected === false) {
-        return name + " — clean (no finding)" + (tagBit ? " · " + tagBit : "");
-      }
-      const sev = (c.severity || "").toUpperCase();
-      const v = c.value != null ? Number(c.value) : 0;
-      let line = `${name} — ${sev || "UNKNOWN"} (score ${v.toFixed(2)}). Click for full details.`;
-      if (tagBit) line += " Tags: " + tagBit;
-      return line;
-    }
-
-    const honeyView = {};
-
-    function hexPoints(cx, cy, r) {
-      const pts = [];
-      for (let i = 0; i < 6; i++) {
-        const a = (Math.PI / 180) * (60 * i - 30);
-        pts.push(`${(cx + r * Math.cos(a)).toFixed(2)},${(cy + r * Math.sin(a)).toFixed(2)}`);
-      }
-      return pts.join(" ");
-    }
-
-    function applyHoneyTransform(svg) {
-      const st = honeyView[svg.id];
-      if (!st) return;
-      const g = svg.querySelector(".honey-pan");
-      if (!g) return;
-      const { k, panX, panY, cx, cy } = st;
-      g.setAttribute(
-        "transform",
-        `translate(${panX} ${panY}) translate(${cx} ${cy}) scale(${k}) translate(${-cx} ${-cy})`
-      );
-    }
 
     function escHtml(s) {
       return String(s)
@@ -3888,6 +4327,399 @@
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;")
         .replace(/"/g, "&quot;");
+    }
+
+    function fleetMemDetectorPill(det) {
+      const d = String(det != null ? det : "");
+      const slug = d.replace(/[^a-z0-9_-]/gi, "_") || "other";
+      return '<span class="fleet-mem-det fleet-mem-det--' + slug + '">' + escHtml(d) + "</span>";
+    }
+
+    function fleetMemVerdictBadgeHtml(v) {
+      const x = String(v == null ? "" : v)
+        .toLowerCase()
+        .replace(/-/g, "_");
+      let cls = "fleet-mem-verdict fleet-mem-verdict--unset";
+      let text = t("fleet.verdictUnset");
+      if (x === "false_positive") {
+        cls = "fleet-mem-verdict fleet-mem-verdict--fp";
+        text = t("fleet.verdictFp");
+      } else if (x === "malicious") {
+        cls = "fleet-mem-verdict fleet-mem-verdict--mal";
+        text = t("fleet.verdictMal");
+      }
+      return '<span class="' + cls + '">' + escHtml(text) + "</span>";
+    }
+
+    function fleetMemVerdictPlain(v) {
+      const x = String(v == null ? "" : v)
+        .toLowerCase()
+        .replace(/-/g, "_");
+      if (x === "false_positive") return t("fleet.verdictFp");
+      if (x === "malicious") return t("fleet.verdictMal");
+      return t("fleet.verdictUnset");
+    }
+
+    let fleetMemCache = { entries: [], dropped: [], ok: true, error: "" };
+    let fleetMemSortActive = { col: "detector", dir: 1 };
+    let fleetMemSortDropped = { col: "detector", dir: 1 };
+
+    function fleetMemCmpStr(a, b) {
+      return String(a || "").localeCompare(String(b || ""), undefined, { sensitivity: "base", numeric: true });
+    }
+
+    function fleetMemActiveSortValue(e, col) {
+      switch (col) {
+        case "detector":
+          return String(e.detector != null ? e.detector : "");
+        case "reason":
+          return String(e.reason != null ? e.reason : "");
+        case "verdict":
+          return fleetMemVerdictPlain(e.verdict) + "\0" + String(e.verdict != null ? e.verdict : "");
+        case "source_run":
+          return String(e.source_run_id != null ? e.source_run_id : "");
+        case "reviewed":
+          return String(e.source_reviewed_at != null ? e.source_reviewed_at : "");
+        case "host":
+          return String(e.source_machine_id != null ? e.source_machine_id : "");
+        default:
+          return "";
+      }
+    }
+
+    function fleetMemCompareActiveRows(a, b, col, dir) {
+      const c = fleetMemCmpStr(fleetMemActiveSortValue(a, col), fleetMemActiveSortValue(b, col));
+      if (c !== 0) return c * dir;
+      return fleetMemCmpStr(String(a.reason || ""), String(b.reason || "")) * dir;
+    }
+
+    function fleetMemDroppedSortValue(k, col) {
+      if (col === "reason") return String(k.reason != null ? k.reason : "");
+      return String(k.detector != null ? k.detector : "");
+    }
+
+    function fleetMemCompareDroppedRows(a, b, col, dir) {
+      const c = fleetMemCmpStr(fleetMemDroppedSortValue(a, col), fleetMemDroppedSortValue(b, col));
+      if (c !== 0) return c * dir;
+      return fleetMemCmpStr(String(a.reason || ""), String(b.reason || "")) * dir;
+    }
+
+    function fleetMemEntrySearchBlob(e) {
+      return (
+        String(e.detector || "") +
+        " " +
+        String(e.reason || "") +
+        " " +
+        String(e.verdict || "") +
+        " " +
+        fleetMemVerdictPlain(e.verdict) +
+        " " +
+        String(e.source_run_id || "") +
+        " " +
+        String(e.source_reviewed_at || "") +
+        " " +
+        String(e.source_machine_id || "")
+      ).toLowerCase();
+    }
+
+    function fleetMemDroppedSearchBlob(k) {
+      return (String(k.detector || "") + " " + String(k.reason || "")).toLowerCase();
+    }
+
+    function fleetMemThSortBtn(table, col, state, labelEscaped) {
+      const active = state.col === col;
+      const ind = active ? (state.dir === 1 ? "\u25b2" : "\u25bc") : "";
+      return (
+        '<th scope="col"><button type="button" class="fleet-mem-th-sort js-fleet-mem-sort" data-fleet-table="' +
+        escHtml(table) +
+        '" data-fleet-col="' +
+        escHtml(col) +
+        '" title="' +
+        escHtml(t("fleet.sortByColumn")) +
+        '">' +
+        labelEscaped +
+        (active ? '<span class="fleet-mem-sort-ind" aria-hidden="true">' + ind + "</span>" : "") +
+        "</button></th>"
+      );
+    }
+
+    function fleetMemRefreshViews() {
+      const gEl = document.getElementById("wbFleetMemGlobalActive");
+      const dEl = document.getElementById("wbFleetMemGlobalDropped");
+      const inp = document.getElementById("fleetMemSearchInput");
+      const q = (inp && inp.value != null ? String(inp.value) : "").trim().toLowerCase();
+      if (!fleetMemCache.ok) {
+        const err = `<div class="fleet-mem-empty">${escHtml(fleetMemCache.error)}</div>`;
+        if (gEl) gEl.innerHTML = err;
+        if (dEl) dEl.innerHTML = err;
+        return;
+      }
+      let ent = fleetMemCache.entries.slice();
+      let dr = fleetMemCache.dropped.slice();
+      if (q) {
+        ent = ent.filter((e) => fleetMemEntrySearchBlob(e).includes(q));
+        dr = dr.filter((k) => fleetMemDroppedSearchBlob(k).includes(q));
+      }
+      ent.sort((a, b) => fleetMemCompareActiveRows(a, b, fleetMemSortActive.col, fleetMemSortActive.dir));
+      dr.sort((a, b) => fleetMemCompareDroppedRows(a, b, fleetMemSortDropped.col, fleetMemSortDropped.dir));
+      if (gEl) {
+        const had = fleetMemCache.entries.length > 0;
+        if (!ent.length && had && q) gEl.innerHTML = `<div class="fleet-mem-empty">${escHtml(t("fleet.searchNoMatch"))}</div>`;
+        else if (!ent.length) gEl.innerHTML = `<div class="fleet-mem-empty">${escHtml(t("fleet.none"))}</div>`;
+        else gEl.innerHTML = fleetMemRenderPrecedentTable(ent, fleetMemSortActive);
+      }
+      if (dEl) {
+        const hadD = fleetMemCache.dropped.length > 0;
+        if (!dr.length && hadD && q) dEl.innerHTML = `<div class="fleet-mem-empty">${escHtml(t("fleet.searchNoMatch"))}</div>`;
+        else if (!dr.length) dEl.innerHTML = `<div class="fleet-mem-empty">${escHtml(t("fleet.none"))}</div>`;
+        else dEl.innerHTML = fleetMemRenderDroppedKeysTable(dr, fleetMemSortDropped);
+      }
+    }
+
+    function fleetMemActionButtonClass(action) {
+      if (action === "fleet-drop") return "fleet-mem-action fleet-mem-action--danger js-fleet-mem-wb";
+      if (action === "fleet-undrop") return "fleet-mem-action fleet-mem-action--success js-fleet-mem-wb";
+      if (action === "fleet-delete") return "fleet-mem-action fleet-mem-action--delete js-fleet-mem-wb";
+      return "fleet-mem-action js-fleet-mem-wb";
+    }
+
+    function fleetMemWrapTable(inner) {
+      return '<div class="fleet-mem-table-wrap"><table class="fleet-mem-table">' + inner + "</table></div>";
+    }
+
+    function fleetMemRenderPrecedentTable(rows, sortState) {
+      if (!rows || !rows.length) return '<div class="fleet-mem-empty">' + escHtml(t("fleet.none")) + "</div>";
+      const thDet = escHtml(t("fleet.colDetector"));
+      const thReason = escHtml(t("fleet.colReason"));
+      const thVer = escHtml(t("fleet.colVerdict"));
+      const thSrc = escHtml(t("fleet.colSourceRun"));
+      const thRev = escHtml(t("fleet.colReviewed"));
+      const thHost = escHtml(t("fleet.colSourceHost"));
+      const thAct = escHtml(t("fleet.colAction"));
+      const thead =
+        "<thead><tr>" +
+        fleetMemThSortBtn("active", "detector", sortState, thDet) +
+        fleetMemThSortBtn("active", "reason", sortState, thReason) +
+        fleetMemThSortBtn("active", "verdict", sortState, thVer) +
+        fleetMemThSortBtn("active", "source_run", sortState, thSrc) +
+        fleetMemThSortBtn("active", "reviewed", sortState, thRev) +
+        fleetMemThSortBtn("active", "host", sortState, thHost) +
+        "<th scope=\"col\">" +
+        thAct +
+        "</th></tr></thead><tbody>";
+      const dropCls = fleetMemActionButtonClass("fleet-drop");
+      const delCls = fleetMemActionButtonClass("fleet-delete");
+      const body = rows
+        .map((e) => {
+          const det = String(e.detector != null ? e.detector : "");
+          const reason = String(e.reason != null ? e.reason : "");
+          const reasonShort = reason.length > 140 ? escHtml(reason.slice(0, 140)) + "…" : escHtml(reason);
+          const encDet = encodeURIComponent(det);
+          const encReason = encodeURIComponent(reason);
+          const rid = String(e.source_run_id != null ? e.source_run_id : "");
+          const reviewed = String(e.source_reviewed_at != null ? e.source_reviewed_at : "—");
+          return (
+            "<tr><td>" +
+            fleetMemDetectorPill(det) +
+            "</td><td class=\"fleet-mem-reason\" title=\"" +
+            escHtml(reason) +
+            "\"><code>" +
+            reasonShort +
+            "</code></td><td>" +
+            fleetMemVerdictBadgeHtml(e.verdict) +
+            "</td><td class=\"fleet-mem-col--mono\"><code>" +
+            escHtml(rid.length > 16 ? rid.slice(0, 14) + "…" : rid) +
+            "</code></td><td class=\"muted\" style=\"font-size:11px;white-space:nowrap\">" +
+            escHtml(reviewed.length > 22 ? reviewed.slice(0, 20) + "…" : reviewed) +
+            "</td><td class=\"fleet-mem-col--mono\"><code class=\"muted\">" +
+            escHtml(String(e.source_machine_id != null ? e.source_machine_id : "")) +
+            '</code></td><td class="fleet-mem-col--actions"><div class="fleet-mem-actions">' +
+            '<button type="button" class="' +
+            dropCls +
+            '" data-action="fleet-drop" data-det-enc="' +
+            encDet +
+            '" data-reason-enc="' +
+            encReason +
+            '">' +
+            escHtml(t("fleet.btnDropGlobal")) +
+            "</button>" +
+            '<button type="button" class="' +
+            delCls +
+            '" data-action="fleet-delete" data-det-enc="' +
+            encDet +
+            '" data-reason-enc="' +
+            encReason +
+            '">' +
+            escHtml(t("fleet.btnDeleteEntry")) +
+            "</button></div></td></tr>"
+          );
+        })
+        .join("");
+      return fleetMemWrapTable(thead + body + "</tbody>");
+    }
+
+    function fleetMemRenderDroppedKeysTable(keys, sortState) {
+      if (!keys || !keys.length) return '<div class="fleet-mem-empty">' + escHtml(t("fleet.none")) + "</div>";
+      const thDet = escHtml(t("fleet.colDetector"));
+      const thReason = escHtml(t("fleet.colReason"));
+      const thAct = escHtml(t("fleet.colAction"));
+      const thead =
+        "<thead><tr>" +
+        fleetMemThSortBtn("dropped", "detector", sortState, thDet) +
+        fleetMemThSortBtn("dropped", "reason", sortState, thReason) +
+        "<th scope=\"col\">" +
+        thAct +
+        "</th></tr></thead><tbody>";
+      const body = keys
+        .map((k) => {
+          const det = String(k.detector != null ? k.detector : "");
+          const reason = String(k.reason != null ? k.reason : "");
+          const reasonShort = reason.length > 140 ? escHtml(reason.slice(0, 140)) + "…" : escHtml(reason);
+          const undropCls = fleetMemActionButtonClass("fleet-undrop");
+          const delCls = fleetMemActionButtonClass("fleet-delete");
+          return (
+            "<tr><td>" +
+            fleetMemDetectorPill(det) +
+            "</td><td class=\"fleet-mem-reason\" title=\"" +
+            escHtml(reason) +
+            "\"><code>" +
+            reasonShort +
+            '</code></td><td class="fleet-mem-col--actions"><div class="fleet-mem-actions">' +
+            '<button type="button" class="' +
+            undropCls +
+            '" data-action="fleet-undrop" data-det-enc="' +
+            encodeURIComponent(det) +
+            '" data-reason-enc="' +
+            encodeURIComponent(reason) +
+            '">' +
+            escHtml(t("fleet.btnRestore")) +
+            "</button>" +
+            '<button type="button" class="' +
+            delCls +
+            '" data-action="fleet-delete" data-det-enc="' +
+            encodeURIComponent(det) +
+            '" data-reason-enc="' +
+            encodeURIComponent(reason) +
+            '">' +
+            escHtml(t("fleet.btnDeleteEntry")) +
+            "</button></div></td></tr>"
+          );
+        })
+        .join("");
+      return fleetMemWrapTable(thead + body + "</tbody>");
+    }
+
+    async function loadFleetMemoryGlobalPanel() {
+      const fleetD = await api("/api/fleet/triage-precedent");
+      if (fleetD._jsonParseError || fleetD._ok === false) {
+        fleetMemCache = {
+          entries: [],
+          dropped: [],
+          ok: false,
+          error: fleetD.error || "HTTP " + (fleetD._httpStatus || ""),
+        };
+        fleetMemRefreshViews();
+        return;
+      }
+      fleetMemCache = {
+        entries: Array.isArray(fleetD.entries) ? fleetD.entries.slice() : [],
+        dropped: Array.isArray(fleetD.dropped) ? fleetD.dropped.slice() : [],
+        ok: true,
+        error: "",
+      };
+      fleetMemRefreshViews();
+    }
+
+    async function loadFleetMemoryWorkbenchAll() {
+      const st = document.getElementById("fleetMemWbStatus");
+      if (st) st.textContent = "";
+      await loadFleetMemoryGlobalPanel();
+    }
+
+    async function loadFleetMemoryWorkbenchPage() {
+      wireFleetMemoryWorkbenchOnce();
+      await loadFleetMemoryWorkbenchAll();
+    }
+
+    function wireFleetMemoryWorkbenchOnce() {
+      const sec = document.getElementById("fleet-memory");
+      if (!sec || sec.dataset.fleetWbBound) return;
+      sec.dataset.fleetWbBound = "1";
+      sec.addEventListener("input", (ev) => {
+        const tgt = ev.target;
+        if (tgt && tgt.id === "fleetMemSearchInput") fleetMemRefreshViews();
+      });
+      sec.addEventListener("click", async (ev) => {
+        const sortBtn = ev.target && ev.target.closest && ev.target.closest(".js-fleet-mem-sort");
+        if (sortBtn) {
+          ev.preventDefault();
+          const table = sortBtn.getAttribute("data-fleet-table") || "";
+          const col = sortBtn.getAttribute("data-fleet-col") || "";
+          if (table === "active") {
+            const allowed = new Set(["detector", "reason", "verdict", "source_run", "reviewed", "host"]);
+            if (!allowed.has(col)) return;
+            if (fleetMemSortActive.col === col) fleetMemSortActive.dir *= -1;
+            else {
+              fleetMemSortActive.col = col;
+              fleetMemSortActive.dir = 1;
+            }
+          } else if (table === "dropped") {
+            const allowedD = new Set(["detector", "reason"]);
+            if (!allowedD.has(col)) return;
+            if (fleetMemSortDropped.col === col) fleetMemSortDropped.dir *= -1;
+            else {
+              fleetMemSortDropped.col = col;
+              fleetMemSortDropped.dir = 1;
+            }
+          } else return;
+          fleetMemRefreshViews();
+          return;
+        }
+        const btn = ev.target && ev.target.closest && ev.target.closest(".js-fleet-mem-wb");
+        if (!btn) return;
+        const action = btn.getAttribute("data-action") || "";
+        let det = "";
+        let reason = "";
+        try {
+          det = decodeURIComponent(btn.getAttribute("data-det-enc") || "");
+          reason = decodeURIComponent(btn.getAttribute("data-reason-enc") || "");
+        } catch (_) {
+          return;
+        }
+        const st = document.getElementById("fleetMemWbStatus");
+        if (action === "fleet-delete" && !confirm(t("fleet.deleteConfirm"))) return;
+        btn.disabled = true;
+        try {
+          let path = "";
+          if (action === "fleet-drop") path = "/api/fleet/triage-precedent/drop";
+          else if (action === "fleet-undrop") path = "/api/fleet/triage-precedent/undrop";
+          else if (action === "fleet-delete") path = "/api/fleet/triage-precedent/delete";
+          else return;
+          const res = await api(path, { method: "POST", body: JSON.stringify({ detector: det, reason }) });
+          if (!res._ok) {
+            if (st) st.textContent = res.error || "HTTP " + (res._httpStatus || "");
+            return;
+          }
+          if (st) st.textContent = t("fleet.statusUpdated");
+          setTimeout(() => {
+            if (st) st.textContent = "";
+          }, 2200);
+          await loadFleetMemoryGlobalPanel();
+          if (typeof loadRuns === "function") await loadRuns();
+        } finally {
+          btn.disabled = false;
+        }
+      });
+    }
+
+    async function tryApplyInitialTabFromQuery() {
+      const params = new URLSearchParams(window.location.search);
+      const tab = (params.get("tab") || "").trim();
+      if (!tab || tab === "ingestion") return;
+      const allowed = new Set(["dashboard", "ingestion", "runs", "anomark-tab", "sigma-tab", "fleet-memory"]);
+      if (!allowed.has(tab)) return;
+      const b = document.querySelector('.tab-btn[data-tab="' + tab + '"]');
+      if (b) switchTab(tab, b);
     }
 
     function fmtBytes(n) {
@@ -3991,199 +4823,6 @@
         </details>`;
     }
 
-    function openHoneyPanel(panelId, cell, idx, toggle) {
-      const panel = document.getElementById(panelId);
-      if (!panel) return;
-      if (!cell) {
-        panel.style.display = "none";
-        panel.setAttribute("hidden", "");
-        return;
-      }
-      if (toggle && panel.dataset.selectedIdx === String(idx) && panel.style.display !== "none") {
-        panel.style.display = "none";
-        panel.setAttribute("hidden", "");
-        delete panel.dataset.selectedIdx;
-        return;
-      }
-      panel.dataset.selectedIdx = String(idx);
-      panel.removeAttribute("hidden");
-      panel.style.display = "block";
-      if (cell.infected === false) {
-        const nm = cell.name != null && cell.name !== "" ? String(cell.name) : "(unknown host)";
-        panel.innerHTML = `
-          <h4><code>${escHtml(nm)}</code> <span class="pill" style="background:#14532d;color:#dcfce7">Clean</span></h4>
-          ${honeyDatasetTagsPanelHtml(cell.dataset_tags)}
-          <p class="muted" style="margin:0; font-size: 13px;">No finding for this host. Move the pointer over a hex to see the host in the line below the chart, or the browser tooltip.</p>
-        `;
-        return;
-      }
-      const sev = (cell.severity || "").toUpperCase();
-      const reasons = (cell.reasons || [])
-        .map((r) => "<li>" + escHtml(r) + "</li>")
-        .join("");
-      const dets = (cell.detectors || []).map((d) => `<span class="pill">${escHtml(d)}</span>`).join(" ");
-      panel.innerHTML = `
-        <h4><code>${escHtml(cell.name || "")}</code> <span class="sev-badge ${severityClass(sev)}">${escHtml(sev)}</span></h4>
-        ${honeyDatasetTagsPanelHtml(cell.dataset_tags)}
-        <p class="muted" style="margin:0 0 6px">Score: <strong>${Number(cell.value).toFixed(3)}</strong></p>
-        <p class="muted" style="margin:0 0 4px; font-size: 12px;">Detectors: ${dets || "—"}</p>
-        <p class="muted" style="margin:0 0 4px; font-size: 12px;">Reasons:</p>
-        <ul class="det-list">${reasons || '<li class="muted">(none)</li>'}</ul>
-      `;
-    }
-
-    function installHoneyView(svg, panelId, cells, hasFilter) {
-      const id = svg.id;
-      {
-        const hi = honeyGetHintEl(svg);
-        if (hi) hi.textContent = "";
-      }
-      if (!honeyView[id]) {
-        const onMove = (e) => {
-          const s = honeyView[id];
-          if (!s || !s.drag) return;
-          const w = svg.viewBox && svg.viewBox.baseVal ? svg.viewBox.baseVal.width : 1;
-          const h = svg.viewBox && svg.viewBox.baseVal ? svg.viewBox.baseVal.height : 1;
-          const cw = svg.clientWidth || 1;
-          const ch = svg.clientHeight || 1;
-          s.panX += ((e.clientX - s.lastX) * w) / cw;
-          s.panY += ((e.clientY - s.lastY) * h) / ch;
-          s.lastX = e.clientX;
-          s.lastY = e.clientY;
-          s.moved = true;
-          applyHoneyTransform(svg);
-        };
-        const onUp = () => {
-          const s = honeyView[id];
-          if (s) {
-            if (s.moved) s.suppressClickOnce = true;
-            s.drag = false;
-            s.moved = false;
-          }
-          window.removeEventListener("pointermove", onMove);
-          window.removeEventListener("pointerup", onUp);
-        };
-        svg.addEventListener("pointerdown", (e) => {
-          if (e.button !== 0) return;
-          if (e.target && e.target.closest && e.target.closest("polygon[data-idx]")) return;
-          const s = honeyView[id];
-          if (!s) return;
-          s.drag = true;
-          s.moved = false;
-          s.lastX = e.clientX;
-          s.lastY = e.clientY;
-          try { svg.setPointerCapture(e.pointerId); } catch (_) {}
-          window.addEventListener("pointermove", onMove);
-          window.addEventListener("pointerup", onUp);
-        });
-        const hintMove = (e) => {
-          const s = honeyView[id];
-          const h = honeyGetHintEl(svg);
-          if (!h) return;
-          if (s && s.drag) {
-            h.textContent = "";
-            return;
-          }
-          if (!s || !s.cells) {
-            h.textContent = "";
-            return;
-          }
-          const el = document.elementFromPoint(e.clientX, e.clientY);
-          if (!el || !svg.contains(el)) {
-            h.textContent = "";
-            return;
-          }
-          const poly = el.closest && el.closest("polygon[data-idx]");
-          if (!poly) {
-            h.textContent = "";
-            return;
-          }
-          const j = parseInt(poly.getAttribute("data-idx"), 10);
-          const c = s.cells[j];
-          h.textContent = c ? honeyStatusLine(c) : "";
-        };
-        const hintLeave = () => {
-          const h = honeyGetHintEl(svg);
-          if (h) h.textContent = "";
-        };
-        svg.addEventListener("pointermove", hintMove, { passive: true });
-        svg.addEventListener("pointerleave", hintLeave);
-        svg.addEventListener("click", (e) => {
-          const s = honeyView[id];
-          if (s && s.suppressClickOnce) {
-            s.suppressClickOnce = false;
-            return;
-          }
-          const poly = e.target && e.target.closest && e.target.closest("polygon[data-idx]");
-          if (!poly) return;
-          if (!s) return;
-          const i = parseInt(poly.getAttribute("data-idx"), 10);
-          const c = s.cells && s.cells[i];
-          if (!c) return;
-          openHoneyPanel(s.panelId, c, i, true);
-        });
-        svg.addEventListener("wheel", (e) => {
-          const s = honeyView[id];
-          if (!s) return;
-          e.preventDefault();
-          const f = e.deltaY > 0 ? 0.9 : 1.11;
-          s.k = Math.min(4, Math.max(0.2, s.k * f));
-          applyHoneyTransform(svg);
-        }, { passive: false });
-      }
-      const layout = (function buildLayout(cells) {
-        if (!cells.length) {
-          return { vbW: 240, vbH: 200, inner: "<text x='120' y='100' text-anchor='middle' fill='#94a3b8' font-size='13'>No machine data for this run</text>", cx: 120, cy: 100 };
-        }
-        const n = cells.length;
-        const r = Math.max(8, Math.min(26, 300 / Math.sqrt(n + 2)));
-        const dx = Math.sqrt(3) * r;
-        const dy = 1.5 * r;
-        const cols = Math.max(1, Math.ceil(Math.sqrt(n * 1.15)));
-        const rows = Math.ceil(n / cols);
-        const pad = 28;
-        const vbW = Math.max(240, pad * 2 + (cols - 0.5) * dx + r * 2);
-        const vbH = Math.max(200, pad * 2 + rows * dy + r * 1.2);
-        const cx = vbW / 2;
-        const cy = (pad * 2 + rows * dy) / 2;
-        const dim = (c) => c && c.infected && hasFilter && c.matches_filter === false;
-        const hintEsc = (t) => String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-        let g = "";
-        cells.forEach((c, i) => {
-          const col = i % cols;
-          const row = Math.floor(i / cols);
-          const x = pad + col * dx + (row % 2 ? dx / 2 : 0);
-          const y = pad + row * dy;
-          const color = cellFill(c);
-          const cl =
-            "honey-hex " + (c && c.infected ? "honey-hex--infected " : "") + (dim(c) ? "honey-hex--dim" : "");
-          const tip = hintEsc(honeyStatusLine(c));
-          g += `<g>
-            <polygon class="${cl}" data-idx="${i}" points="${hexPoints(x, y, r)}" fill="${color}" stroke="var(--honey-stroke)" stroke-width="${Math.max(1, r * 0.04)}">
-              <title>${tip}</title>
-            </polygon>
-          </g>`;
-        });
-        return { vbW, vbH, inner: g, cx, cy };
-      })(cells);
-      honeyView[id] = {
-        k: 1,
-        panX: 0,
-        panY: 0,
-        cx: layout.cx,
-        cy: layout.cy,
-        cells: cells,
-        hasFilter: !!hasFilter,
-        panelId: panelId,
-        drag: false,
-        moved: false,
-      };
-      svg.setAttribute("viewBox", `0 0 ${layout.vbW} ${layout.vbH}`);
-      svg.setAttribute("preserveAspectRatio", "xMidYMid meet");
-      svg.innerHTML = `<rect class="honey-bg" x="0" y="0" width="${layout.vbW}" height="${layout.vbH}" fill="var(--honey-bg)" />
-        <g class="honey-pan">${layout.inner}</g>`;
-      applyHoneyTransform(svg);
-    }
 
     function ingestKindLabel(kind) {
       const k = (kind || "").toString().toLowerCase();
@@ -5362,6 +6001,7 @@
       wireRunDatasetKindFilterOnce();
       wireRunDetectionFocusOnce();
       wireRunDetectorModeOnce();
+      wireRunSigmaStableSegOnce();
       for (const p of DATASET_SELECTION_PICKERS) {
         wireDatasetPickerFilterOnce(p.filterId, p.scrollId, p.statsId);
         wireDatasetPickerSelectionChangeOnce(p);
@@ -5378,6 +6018,73 @@
     let cachedDatasetsForRuns = [];
     /** Last `/api/anomark/availability` result (`any_available`). Used when toggling detector mode UI. */
     let lastRunAnomarkAnyAvailable = false;
+    /** Stable Sigma rules from `GET /api/sigma-zero/stable-rules` (id + title) for the run form. */
+    let cachedRunSigmaStableRules = [];
+
+    function applyRunSigmaStableRulesToListUi() {
+      const listEl = document.getElementById("runSigmaStableRulesList");
+      if (!listEl) return;
+      const rules = cachedRunSigmaStableRules || [];
+      if (!rules.length) {
+        listEl.innerHTML = `<li class="muted">${escHtml(t("runs.sigmaNoStableRules"))}</li>`;
+      } else {
+        listEl.innerHTML = rules
+          .map((r) => {
+            const id = String(r && r.id != null ? r.id : "");
+            const title = String(r && r.title != null ? r.title : "");
+            return `<li><code style="font-size:11px;">${escHtml(id)}</code> — ${escHtml(title)}</li>`;
+          })
+          .join("");
+      }
+      refreshRunSigmaStableModeAvailability();
+    }
+
+    function refreshRunSigmaStableModeAvailability() {
+      const seg = document.getElementById("runSigmaStableSeg");
+      if (!seg) return;
+      const has = Array.isArray(cachedRunSigmaStableRules) && cachedRunSigmaStableRules.length > 0;
+      seg.querySelectorAll('input[name="runSigmaStableSeg"]').forEach((inp) => {
+        inp.disabled = inp.value === "on" && !has;
+      });
+      if (!has) {
+        const off = seg.querySelector('input[name="runSigmaStableSeg"][value="off"]');
+        if (off) off.checked = true;
+        syncDatasetKindSegVisual(seg);
+      }
+    }
+
+    async function loadRunSigmaStableRules() {
+      const listEl = document.getElementById("runSigmaStableRulesList");
+      const seg = document.getElementById("runSigmaStableSeg");
+      if (!listEl || !seg) return;
+      listEl.innerHTML = `<li class="muted">${escHtml(t("runs.sigmaRulesLoading"))}</li>`;
+      const data = await api("/api/sigma-zero/stable-rules");
+      if (data._jsonParseError || data._ok === false) {
+        cachedRunSigmaStableRules = [];
+        listEl.innerHTML = `<li style="color:#fecaca;">${escHtml(data.error || t("runs.sigmaRulesLoadErr"))}</li>`;
+        refreshRunSigmaStableModeAvailability();
+        return;
+      }
+      const raw = Array.isArray(data.rules) ? data.rules : [];
+      cachedRunSigmaStableRules = raw.map((r) => ({
+        id: (r && r.id) != null ? String(r.id) : "",
+        title: (r && r.title) != null ? String(r.title) : "",
+      }));
+      applyRunSigmaStableRulesToListUi();
+    }
+
+    function wireRunSigmaStableSegOnce() {
+      const seg = document.getElementById("runSigmaStableSeg");
+      if (!seg || seg.dataset.sigmaSegWired) return;
+      seg.dataset.sigmaSegWired = "1";
+      seg.querySelectorAll('input[name="runSigmaStableSeg"]').forEach((inp) => {
+        inp.addEventListener("change", () => {
+          syncDatasetKindSegVisual(seg);
+        });
+      });
+      syncDatasetKindSegVisual(seg);
+      refreshRunSigmaStableModeAvailability();
+    }
 
     function getDetectorMode() {
       let v = "both";
@@ -5771,6 +6478,7 @@
       loadRunAnomarkAvailability();
       sigmaUpdateRunSelectionStats();
       await tryConsumeInspectDeepLink();
+      await tryApplyInitialTabFromQuery();
     }
 
     async function applyDatasetTagsBulkAdd(datasetIds, inputEl) {
@@ -5919,6 +6627,7 @@
       } catch (e) {
         hint.textContent = t("anomark.availErr");
         renderDashboardAnomark({ any_available: false });
+        void loadRunSigmaStableRules();
         return;
       }
       const a = data.availability || {};
@@ -5932,6 +6641,7 @@
         hint.textContent = t("anomark.noModel");
         refreshDetectorModeUi();
         renderDashboardAnomark(a);
+        void loadRunSigmaStableRules();
         return;
       }
       box.checked = true;
@@ -5967,6 +6677,31 @@
       }
       refreshDetectorModeUi();
       renderDashboardAnomark(a);
+      void loadRunSigmaStableRules();
+    }
+
+    function hideRunOpenResultsLink() {
+      const link = document.getElementById("runOpenResultsLink");
+      if (!link) return;
+      link.style.display = "none";
+      link.removeAttribute("href");
+    }
+
+    function showRunOpenResultsLink(runId) {
+      const link = document.getElementById("runOpenResultsLink");
+      if (!link || !runId) return;
+      const id = String(runId).trim();
+      if (!id) return;
+      link.href = "/run/" + encodeURIComponent(id);
+      link.style.display = "inline-flex";
+    }
+
+    /** Opens the dedicated run page and surfaces the same URL as a visible link (pop-up blockers, etc.). */
+    function publishRunSuccessUi(runId) {
+      if (!runId) return;
+      openRunResultsInNewTab(runId);
+      showRunOpenResultsLink(runId);
+      setGlobalActivity("ok", t("global.runOk").replace("%id", runId));
     }
 
     async function createRun() {
@@ -5983,6 +6718,13 @@
       }
       setStatus("run-create-status--busy", t("runs.runProgress"));
       setGlobalActivity("busy", t("global.runBusy"));
+      hideRunOpenResultsLink();
+      const runProg = document.getElementById("runCreateProgress");
+      const runProgText = document.getElementById("runCreateProgressText");
+      if (runProg && runProgText) {
+        runProg.hidden = false;
+        runProgText.textContent = t("runs.runProgressDetail");
+      }
 
       try {
         const selectedFromPicker = datasetPickCheckedIds("run");
@@ -6012,6 +6754,10 @@
           const n = parseFloat(String(pctEl.value).trim());
           if (Number.isFinite(n)) anomark_suspect_percent = n;
         }
+        let enable_sigma_stable = false;
+        document.querySelectorAll('input[name="runSigmaStableSeg"]').forEach((el) => {
+          if (el.checked) enable_sigma_stable = el.value === "on";
+        });
         const body = {
           dataset_ids,
           baseline_tags,
@@ -6021,6 +6767,7 @@
           anomark_suspect_percent,
           detection_focus,
           detector_mode,
+          enable_sigma_stable,
           ...(dcRaw ? { detection_config_id: dcRaw } : {})
         };
         const res = await fetch("/api/runs", {
@@ -6035,10 +6782,9 @@
           if (res.ok) {
             const run = await resolveRunFromListAfterCreate();
             if (run && run.id) {
-              document.getElementById("runIdFindings").value = run.id;
               await loadRuns();
-              await loadFindings();
               setStatus("run-create-status--ok", t("runs.runSuccess").replace("%id", run.id));
+              publishRunSuccessUi(run.id);
               console.warn("Run created; response body was not JSON — using latest run from list.", parsed.err, resBody && resBody.slice(0, 80));
               return;
             }
@@ -6073,19 +6819,18 @@
             console.warn("Run id missing in POST body; using latest run from list.");
           }
         }
-        if (run && run.id) {
-          document.getElementById("runIdFindings").value = run.id;
-        }
         await loadRuns();
-        if (run && run.id) await loadFindings();
         if (run && run.id) {
           setStatus("run-create-status--ok", t("runs.runSuccess").replace("%id", run.id));
+          publishRunSuccessUi(run.id);
         } else {
           setStatus("run-create-status--err", t("runs.runNoId"));
           setGlobalActivity("err", t("runs.runNoId"));
           await loadRuns();
         }
       } finally {
+        const runProgEl = document.getElementById("runCreateProgress");
+        if (runProgEl) runProgEl.hidden = true;
         if (btn) {
           btn.disabled = false;
           btn.removeAttribute("aria-busy");
@@ -6182,6 +6927,519 @@
       await updateDashboardApiLine();
     }
 
+    function countSeveritiesInRunFindings(findings) {
+      const c = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 };
+      (findings || []).forEach((f) => {
+        const s = String((f && f.severity) || "LOW").toUpperCase();
+        if (c[s] != null) c[s] += 1;
+      });
+      return c;
+    }
+
+    function countTriageHostsFromRunRecord(userTriage) {
+      const m = (userTriage && userTriage.machines) || [];
+      let n = 0;
+      for (const row of m) {
+        if (!row) continue;
+        const fv = String(row.final_verdict || "unset").toLowerCase().replace(/-/g, "_");
+        if (fv !== "unset") {
+          n++;
+          continue;
+        }
+        const rd = row.reason_decisions || [];
+        for (const d of rd) {
+          const v = String((d && d.verdict) || "unset").toLowerCase().replace(/-/g, "_");
+          if (v !== "unset") {
+            n++;
+            break;
+          }
+        }
+      }
+      return n;
+    }
+
+    function severityStackedBarHtml(sev, total) {
+      if (!total) return "";
+      const pct = (n) => (total > 0 ? Math.max((100 * n) / total, n > 0 ? 0.45 : 0) : 0);
+      const parts = [];
+      const push = (n, cls) => {
+        if (!n) return;
+        parts.push(`<span class="run-sev-seg ${cls}" style="width:${pct(n).toFixed(2)}%"></span>`);
+      };
+      push(sev.CRITICAL, "run-sev-seg--critical");
+      push(sev.HIGH, "run-sev-seg--high");
+      push(sev.MEDIUM, "run-sev-seg--medium");
+      push(sev.LOW, "run-sev-seg--low");
+      return `<div class="run-sev-bar" role="img" aria-label="Severity mix across hosts">${parts.join("")}</div>`;
+    }
+
+    function classifyLegacyReasonForRunList(text) {
+      const s = String(text || "");
+      if (s.startsWith("Sigma match:")) return "sigma-zero";
+      if (s.startsWith("AnoMark suspect:") || s.startsWith("AnoMark suspicious command ratio")) return "anomark-rs";
+      if (s.startsWith("RISK DETECTED:") || s.startsWith("Process row:") || s.startsWith("Rare process:")) return "ironsift-process";
+      if (
+        s.startsWith("Rare file access:") ||
+        s.startsWith("MTIME ANOMALY") ||
+        s.startsWith("METADATA ANOMALY") ||
+        s.startsWith("FLEET OUTLIER") ||
+        s.startsWith("(+") ||
+        s.indexOf("more rare files matched") !== -1
+      )
+        return "ironsift-file";
+      return "other";
+    }
+
+    function sortDetectorsList(set) {
+      const order = ["ironsift-process", "anomark-rs", "sigma-zero", "ironsift-file", "other"];
+      const out = [];
+      const seen = new Set();
+      for (const d of order) {
+        if (set.has(d)) {
+          out.push(d);
+          seen.add(d);
+        }
+      }
+      const extra = [...set].filter((d) => !seen.has(d)).sort();
+      out.push(...extra);
+      return out;
+    }
+
+    function aggregateRunDetectors(findings) {
+      const detSet = new Set();
+      for (const f of findings || []) {
+        const buckets = Array.isArray(f.reasons_by_detector) ? f.reasons_by_detector : [];
+        if (buckets.length) {
+          for (const b of buckets) {
+            if (!b || !b.detector) continue;
+            const list = Array.isArray(b.reasons) ? b.reasons : [];
+            if (list.length) detSet.add(String(b.detector));
+          }
+        } else {
+          const reasons = Array.isArray(f.reasons) ? f.reasons : [];
+          for (const rr of reasons) detSet.add(classifyLegacyReasonForRunList(rr));
+        }
+      }
+      return sortDetectorsList(detSet);
+    }
+
+    function aggregateReasonsByDetectorForRunList(findings, maxPerDet, maxTotal) {
+      const map = {};
+      let totalLines = 0;
+      const add = (det, line) => {
+        if (totalLines >= maxTotal) return false;
+        const d = String(det || "other");
+        if (!map[d]) map[d] = new Set();
+        if (map[d].size >= maxPerDet) return true;
+        const s = String(line || "").trim();
+        if (!s) return true;
+        const one = s.length > 280 ? s.slice(0, 280) + "…" : s;
+        if (map[d].has(one)) return true;
+        map[d].add(one);
+        totalLines++;
+        return true;
+      };
+      for (const f of findings || []) {
+        if (totalLines >= maxTotal) break;
+        const buckets = Array.isArray(f.reasons_by_detector) ? f.reasons_by_detector : [];
+        if (buckets.length) {
+          for (const b of buckets) {
+            for (const rr of Array.isArray(b.reasons) ? b.reasons : []) {
+              if (!add(b.detector || "other", rr)) break;
+            }
+            if (totalLines >= maxTotal) break;
+          }
+        } else {
+          for (const rr of Array.isArray(f.reasons) ? f.reasons : []) {
+            if (!add(classifyLegacyReasonForRunList(rr), rr)) break;
+          }
+        }
+      }
+      const order = ["ironsift-process", "anomark-rs", "sigma-zero", "ironsift-file", "other"];
+      const out = [];
+      const seen = new Set();
+      for (const det of order) {
+        if (!map[det] || !map[det].size) continue;
+        out.push({ det, reasons: Array.from(map[det]) });
+        seen.add(det);
+      }
+      for (const det of Object.keys(map).sort()) {
+        if (seen.has(det)) continue;
+        out.push({ det, reasons: Array.from(map[det]) });
+      }
+      return out;
+    }
+
+    const RUN_LIST_DET_ORDER = ["ironsift-process", "anomark-rs", "sigma-zero", "ironsift-file", "other"];
+
+    function runListNormTriageVerdict(v) {
+      return String(v || "unset")
+        .toLowerCase()
+        .replace(/-/g, "_");
+    }
+
+    function runListReasonExcludedFromPerReasonTriage(reason) {
+      return String(reason || "").trimStart().startsWith("Process row:");
+    }
+
+    function runListExtractIronsiftProcessPrimaryName(reason) {
+      const s = String(reason || "").trimStart();
+      if (s.startsWith("RISK DETECTED:")) {
+        const after = s.slice("RISK DETECTED:".length).trimStart();
+        const parts = after.split(/\s+/);
+        for (let i = 0; i < parts.length; i++) {
+          const tok = parts[i];
+          if (tok.indexOf("name=") === 0) {
+            const v = tok.slice("name=".length).replace(/,$/, "").trim();
+            if (v) return v.toLowerCase();
+          }
+        }
+        return null;
+      }
+      if (s.startsWith("Rare process:")) {
+        const rest = s.slice("Rare process:".length).trim();
+        const first = (rest.split(/[\s(]+/)[0] || "").trim();
+        return first ? first.toLowerCase() : null;
+      }
+      if (s.startsWith("Process row:")) {
+        const parts2 = s.split(/\s+/);
+        for (let j = 0; j < parts2.length; j++) {
+          const tok2 = parts2[j];
+          if (tok2.indexOf("name=") === 0) {
+            const v2 = tok2.slice("name=".length).replace(/,$/, "").trim();
+            if (v2) return v2.toLowerCase();
+          }
+        }
+      }
+      return null;
+    }
+
+    function runListTriageGroupKey(detector, reason) {
+      if (detector === "ironsift-process") {
+        const n = runListExtractIronsiftProcessPrimaryName(reason);
+        if (n) return "ironsift-process::g::" + n;
+      }
+      return String(detector) + "::" + String(reason);
+    }
+
+    function runListFindingDetectorReasonPairs(f) {
+      const out = [];
+      const buckets = Array.isArray(f.reasons_by_detector) ? f.reasons_by_detector : [];
+      if (buckets.length) {
+        const byDet = {};
+        buckets.forEach((b) => {
+          if (!b || !b.detector) return;
+          const list = Array.isArray(b.reasons) ? b.reasons : [];
+          if (!list.length) return;
+          const det = String(b.detector);
+          if (!byDet[det]) byDet[det] = [];
+          list.forEach((r) => {
+            byDet[det].push(r);
+          });
+        });
+        RUN_LIST_DET_ORDER.forEach((det) => {
+          const list = byDet[det];
+          if (!list) return;
+          list.forEach((reason) => {
+            out.push([det, reason]);
+          });
+          delete byDet[det];
+        });
+        Object.keys(byDet)
+          .sort()
+          .forEach((det) => {
+            byDet[det].forEach((reason) => {
+              out.push([det, reason]);
+            });
+          });
+      } else {
+        const reasons = Array.isArray(f.reasons) ? f.reasons : [];
+        reasons.forEach((reason) => {
+          out.push([classifyLegacyReasonForRunList(reason), reason]);
+        });
+      }
+      return out;
+    }
+
+    function runListActionableTriageGroupSlots(f) {
+      const seen = {};
+      const out = [];
+      const pairs = runListFindingDetectorReasonPairs(f);
+      for (let i = 0; i < pairs.length; i++) {
+        const det = pairs[i][0];
+        const reason = pairs[i][1];
+        if (runListReasonExcludedFromPerReasonTriage(reason)) continue;
+        const gk = runListTriageGroupKey(det, reason);
+        const key = det + "\0" + gk;
+        if (!seen[key]) {
+          seen[key] = true;
+          out.push([det, gk]);
+        }
+      }
+      return out;
+    }
+
+    function runListVerdictForReasonOnMachine(triage, machineId, detector, reason) {
+      const mlist = (triage && triage.machines) || [];
+      for (let i = 0; i < mlist.length; i++) {
+        if (!mlist[i] || mlist[i].machine_id !== machineId) continue;
+        const rd = mlist[i].reason_decisions || [];
+        for (let j = 0; j < rd.length; j++) {
+          if (!rd[j]) continue;
+          if (String(rd[j].detector || "") === String(detector || "") && String(rd[j].reason || "") === String(reason || "")) {
+            return runListNormTriageVerdict(rd[j].verdict);
+          }
+        }
+        return "unset";
+      }
+      return "unset";
+    }
+
+    function runListAggVerdictsForGroup(vers) {
+      if (!vers || !vers.length) return "unset";
+      for (let i = 0; i < vers.length; i++) {
+        if (runListNormTriageVerdict(vers[i]) === "malicious") return "malicious";
+      }
+      for (let j = 0; j < vers.length; j++) {
+        if (runListNormTriageVerdict(vers[j]) === "unset") return "unset";
+      }
+      return "false_positive";
+    }
+
+    function runListMachineHasPendingReasonTriage(f, userTriage) {
+      const slots = runListActionableTriageGroupSlots(f);
+      if (!slots.length) return false;
+      const mid = String((f && f.machine_id) || "");
+      const pairs = runListFindingDetectorReasonPairs(f);
+      for (let si = 0; si < slots.length; si++) {
+        const det = slots[si][0];
+        const gk = slots[si][1];
+        const reasons = [];
+        for (let pi = 0; pi < pairs.length; pi++) {
+          const d = pairs[pi][0];
+          const r = pairs[pi][1];
+          if (runListReasonExcludedFromPerReasonTriage(r)) continue;
+          if (d === det && runListTriageGroupKey(d, r) === gk) reasons.push(r);
+        }
+        const vers = reasons.map((r) => runListVerdictForReasonOnMachine(userTriage, mid, det, r));
+        if (runListAggVerdictsForGroup(vers) === "unset") return true;
+      }
+      return false;
+    }
+
+    function runListMachinesPendingReasonTriage(findings, userTriage) {
+      const out = [];
+      const seen = new Set();
+      for (const f of findings || []) {
+        if (!f || !runListMachineHasPendingReasonTriage(f, userTriage || {})) continue;
+        const mid = String(f.machine_id || "").trim();
+        if (!mid || seen.has(mid)) continue;
+        seen.add(mid);
+        out.push(mid);
+      }
+      return out;
+    }
+
+    function detectorShortLabel(det) {
+      const d = String(det || "other");
+      switch (d) {
+        case "ironsift-process":
+          return t("runs.runReasonDetProcess");
+        case "anomark-rs":
+          return t("runs.runReasonDetAnomark");
+        case "sigma-zero":
+          return t("runs.runReasonDetSigma");
+        case "ironsift-file":
+          return t("runs.runReasonDetFile");
+        case "other":
+          return t("runs.runReasonDetOther");
+        default:
+          return t("runs.runReasonDetFmt").replace("%s", d.replace(/-/g, " "));
+      }
+    }
+
+    function buildRunReasonsPreviewHtml(findings, userTriage) {
+      const groups = aggregateReasonsByDetectorForRunList(findings, 5, 36);
+      const pendingMids = runListMachinesPendingReasonTriage(findings, userTriage || {});
+      const maxShow = 5;
+      let pendingHtml = "";
+      if (pendingMids.length) {
+        const shown = pendingMids.slice(0, maxShow);
+        const codes = shown.map((id) => `<code class="run-card-reasons-pending__mid">${escHtml(id)}</code>`).join(" ");
+        const more =
+          pendingMids.length > maxShow
+            ? ` <span class="muted">${escHtml(t("runs.runListPendingReviewMore").replace("%n", String(pendingMids.length - maxShow)))}</span>`
+            : "";
+        pendingHtml = `<div class="run-card-reasons-pending" role="status"><span class="run-card-reasons-pending__lbl">${escHtml(
+          t("runs.runListPendingReviewLead")
+        )}</span> ${codes}${more}</div>`;
+      }
+      if (!groups.length && !pendingHtml) return "";
+      const blocks = groups.length
+        ? groups
+            .map((g) => {
+              const slug = String(g.det || "other").replace(/[^a-z0-9_-]/gi, "_");
+              const lis = g.reasons.map((line) => `<li class="run-reason-li">${escHtml(line)}</li>`).join("");
+              return `<div class="run-reason-group run-reason-group--${slug}"><div class="run-reason-group__label">${escHtml(
+                detectorShortLabel(g.det)
+              )}</div><ul class="run-reason-ul">${lis}</ul></div>`;
+            })
+            .join("")
+        : "";
+      return `<details class="run-card-reasons"><summary class="run-card-reasons-sum"><span class="run-card-reasons-chev" aria-hidden="true">▶</span>${escHtml(
+        t("runs.runListReasonsSummary")
+      )} <span class="run-card-reasons-hint muted">${escHtml(t("runs.runListReasonsHint"))}</span></summary><div class="run-card-reasons-body">${pendingHtml}${blocks}</div></details>`;
+    }
+
+    function formatRunListEntryHtml(r) {
+      const rid = String((r && r.id) != null ? r.id : "");
+      const cfgLbl = r.detection_config_name
+        ? ` <span class="muted">(${escapeForHtml(r.detection_config_name)})</span>`
+        : "";
+      const findings = Array.isArray(r.findings) ? r.findings : [];
+      const sev = countSeveritiesInRunFindings(findings);
+      const nHosts = findings.length;
+      const maxSev = sev.CRITICAL ? "critical" : sev.HIGH ? "high" : sev.MEDIUM ? "medium" : "low";
+      const sevBarHtml = nHosts ? severityStackedBarHtml(sev, nHosts) : "";
+      const dets = aggregateRunDetectors(findings);
+      const detPillsHtml = dets.length
+        ? `<div class="run-list-detectors">${dets
+            .map(
+              (d) =>
+                `<span class="run-list-det-pill run-list-det-pill--${String(d).replace(/[^a-z0-9_-]/gi, "_")}">${escHtml(detectorShortLabel(d))}</span>`
+            )
+            .join("")}</div>`
+        : "";
+      const reasonsHtml = buildRunReasonsPreviewHtml(findings, r.user_triage);
+      let kpiInner = "";
+      if (nHosts === 0) {
+        kpiInner = `<span class="muted">${escHtml(t("runs.runListNoFindings"))}</span>`;
+      } else {
+        const bits = [`<span>${escHtml(t("runs.runListHosts").replace("%n", String(nHosts)))}</span>`];
+        if (sev.CRITICAL) bits.push(`<span class="sev-badge sev-critical">${escHtml(t("runs.runListKpiCr").replace("%n", String(sev.CRITICAL)))}</span>`);
+        if (sev.HIGH) bits.push(`<span class="sev-badge sev-high">${escHtml(t("runs.runListKpiHi").replace("%n", String(sev.HIGH)))}</span>`);
+        if (sev.MEDIUM) bits.push(`<span class="sev-badge sev-medium">${escHtml(t("runs.runListKpiMd").replace("%n", String(sev.MEDIUM)))}</span>`);
+        if (sev.LOW) bits.push(`<span class="sev-badge sev-low">${escHtml(t("runs.runListKpiLo").replace("%n", String(sev.LOW)))}</span>`);
+        kpiInner = bits.join(" ");
+      }
+      const focusRaw = r.detection_focus != null ? String(r.detection_focus) : "auto";
+      const scopeDisp =
+        focusRaw === "process_only"
+          ? t("runs.detectionFocusShortProcess")
+          : focusRaw === "file_only"
+            ? t("runs.detectionFocusShortFile")
+            : t("runs.detectionFocusAuto");
+      const dmRaw = r.detector_mode != null ? String(r.detector_mode) : "both";
+      let enginesDisp = t("runs.detectorModeBoth");
+      if (dmRaw === "ironsift_only") enginesDisp = t("runs.detectorModeIronsift");
+      else if (dmRaw === "anomark_only") enginesDisp = t("runs.detectorModeAnomark");
+      const reqSnap = r.request && typeof r.request === "object" ? r.request : {};
+      let amoBaseOn = false;
+      if (typeof reqSnap.enable_anomark === "boolean") amoBaseOn = !!reqSnap.enable_anomark;
+      else if (dmRaw === "ironsift_only") amoBaseOn = false;
+      else if (dmRaw === "anomark_only") amoBaseOn = true;
+      else amoBaseOn = true;
+      let amoLbl = amoBaseOn ? t("runs.runListOn") : t("runs.runListOff");
+      if (amoBaseOn && dmRaw !== "ironsift_only") {
+        const ap = r.anomark_suspect_percent;
+        const nn = typeof ap === "number" && Number.isFinite(ap) ? ap : 95;
+        const disp = Math.abs(nn - Math.round(nn)) < 1e-6 ? String(Math.round(nn)) : nn.toFixed(1);
+        amoLbl += ` (${disp}%)`;
+      }
+      let sigLbl;
+      if (typeof reqSnap.enable_sigma_stable === "boolean") {
+        sigLbl = reqSnap.enable_sigma_stable ? t("runs.runListOn") : t("runs.runListOff");
+      } else if (r.sigma_stable_stats) {
+        sigLbl = t("runs.runListOn");
+      } else {
+        sigLbl = t("runs.runListUnknown");
+      }
+      const bl = Array.isArray(r.baseline_tags) ? r.baseline_tags : [];
+      const cd = Array.isArray(r.candidate_tags) ? r.candidate_tags : [];
+      const tagRows = [];
+      if (bl.length) {
+        tagRows.push(
+          `<div>${escHtml(t("runs.runListBaselineLbl"))} ${bl.map((x) => `<span class="pill">${escHtml(String(x))}</span>`).join(" ")}</div>`
+        );
+      }
+      if (cd.length) {
+        tagRows.push(
+          `<div>${escHtml(t("runs.runListCandidateLbl"))} ${cd.map((x) => `<span class="pill">${escHtml(String(x))}</span>`).join(" ")}</div>`
+        );
+      }
+      const ds = Array.isArray(r.dataset_ids) ? r.dataset_ids : [];
+      const dsShown = ds.slice(0, 5);
+      const dsMore = ds.length > dsShown.length ? ` <span class="muted">(+${ds.length - dsShown.length})</span>` : "";
+      const dsLine =
+        ds.length > 0
+          ? `<div>${escHtml(t("runs.runListDatasetLbl"))} ${dsShown
+              .map((id) => `<code style="font-size:11px;">${escHtml(String(id))}</code>`)
+              .join(" ")}${dsMore}</div>`
+          : "";
+      const sig = r.sigma_stable_stats;
+      let sigmaDetail = "";
+      if (sig && typeof sig === "object") {
+        sigmaDetail = `<div class="run-list-detail">${escHtml(
+          t("runs.runListSigmaStats")
+            .replace("%m", String(sig.rules_match_count != null ? sig.rules_match_count : 0))
+            .replace("%r", String(sig.rules_compiled != null ? sig.rules_compiled : 0))
+            .replace("%l", String(sig.line_count != null ? sig.line_count : 0))
+            .replace("%ms", String(sig.evaluate_ms != null ? sig.evaluate_ms : 0))
+        )}</div>`;
+      }
+      const triN = countTriageHostsFromRunRecord(r.user_triage);
+      const triHtml = triN
+        ? `<div class="run-list-detail muted">${escHtml(t("runs.runListTriage").replace("%n", String(triN)))}</div>`
+        : "";
+      const metaParts = [...tagRows];
+      if (dsLine) metaParts.push(dsLine);
+      const metaHtml = metaParts.length ? `<div class="run-list-meta">${metaParts.join("")}</div>` : "";
+      const hasSavedOptions =
+        reqSnap &&
+        typeof reqSnap === "object" &&
+        Array.isArray(reqSnap.dataset_ids) &&
+        reqSnap.dataset_ids.length > 0;
+      let optionsBlock = "";
+      if (hasSavedOptions) {
+        const json = escapeForHtml(JSON.stringify(reqSnap, null, 2));
+        optionsBlock = `<details class="run-saved-options" style="margin-top:8px;"><summary class="muted" style="cursor:pointer;">${escHtml(
+          t("runs.savedOptionsSummary")
+        )}</summary><pre class="muted" style="margin:6px 0 0;font-size:11px;white-space:pre-wrap;word-break:break-all;max-height:240px;overflow:auto;border:1px solid var(--border, #334155);border-radius:6px;padding:8px;background:rgba(0,0,0,0.15);">${json}</pre></details>`;
+      } else if (ds.length > 0) {
+        optionsBlock = `<p class="muted" style="font-size:11px;margin:8px 0 0;">${escHtml(t("runs.savedOptionsLegacy"))}</p>`;
+      }
+      return `
+        <article class="run-list-card run-list-card--max-${maxSev}">
+          <div class="run-list-card__inner">
+            <div class="run-list-card__head">
+              <code>${escapeForHtml(rid)}</code>
+              <span class="run-list-card__time">${escapeForHtml(r.created_at || "")}</span>
+            </div>
+            <div class="run-list-card__summary"><strong>${escapeForHtml(r.summary || "")}</strong>${cfgLbl}</div>
+            ${sevBarHtml}
+            <div class="run-list-kpis">${kpiInner}</div>
+            ${detPillsHtml}
+            <div class="run-list-badges">
+              <span class="pill">${escHtml(t("runs.runListBadgeScope").replace("%s", scopeDisp))}</span>
+              <span class="pill">${escHtml(t("runs.runListBadgeEngines").replace("%s", enginesDisp))}</span>
+              <span class="pill">${escHtml(t("runs.runListBadgeAno").replace("%s", amoLbl))}</span>
+              <span class="pill">${escHtml(t("runs.runListBadgeSigma").replace("%s", sigLbl))}</span>
+            </div>
+            ${sigmaDetail}
+            ${triHtml}
+            ${reasonsHtml}
+            ${metaHtml}
+            <div class="run-list-card__actions">
+              <button type="button" class="run-select-btn" data-run-id="${escapeForHtml(rid)}">${escHtml(t("runs.useThisRun"))}</button>
+              <button type="button" class="str-list__rm run-delete-btn" data-run-id="${escapeForHtml(rid)}">${escHtml(t("runs.deleteOne"))}</button>
+              <span class="muted" style="font-size:11px;">${escHtml(t("runs.runListDatasetCount").replace("%n", String(ds.length)))}</span>
+            </div>
+            ${optionsBlock}
+          </div>
+        </article>
+      `;
+    }
+
     async function loadRuns() {
       const data = await api("/api/runs");
       const el = document.getElementById("runsList");
@@ -6193,60 +7451,7 @@
         el.innerHTML = `<p class="muted" style="color:#fecaca">${escapeForHtml(data.error || "Failed to load runs")} (${data._httpStatus != null ? data._httpStatus : "?"})</p>`;
         return;
       }
-      el.innerHTML = (data.runs || []).map((r) => {
-        const rid = String((r && r.id) != null ? r.id : "");
-        const cfgLbl = r.detection_config_name ? ` — <span class="muted">${escapeForHtml(r.detection_config_name)}</span>` : "";
-        const focusRaw = r.detection_focus != null ? String(r.detection_focus) : "auto";
-        const focusLbl =
-          focusRaw === "process_only"
-            ? escHtml(t("runs.detectionFocusShortProcess"))
-            : focusRaw === "file_only"
-              ? escHtml(t("runs.detectionFocusShortFile"))
-              : "";
-        const focusSuffix =
-          focusLbl && focusRaw !== "auto"
-            ? ` <span class="muted" title="${escHtml(t("runs.detectionFocusLbl"))}">${escHtml(t("runs.detectionFocusRunBadgePrefix"))}: ${focusLbl}</span>`
-            : "";
-        const dmRaw = r.detector_mode != null ? String(r.detector_mode) : "both";
-        let dmLbl = "";
-        if (dmRaw === "ironsift_only") dmLbl = escHtml(t("runs.detectorModeShortIronsift"));
-        else if (dmRaw === "anomark_only") dmLbl = escHtml(t("runs.detectorModeShortAnomark"));
-        const dmSuffix =
-          dmLbl && dmRaw !== "both"
-            ? ` <span class="muted" title="${escHtml(t("runs.detectorModeLbl"))}">${escHtml(t("runs.detectorModeRunBadgePrefix"))}: ${dmLbl}</span>`
-            : "";
-        let amoSuspectSuffix = "";
-        if (dmRaw !== "ironsift_only") {
-          const ap = r.anomark_suspect_percent;
-          const n = typeof ap === "number" && Number.isFinite(ap) ? ap : 95;
-          const disp = Math.abs(n - Math.round(n)) < 1e-6 ? String(Math.round(n)) : n.toFixed(1);
-          amoSuspectSuffix = ` <span class="muted" title="${escHtml(t("runs.anomarkSuspectRunBadgeTitle"))}">${escHtml(t("runs.anomarkSuspectRunBadge").replace("%s", disp))}</span>`;
-        }
-        const reqSnap = r.request;
-        const hasSavedOptions =
-          reqSnap &&
-          typeof reqSnap === "object" &&
-          Array.isArray(reqSnap.dataset_ids) &&
-          reqSnap.dataset_ids.length > 0;
-        let optionsBlock = "";
-        if (hasSavedOptions) {
-          const json = escapeForHtml(JSON.stringify(reqSnap, null, 2));
-          optionsBlock = `<details class="run-saved-options" style="margin-top:8px;"><summary class="muted" style="cursor:pointer;">${escHtml(t("runs.savedOptionsSummary"))}</summary><pre class="muted" style="margin:6px 0 0;font-size:11px;white-space:pre-wrap;word-break:break-all;max-height:240px;overflow:auto;border:1px solid var(--border, #334155);border-radius:6px;padding:8px;background:rgba(0,0,0,0.15);">${json}</pre></details>`;
-        } else if ((r.dataset_ids || []).length > 0) {
-          optionsBlock = `<p class="muted" style="font-size:11px;margin:8px 0 0;">${escHtml(t("runs.savedOptionsLegacy"))}</p>`;
-        }
-        return `
-        <div class="ds-picker-box" style="margin-bottom:8px;">
-          <code>${escapeForHtml(rid)}</code> - ${escapeForHtml(r.summary || "")}${cfgLbl}${focusSuffix}${dmSuffix}${amoSuspectSuffix} <span class="muted">(${escapeForHtml(r.created_at || "")})</span>
-          <div class="row" style="margin-top:6px; align-items:center; gap:8px;">
-            <button type="button" class="run-select-btn" data-run-id="${escapeForHtml(rid)}">${escHtml(t("runs.useThisRun"))}</button>
-            <button type="button" class="str-list__rm run-delete-btn" style="margin:0" data-run-id="${escapeForHtml(rid)}">${escHtml(t("runs.deleteOne"))}</button>
-            <span class="muted">datasets: ${(r.dataset_ids || []).length}</span>
-          </div>
-          ${optionsBlock}
-        </div>
-      `;
-      }).join("");
+      el.innerHTML = (data.runs || []).map((r) => formatRunListEntryHtml(r)).join("");
       el.querySelectorAll(".run-select-btn").forEach((btn) => {
         btn.onclick = () => selectRun(btn.getAttribute("data-run-id") || "");
       });
@@ -6266,13 +7471,6 @@
         try { o = JSON.parse(resTxt.replace(/^\uFEFF/, "")); } catch (e) { alert("Invalid response from server: " + (e && e.message)); return; }
       }
       if (!res.ok) { alert((o && o.error) || ("Delete failed (" + res.status + ")")); return; }
-      if (document.getElementById("runIdFindings").value === runId) {
-        document.getElementById("runIdFindings").value = "";
-        resetFindingsPanel();
-        document.getElementById("findingsTable").innerHTML = "<p class=\"muted\">" + escHtml(t("findings.runRemoved")) + "</p>";
-        const fhc = document.getElementById("findingsHoneycomb");
-        if (fhc) installHoneyView(fhc, "findingsHoneyPanel", [], false);
-      }
       await loadRuns();
     }
 
@@ -6286,507 +7484,19 @@
         try { o = JSON.parse(purgeTxt.replace(/^\uFEFF/, "")); } catch (e) { alert("Invalid response: " + (e && e.message)); return; }
       }
       if (!res.ok) { alert((o && o.error) || ("Purge failed (" + res.status + ")")); return; }
-      document.getElementById("runIdFindings").value = "";
-      resetFindingsPanel();
-      document.getElementById("findingsTable").innerHTML = "<p class=\"muted\">" + escHtml(t("findings.allRunsRemoved")) + "</p>";
-      const fhc = document.getElementById("findingsHoneycomb");
-      if (fhc) installHoneyView(fhc, "findingsHoneyPanel", [], false);
       await loadRuns();
     }
 
-    /** Heuristic detector classification used when the run was saved before the per-detector
-     *  bucket field existed (`reasons_by_detector` is empty). Mirrors the prefixes the backend
-     *  emits in `run_detection`. */
-    function classifyLegacyReason(text) {
-      const s = String(text || "");
-      if (s.startsWith("AnoMark suspect:") || s.startsWith("AnoMark suspicious command ratio")) {
-        return "anomark-rs";
-      }
-      if (
-        s.startsWith("RISK DETECTED:") ||
-        s.startsWith("Process row:") ||
-        s.startsWith("Rare process:")
-      ) {
-        return "ironsift-process";
-      }
-      if (
-        s.startsWith("Rare file access:") ||
-        s.startsWith("MTIME ANOMALY") ||
-        s.startsWith("METADATA ANOMALY") ||
-        s.startsWith("FLEET OUTLIER") ||
-        s.startsWith("(+") ||
-        s.includes("more rare files matched")
-      ) {
-        return "ironsift-file";
-      }
-      return "other";
-    }
 
-    /** Flat list of { detector, reason } in the same order as the findings UI groups. */
-    function collectFindingReasonGroups(f) {
-      const out = [];
-      const directBuckets = Array.isArray(f.reasons_by_detector) ? f.reasons_by_detector : [];
-      const groupOrder = ["ironsift-process", "anomark-rs", "ironsift-file", "other"];
-      if (directBuckets.length) {
-        const byDet = new Map();
-        directBuckets.forEach((b) => {
-          if (b && b.detector) {
-            const list = Array.isArray(b.reasons) ? b.reasons.slice() : [];
-            if (list.length) byDet.set(b.detector, list);
-          }
-        });
-        groupOrder.forEach((det) => {
-          const r = byDet.get(det);
-          if (r && r.length) {
-            r.forEach((reason) => out.push({ detector: det, reason }));
-            byDet.delete(det);
-          }
-        });
-        for (const [det, r] of byDet) {
-          r.forEach((reason) => out.push({ detector: det, reason }));
-        }
-      } else {
-        const reasons = f.reasons || [];
-        reasons.forEach((reason) => {
-          out.push({ detector: classifyLegacyReason(reason), reason });
-        });
-      }
-      return out;
-    }
-
-    function buildTriageVerdictLookup(userTriage, machineId) {
-      const m = (userTriage && userTriage.machines) || [];
-      const entry = m.find((x) => x && x.machine_id === machineId);
-      const map = new Map();
-      if (entry && Array.isArray(entry.reason_decisions)) {
-        entry.reason_decisions.forEach((row) => {
-          if (!row) return;
-          const k = String(row.detector || "") + "\x00" + String(row.reason || "");
-          map.set(k, row.verdict != null ? String(row.verdict) : "unset");
-        });
-      }
-      return (detector, reason) => {
-        const k = String(detector || "") + "\x00" + String(reason || "");
-        return map.has(k) ? map.get(k) : "unset";
-      };
-    }
-
-    function finalVerdictFromTriage(userTriage, machineId) {
-      const m = (userTriage && userTriage.machines) || [];
-      const entry = m.find((x) => x && x.machine_id === machineId);
-      return entry && entry.final_verdict != null ? String(entry.final_verdict) : "unset";
-    }
-
-    /** Detector display name shown on the group header pill. */
-    function detectorDisplayName(detector) {
-      const k = "findings.detectorName." + detector;
-      const localized = t(k);
-      if (localized && localized !== k) return localized;
-      return detector;
-    }
-
-    /** Pretty-print one reason line. Splits a known label/prefix from the payload so the payload
-     *  can be styled monospace. Recognised payload shapes:
-     *  - "key=value key=value …" lines (e.g. RISK DETECTED, Process row)  → key/value formatting;
-     *  - "<text> (...)"           (e.g. AnoMark suspect)                  → value + meta;
-     *  - everything else                                                  → plain payload. */
-    function formatReasonHtml(reason) {
-      const raw = String(reason == null ? "" : reason);
-      // Truncation summary lines for rare-file gate (`(+N more rare files …)`) — render muted.
-      if (/^\(\+\d+\s+more\b/.test(raw)) {
-        return `<span class="findings-reasons-truncated">${escHtml(raw)}</span>`;
-      }
-      // Recognise "Label: payload" with a colon at the start (e.g. "AnoMark suspect: …",
-      // "Rare file access: …", "Process row: …", "RISK DETECTED: …").
-      const labelMatch = raw.match(/^([A-Z][A-Z0-9 a-z._-]{0,80}?):\s*(.*)$/);
-      if (labelMatch) {
-        const label = labelMatch[1];
-        const payload = labelMatch[2];
-        const labelEsc = `<span class="findings-reasons-label">${escHtml(label + ":")}</span>`;
-        // key=value lines (e.g. RISK DETECTED, Process row): style each k= span.
-        if (/(?:^|\s)[a-zA-Z_][a-zA-Z0-9_]*=/.test(payload)) {
-          const tokens = payload.match(/\S+=(?:"[^"]*"|\S+)|\S+/g) || [];
-          const inner = tokens
-            .map((tok) => {
-              const m = tok.match(/^([a-zA-Z_][a-zA-Z0-9_]*)=(.*)$/);
-              if (m) {
-                return `<span class="kv-key">${escHtml(m[1])}=</span><span class="kv-val">${escHtml(m[2])}</span>`;
-              }
-              return `<span class="kv-val">${escHtml(tok)}</span>`;
-            })
-            .join(" ");
-          return `${labelEsc}<span class="findings-reasons-payload-kv">${inner}</span>`;
-        }
-        return `${labelEsc}<span class="findings-reasons-payload">${escHtml(payload)}</span>`;
-      }
-      return `<span class="findings-reasons-payload">${escHtml(raw)}</span>`;
-    }
-
-    function normalizeTriageVerdictVal(v) {
-      return String(v || "unset")
-        .toLowerCase()
-        .replace(/-/g, "_");
-    }
-
-    /** Context lines (not actionable detection reasons) — no per-reason triage. */
-    function isExcludedFromReasonTriage(reason) {
-      return String(reason || "").trimStart().startsWith("Process row:");
-    }
-
-    function renderReasonVerdictSelect(machineId, detector, reasonText, current) {
-      const enc = encodeURIComponent(reasonText);
-      const cur = normalizeTriageVerdictVal(current);
-      const un = cur === "unset";
-      const fp = cur === "false_positive";
-      const ma = cur === "malicious";
-      return `<select class="triage-reason-verdict" aria-label="${escHtml(t("triage.reasonAria"))}" data-machine="${escapeForHtml(machineId)}" data-detector="${escapeForHtml(detector)}" data-reason="${enc}">
-        <option value="unset" ${un ? "selected" : ""}>${escHtml(t("triage.verdict.unset"))}</option>
-        <option value="false_positive" ${fp ? "selected" : ""}>${escHtml(t("triage.verdict.fp"))}</option>
-        <option value="malicious" ${ma ? "selected" : ""}>${escHtml(t("triage.verdict.mal"))}</option>
-      </select>`;
-    }
-
-    function renderFinalVerdictSelect(machineId, current) {
-      const cur = normalizeTriageVerdictVal(current);
-      const un = cur === "unset";
-      const fp = cur === "false_positive";
-      const ma = cur === "malicious";
-      return `<select class="triage-final-verdict" aria-label="${escHtml(t("triage.finalAria"))}" data-machine="${escapeForHtml(machineId)}">
-        <option value="unset" ${un ? "selected" : ""}>${escHtml(t("triage.verdict.unset"))}</option>
-        <option value="false_positive" ${fp ? "selected" : ""}>${escHtml(t("triage.verdict.fp"))}</option>
-        <option value="malicious" ${ma ? "selected" : ""}>${escHtml(t("triage.verdict.mal"))}</option>
-      </select>`;
-    }
-
-    /** Render one detector group with per-reason triage selects. */
-    function renderReasonGroupTriage(machineId, detector, reasons, verdictLookup) {
-      const safeDet = String(detector || "other").replace(/[^a-z0-9_-]/gi, "_");
-      const pillCls = `findings-reasons-group-pill findings-reasons-group-pill--${safeDet}`;
-      const items = reasons
-        .map((r) => {
-          const excluded = isExcludedFromReasonTriage(r);
-          const v = verdictLookup(detector, r);
-          const sel = excluded ? "" : renderReasonVerdictSelect(machineId, detector, r, v);
-          const liCls = excluded
-            ? "findings-reason-triage-li findings-reason-triage-li--no-decision"
-            : "findings-reason-triage-li";
-          return `<li class="${liCls}"><div class="findings-reason-li-main">${formatReasonHtml(r)}</div>${sel}</li>`;
-        })
-        .join("");
-      return `<div class="findings-reasons-group">
-        <div class="findings-reasons-group-head">
-          <span class="${pillCls}">${escHtml(detectorDisplayName(detector))}</span>
-          <span class="findings-reasons-group-count">${reasons.length}</span>
-        </div>
-        <ul class="findings-reasons-group-list findings-reasons-group-list--triage">${items}</ul>
-      </div>`;
-    }
-
-    function findingsReasonsCell(f, userTriage) {
-      const pairs = collectFindingReasonGroups(f);
-      if (!pairs.length) return `<span class="muted">—</span>`;
-      const byDet = new Map();
-      pairs.forEach(({ detector, reason }) => {
-        if (!byDet.has(detector)) byDet.set(detector, []);
-        byDet.get(detector).push(reason);
-      });
-      const groupOrder = ["ironsift-process", "anomark-rs", "ironsift-file", "other"];
-      const groups = [];
-      groupOrder.forEach((det) => {
-        if (byDet.has(det)) {
-          groups.push([det, byDet.get(det)]);
-          byDet.delete(det);
-        }
-      });
-      for (const [det, r] of byDet) groups.push([det, r]);
-      const total = groups.reduce((acc, [, list]) => acc + list.length, 0);
-      if (!total) return `<span class="muted">—</span>`;
-      const machineId = f.machine_id || "";
-      const verdictLookup = buildTriageVerdictLookup(userTriage, machineId);
-      const sum = total === 1 ? t("findings.oneReason") : t("findings.nReasons").replace("%n", String(total));
-      const groupsHtml = groups.map(([det, r]) => renderReasonGroupTriage(machineId, det, r, verdictLookup)).join("");
-      return `<details class="findings-reasons-box"><summary class="findings-reasons-sum">${escHtml(sum)}</summary>
-        <div class="findings-reasons-groups">${groupsHtml}</div>
-      </details>`;
-    }
-
-    function findingsFinalTriageCell(f, userTriage) {
-      const mid = f.machine_id || "";
-      return renderFinalVerdictSelect(mid, finalVerdictFromTriage(userTriage, mid));
-    }
-
-    function collectTriagePayloadFromDom() {
-      const machines = new Map();
-      document.querySelectorAll(".triage-reason-verdict").forEach((sel) => {
-        const mid = sel.getAttribute("data-machine");
-        const det = sel.getAttribute("data-detector");
-        let reason = "";
-        try {
-          reason = decodeURIComponent(sel.getAttribute("data-reason") || "");
-        } catch (_) {
-          return;
-        }
-        if (!mid) return;
-        if (!machines.has(mid)) {
-          machines.set(mid, { machine_id: mid, reason_decisions: [], final_verdict: "unset" });
-        }
-        machines.get(mid).reason_decisions.push({
-          detector: det || "other",
-          reason,
-          verdict: sel.value || "unset",
-        });
-      });
-      document.querySelectorAll(".triage-final-verdict").forEach((sel) => {
-        const mid = sel.getAttribute("data-machine");
-        if (!mid) return;
-        if (!machines.has(mid)) {
-          machines.set(mid, { machine_id: mid, reason_decisions: [], final_verdict: sel.value || "unset" });
-        } else {
-          machines.get(mid).final_verdict = sel.value || "unset";
-        }
-      });
-      const list = Array.from(machines.values());
-      list.sort((a, b) => String(a.machine_id).localeCompare(String(b.machine_id)));
-      return { user_triage: { machines: list } };
-    }
-
-    let findingsTriageAutoSaveTimer = null;
-    let findingsTriageSaveBusy = false;
-    let findingsTriageSavePendingAgain = false;
-
-    function scheduleAutoSaveFindingsTriage() {
-      const runIdEl = document.getElementById("runIdFindings");
-      if (!runIdEl || !runIdEl.value.trim()) return;
-      const table = document.getElementById("findingsTable");
-      if (!table || !table.querySelector(".triage-reason-verdict, .triage-final-verdict")) return;
-      if (findingsTriageAutoSaveTimer) clearTimeout(findingsTriageAutoSaveTimer);
-      findingsTriageAutoSaveTimer = setTimeout(() => {
-        findingsTriageAutoSaveTimer = null;
-        void saveFindingsTriage({ auto: true });
-      }, 450);
-    }
-
-    document.body.addEventListener("change", (ev) => {
-      const t = ev.target;
-      if (!(t instanceof HTMLSelectElement)) return;
-      if (
-        !t.classList.contains("triage-reason-verdict") &&
-        !t.classList.contains("triage-final-verdict")
-      ) {
-        return;
-      }
-      scheduleAutoSaveFindingsTriage();
-    });
-
-    async function saveFindingsTriage(opts) {
-      const auto = opts && typeof opts === "object" && opts.auto === true;
-      if (findingsTriageSaveBusy) {
-        findingsTriageSavePendingAgain = true;
-        return;
-      }
-      findingsTriageSaveBusy = true;
-      const runId = document.getElementById("runIdFindings").value.trim();
-      const st = document.getElementById("findingsTriageStatus");
-      try {
-        if (!runId) return;
-        if (st) st.textContent = t("triage.saving");
-        const body = collectTriagePayloadFromDom();
-        const data = await api(`/api/runs/${encodeURIComponent(runId)}/triage`, {
-          method: "PUT",
-          body: JSON.stringify(body),
-        });
-        if (!data._ok) {
-          const msg = data.error || t("triage.saveErr");
-          if (st) st.textContent = msg;
-          alert(msg + (data._httpStatus ? " (HTTP " + data._httpStatus + ")" : ""));
-          return;
-        }
-        if (st) st.textContent = t("triage.saved");
-        setTimeout(() => {
-          if (st) st.textContent = "";
-        }, auto ? 2000 : 2800);
-      } finally {
-        findingsTriageSaveBusy = false;
-        if (findingsTriageSavePendingAgain) {
-          findingsTriageSavePendingAgain = false;
-          void saveFindingsTriage({ auto: true });
-        }
-      }
-    }
-
-    function findingsDetectorsCell(f) {
-      const d = f.detectors || [];
-      if (!d.length) return `<span class="muted">—</span>`;
-      return `<div style="display:flex;flex-wrap:wrap;gap:4px;align-items:center;">${d.map((x) => `<span class="pill" style="font-size:11px;margin:0">${escHtml(x)}</span>`).join("")}</div>`;
-    }
-
-    function setFindingsError(msg) {
-      const el = document.getElementById("findingsError");
-      if (!el) return;
-      if (msg) {
-        el.textContent = msg;
-        el.style.display = "block";
-      } else {
-        el.textContent = "";
-        el.style.display = "none";
-      }
-    }
-
-    function setFindingsRawBlock(text, visible) {
-      const pre = document.getElementById("findings");
-      const wrap = document.getElementById("findingsRawWrap");
-      if (pre) pre.textContent = text || "";
-      if (wrap) wrap.style.display = visible ? "" : "none";
-    }
-
-    function resetFindingsKpis() {
-      ["rfCritical", "rfHigh", "rfMedium", "rfLow"].forEach((id) => {
-        const el = document.getElementById(id);
-        if (el) el.textContent = "0";
-      });
-    }
-
-    function clearFindingsTableForError() {
-      resetFindingsKpis();
-      const ft = document.getElementById("findingsTable");
-      if (ft) ft.innerHTML = "";
-    }
-
-    function resetFindingsPanel() {
-      setFindingsError("");
-      setFindingsRawBlock("", false);
-      resetFindingsKpis();
-    }
-
-    async function loadFindings() {
-      const runId = document.getElementById("runIdFindings").value.trim();
-      setFindingsError("");
-      if (!runId) {
-        setGlobalActivity("idle", "");
-        const fhc = document.getElementById("findingsHoneycomb");
-        if (fhc) installHoneyView(fhc, "findingsHoneyPanel", [], false);
-        resetFindingsPanel();
-        document.getElementById("findingsTable").innerHTML = "<p class=\"muted\">" + escHtml(t("findings.enterId")) + "</p>";
-        const sb = document.getElementById("findingsSaveTriage");
-        if (sb) sb.style.display = "none";
-        const ts = document.getElementById("findingsTriageStatus");
-        if (ts) ts.textContent = "";
-        return;
-      }
-      setGlobalActivity("busy", t("global.findingsBusy"));
-      const [data, hon] = await Promise.all([
-        api(`/api/runs/${encodeURIComponent(runId)}/detections`),
-        api(`/api/fleet/honeycomb?${new URLSearchParams({ run_id: runId }).toString()}`)
-      ]);
-      if (data._jsonParseError) {
-        setFindingsRawBlock("", false);
-        clearFindingsTableForError();
-        const sb0 = document.getElementById("findingsSaveTriage");
-        if (sb0) sb0.style.display = "none";
-        setFindingsError(
-          "Run findings: " + (data.error || data._jsonParseError) + (data._rawPreview ? " — " + data._rawPreview.slice(0, 240) : "")
-        );
-        setGlobalActivity("err", t("global.findingsErr"));
-        return;
-      }
-      if (data._ok === false) {
-        let msg = "Run findings: " + (data.error || "Error") + " (HTTP " + (data._httpStatus || "") + ")";
-        if (hon && !hon._ok && !hon._jsonParseError) {
-          msg += " · Honeycomb: " + (hon.error || "");
-        }
-        setFindingsError(msg);
-        setFindingsRawBlock("", false);
-        clearFindingsTableForError();
-        const sb1 = document.getElementById("findingsSaveTriage");
-        if (sb1) sb1.style.display = "none";
-        const fhc = document.getElementById("findingsHoneycomb");
-        if (fhc) installHoneyView(fhc, "findingsHoneyPanel", [], false);
-        setGlobalActivity("err", t("global.findingsErr"));
-        return;
-      }
-      const findings = data.findings || [];
-      const runDatasetIds = data.dataset_ids || [];
-      const userTriage = data.user_triage && typeof data.user_triage === "object" ? data.user_triage : { machines: [] };
-      const saveTriageBtn = document.getElementById("findingsSaveTriage");
-      if (saveTriageBtn) saveTriageBtn.style.display = findings.length ? "" : "none";
-      const triageSt = document.getElementById("findingsTriageStatus");
-      if (triageSt) triageSt.textContent = "";
-      let rawJson = JSON.stringify(findings, null, 2);
-      if (hon && hon._jsonParseError) {
-        rawJson =
-          "[Note: honeycomb request failed or returned non-JSON; map below may be empty. " +
-          (hon._rawPreview ? "Preview: " + hon._rawPreview.slice(0, 200) : hon._jsonParseError) +
-          "]\n\n" +
-          rawJson;
-      }
-      setFindingsRawBlock(rawJson, true);
-      const counts = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 };
-      findings.forEach((f) => {
-        const s = (f.severity || "LOW").toUpperCase();
-        if (counts[s] != null) counts[s] += 1;
-      });
-      document.getElementById("rfCritical").textContent = counts.CRITICAL;
-      document.getElementById("rfHigh").textContent = counts.HIGH;
-      document.getElementById("rfMedium").textContent = counts.MEDIUM;
-      document.getElementById("rfLow").textContent = counts.LOW;
-      const table = document.getElementById("findingsTable");
-      {
-        const fhc = document.getElementById("findingsHoneycomb");
-        if (fhc) installHoneyView(fhc, "findingsHoneyPanel", hon && Array.isArray(hon.cells) ? hon.cells : [], false);
-      }
-      table.innerHTML = findings.length
-        ? `
-        <table style="width:100%; border-collapse: collapse; font-size: 13px;">
-          <thead>
-            <tr>
-              <th style="text-align:left; border-bottom:1px solid var(--border); padding:6px;">${escHtml(t("findings.col.machine"))}</th>
-              <th style="text-align:left; border-bottom:1px solid var(--border); padding:6px;">${escHtml(t("findings.col.severity"))}</th>
-              <th style="text-align:left; border-bottom:1px solid var(--border); padding:6px;">${escHtml(t("findings.col.score"))}</th>
-              <th style="text-align:left; border-bottom:1px solid var(--border); padding:6px;">${escHtml(t("findings.col.risk"))}</th>
-              <th style="text-align:left; border-bottom:1px solid var(--border); padding:6px;">${escHtml(t("findings.col.detectors"))}</th>
-              <th style="text-align:left; border-bottom:1px solid var(--border); padding:6px;">${escHtml(t("findings.col.reasons"))}</th>
-              <th style="text-align:left; border-bottom:1px solid var(--border); padding:6px;">${escHtml(t("findings.col.triageFinal"))}</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${findings
-              .map(
-                (f) => `
-              <tr>
-                <td style="border-bottom:1px solid var(--table-row-b); padding:6px; vertical-align:top;">${findingsMachineCellHtml(f, runDatasetIds)}</td>
-                <td style="border-bottom:1px solid var(--table-row-b); padding:6px; vertical-align:top;">
-                  <span class="sev-badge ${severityClass(f.severity)}">${escHtml(String(f.severity || ""))}</span>
-                </td>
-                <td style="border-bottom:1px solid var(--table-row-b); padding:6px; vertical-align:top;">${Number(f.score || 0).toFixed(3)}</td>
-                <td style="border-bottom:1px solid var(--table-row-b); padding:6px; vertical-align:top;">
-                  <div class="score-wrap"><div class="score-bar" style="width:${Math.max(0, Math.min(100, Number(f.score || 0) * 100))}%; background:${severityColor(Number(f.score || 0))};"></div></div>
-                </td>
-                <td style="border-bottom:1px solid var(--table-row-b); padding:6px; vertical-align:top;">${findingsDetectorsCell(f)}</td>
-                <td style="border-bottom:1px solid var(--table-row-b); padding:6px; vertical-align:top;">${findingsReasonsCell(f, userTriage)}</td>
-                <td style="border-bottom:1px solid var(--table-row-b); padding:6px; vertical-align:top;">${findingsFinalTriageCell(f, userTriage)}</td>
-              </tr>
-            `
-              )
-              .join("")}
-          </tbody>
-        </table>
-      `
-        : `<p class="muted">${escHtml(t("findings.none"))}</p>`;
-      setGlobalActivity("ok", t("global.findingsOk").replace("%n", String(findings.length)));
-    }
-
-    function severityClass(sev) {
-      const s = String(sev || "").toUpperCase();
-      if (s === "CLEAN" || s === "NONE") return "sev-low";
-      if (s === "CRITICAL") return "sev-critical";
-      if (s === "HIGH") return "sev-high";
-      if (s === "MEDIUM") return "sev-medium";
-      return "sev-low";
+    function openRunResultsInNewTab(runId) {
+      const id = String(runId || "").trim();
+      if (!id) return;
+      const u = new URL("/run/" + encodeURIComponent(id), window.location.origin);
+      window.open(u.href, "_blank", "noopener,noreferrer");
     }
 
     function selectRun(runId) {
-      document.getElementById("runIdFindings").value = runId;
-      loadFindings();
+      openRunResultsInNewTab(runId);
     }
 
     const _RUN_DEFAULT_SUSP = [
@@ -7539,7 +8249,7 @@
       return known.has(v) ? v : "";
     }
 
-    /// Re-renders the read-only chips in a card's summary (title, level, status, tag mirror)
+    /// Re-renders the read-only chips in a card's compact header (title, level, status, tag mirror)
     /// so adding tags / editing YAML / toggling enable updates the compact header live.
     function sigmaRuleCardRefreshSummary(card) {
       if (!card) return;
@@ -7623,27 +8333,44 @@
       }
     }
 
-    /// Stops `<summary>` toggle when the user clicks an interactive control inside it.
-    /// Without this, toggling the enable checkbox or hitting Remove would expand/collapse
-    /// the rule card unintentionally.
-    function sigmaSummaryStopToggle(ev) {
-      ev.stopPropagation();
+    function sigmaRuleCardSetOpen(card, open) {
+      const o = !!open;
+      if (!card) return;
+      card.classList.toggle("sigma-rule-card--open", o);
+      const body = card.querySelector(".sigma-rule-card-body");
+      if (body) body.hidden = !o;
+      const expandBtn = card.querySelector(".sigma-rule-expand");
+      if (expandBtn) {
+        expandBtn.setAttribute("aria-expanded", o ? "true" : "false");
+        expandBtn.setAttribute("aria-label", o ? t("sigma.ruleCollapseCard") : t("sigma.ruleExpandCard"));
+      }
     }
 
     function appendSigmaRuleRow(rule) {
       const mount = document.getElementById("sigmaRulesEditor");
       if (!mount) return;
       const r = rule || {};
-      const wrap = document.createElement("details");
+      const wrap = document.createElement("div");
       wrap.className = "sigma-rule-card";
       const id = r.id || (typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : "rule-" + Date.now());
       wrap.dataset.ruleId = id;
-      // Keep the YAML collapsed by default so a library of 20+ rules stays scannable; users
-      // open the card explicitly to edit.
-      wrap.open = !!r.openOnAppend;
+      const bodyId = "sigma-rule-body-" + id;
 
-      const summary = document.createElement("summary");
-      summary.className = "sigma-rule-card-summary";
+      const header = document.createElement("div");
+      header.className = "sigma-rule-card-header";
+
+      const expandBtn = document.createElement("button");
+      expandBtn.type = "button";
+      expandBtn.className = "sigma-rule-expand";
+      expandBtn.setAttribute("aria-controls", bodyId);
+      expandBtn.addEventListener("click", function () {
+        sigmaRuleCardSetOpen(wrap, !wrap.classList.contains("sigma-rule-card--open"));
+      });
+      const chev = document.createElement("span");
+      chev.className = "sigma-rule-chevron";
+      chev.setAttribute("aria-hidden", "true");
+      chev.textContent = "▾";
+      expandBtn.appendChild(chev);
 
       const useChk = document.createElement("input");
       useChk.type = "checkbox";
@@ -7651,7 +8378,6 @@
       useChk.checked = r.enabled !== false;
       useChk.title = t("sigma.ruleUseForChecks");
       useChk.setAttribute("aria-label", t("sigma.ruleUseForChecks"));
-      useChk.addEventListener("click", sigmaSummaryStopToggle);
       useChk.addEventListener("change", function () {
         sigmaRuleCardSetEnabledVisual(wrap, useChk.checked);
         sigmaRefreshRulesStats();
@@ -7694,27 +8420,23 @@
       rm.title = t("sigma.ruleRemove");
       rm.addEventListener("click", function (ev) {
         ev.preventDefault();
-        ev.stopPropagation();
         removeSigmaRuleRow(wrap);
       });
       const rmSpan = document.createElement("span");
       rmSpan.setAttribute("data-i18n", "sigma.ruleRemove");
       rmSpan.textContent = t("sigma.ruleRemove");
       rm.appendChild(rmSpan);
-      const chev = document.createElement("span");
-      chev.className = "sigma-rule-chevron";
-      chev.setAttribute("aria-hidden", "true");
-      chev.textContent = "▾";
       actions.appendChild(rm);
-      actions.appendChild(chev);
 
-      summary.appendChild(useChk);
-      summary.appendChild(main);
-      summary.appendChild(actions);
-      wrap.appendChild(summary);
+      header.appendChild(expandBtn);
+      header.appendChild(useChk);
+      header.appendChild(main);
+      header.appendChild(actions);
+      wrap.appendChild(header);
 
       const body = document.createElement("div");
       body.className = "sigma-rule-card-body";
+      body.id = bodyId;
 
       const desc = document.createElement("p");
       desc.className = "sigma-rule-description";
@@ -7818,6 +8540,7 @@
       wrap.appendChild(body);
       mount.appendChild(wrap);
       sigmaRuleCardRefreshSummary(wrap);
+      sigmaRuleCardSetOpen(wrap, !!r.openOnAppend);
       sigmaRulesEditorSyncEmpty();
     }
 
@@ -7830,7 +8553,7 @@
     function sigmaRulesSetAllOpen(open) {
       const v = !!open;
       document.querySelectorAll("#sigmaRulesEditor .sigma-rule-card").forEach((c) => {
-        c.open = v;
+        sigmaRuleCardSetOpen(c, v);
       });
     }
 
@@ -8582,26 +9305,6 @@
       }
     }
 
-    document.addEventListener("click", (e) => {
-      const b = e.target;
-      if (!b || !b.classList) return;
-      if (!b.classList.contains("honey-zin") && !b.classList.contains("honey-zout") && !b.classList.contains("honey-zreset")) {
-        return;
-      }
-      const chartId = b.getAttribute("data-honey");
-      if (!chartId) return;
-      const svg = document.getElementById(chartId);
-      const st = honeyView[chartId];
-      if (!svg || !st) return;
-      if (b.classList.contains("honey-zin")) st.k = Math.min(4, st.k * 1.25);
-      if (b.classList.contains("honey-zout")) st.k = Math.max(0.2, st.k * 0.8);
-      if (b.classList.contains("honey-zreset")) {
-        st.k = 1;
-        st.panX = 0;
-        st.panY = 0;
-      }
-      applyHoneyTransform(svg);
-    });
 
     initUiPreferences();
     setupDatasetPickerFilters();

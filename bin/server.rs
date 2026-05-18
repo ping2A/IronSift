@@ -19,11 +19,13 @@ use tracing_subscriber::EnvFilter;
 use ironsift::{
     AnoMarkSettings, AnoMarkTrainRequest, CreateDatasetRequest, CreateDetectionConfigRequest,
     CreateRunRequest, DeleteDatasetEventsRequest, DetectionConfig, DATASET_INSPECT_MAX_SAMPLE,
-    PlatformStore, RunUserTriage, SelectDetectionConfigRequest, SigmaZeroCheckRequest,
-    SigmaZeroSettings, UpdateDetectionConfigRequest,
+    PlatformStore, ReasonPrecedentKey, RunUserTriage, SelectDetectionConfigRequest,
+    SigmaZeroCheckRequest, SigmaZeroSettings, UpdateDetectionConfigRequest,
 };
 
 const UI_HTML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/web/index.html"));
+const RUN_FINDINGS_HTML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/web/run-findings.html"));
+const RUN_FINDINGS_UI_JS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/web/run-findings-ui.js"));
 const LOGO_PNG: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/.github/logo.png"));
 
 #[derive(Clone)]
@@ -157,6 +159,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = Router::new()
         .route("/", get(ui))
+        .route("/run/:id", get(run_findings_page))
+        .route("/run-findings-ui.js", get(run_findings_ui_js))
         .route("/logo.png", get(logo_png))
         .route("/api/health", get(health))
         .route("/api/datasets", get(list_datasets).post(create_dataset))
@@ -174,8 +178,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(get_run).delete(delete_run),
         )
         .route("/api/runs/:id/detections", get(get_run_detections))
+        .route("/api/runs/:id/triage-precedent", get(get_run_triage_precedent))
+        .route(
+            "/api/runs/:id/triage-precedent/ignore",
+            post(post_run_triage_precedent_ignore),
+        )
+        .route(
+            "/api/runs/:id/triage-precedent/unignore",
+            post(post_run_triage_precedent_unignore),
+        )
         .route("/api/runs/:id/triage", put(put_run_triage))
         .route("/api/fleet/honeycomb", get(get_honeycomb))
+        .route("/api/fleet/triage-precedent", get(get_fleet_triage_precedent))
+        .route(
+            "/api/fleet/triage-precedent/drop",
+            post(post_fleet_triage_precedent_drop),
+        )
+        .route(
+            "/api/fleet/triage-precedent/undrop",
+            post(post_fleet_triage_precedent_undrop),
+        )
+        .route(
+            "/api/fleet/triage-precedent/delete",
+            post(post_fleet_triage_precedent_delete),
+        )
         .route("/api/anomark/config", get(get_anomark_config).post(set_anomark_config))
         .route("/api/anomark/availability", get(get_anomark_availability))
         .route("/api/anomark/inspect", get(inspect_anomark_configured_model))
@@ -217,6 +243,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/api/sigma-zero/config", get(get_sigma_config).post(set_sigma_config))
         .route("/api/sigma-zero/rule-templates", get(get_sigma_rule_templates))
+        .route("/api/sigma-zero/stable-rules", get(list_sigma_stable_rules))
         .route("/api/sigma-zero/check", post(check_sigma_zero))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
@@ -231,6 +258,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn ui() -> Html<&'static str> {
     Html(UI_HTML)
+}
+
+/// Standalone shareable page for one run’s findings (`GET /run/{id}`).
+async fn run_findings_page(Path(_run_id): Path<String>) -> Html<&'static str> {
+    Html(RUN_FINDINGS_HTML)
+}
+
+async fn run_findings_ui_js() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        RUN_FINDINGS_UI_JS,
+    )
 }
 
 async fn logo_png() -> Response {
@@ -412,6 +451,7 @@ async fn create_run(
 ) -> impl IntoResponse {
     let dataset_count = req.dataset_ids.len();
     let enable_anomark = req.enable_anomark;
+    let enable_sigma_stable = req.enable_sigma_stable;
     let detection_focus = req.detection_focus;
     let detector_mode = req.detector_mode;
     match state.store.run_detection(req) {
@@ -420,6 +460,7 @@ async fn create_run(
                 run_id = %run.id,
                 datasets = dataset_count,
                 enable_anomark = enable_anomark,
+                enable_sigma_stable = enable_sigma_stable,
                 ?detection_focus,
                 ?detector_mode,
                 "POST /api/runs — detection run completed"
@@ -1049,6 +1090,20 @@ async fn get_sigma_rule_templates() -> Json<serde_json::Value> {
     }))
 }
 
+async fn list_sigma_stable_rules(State(state): State<AppState>) -> impl IntoResponse {
+    match state.store.list_sigma_stable_rules() {
+        Ok(rules) => (StatusCode::OK, Json(serde_json::json!({ "rules": rules }))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError {
+                error: e.to_string(),
+            })
+            .unwrap_or_default()),
+        )
+            .into_response(),
+    }
+}
+
 async fn check_sigma_zero(
     State(state): State<AppState>,
     Json(req): Json<SigmaZeroCheckRequest>,
@@ -1108,12 +1163,19 @@ async fn get_run_detections(
     Path(id): Path<String>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    match state.store.get_run(&id) {
-        Some(run) => {
-            let findings = state
-                .store
-                .findings_for_run_detections_api(&id)
-                .unwrap_or_else(|| run.findings.clone());
+    let findings_opt = state.store.findings_for_run_detections_api(&id);
+    match findings_opt {
+        Some(findings) => {
+            let Some(run) = state.store.get_run(&id) else {
+                warn!(run_id = %id, "GET /api/runs/:id/detections — run disappeared after sync");
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::to_value(ApiError {
+                        error: "run not found".to_string(),
+                    }).unwrap_or_default()),
+                )
+                    .into_response();
+            };
             info!(
                 run_id = %id,
                 findings = findings.len(),
@@ -1125,6 +1187,9 @@ async fn get_run_detections(
                     "findings": findings,
                     "dataset_ids": run.dataset_ids,
                     "user_triage": run.user_triage.without_excluded_reason_decisions(),
+                    "run_request": run.request,
+                    "sigma_stable_stats": run.sigma_stable_stats,
+                    "created_at": run.created_at,
                 })),
             )
                 .into_response()
@@ -1136,6 +1201,101 @@ async fn get_run_detections(
                 Json(serde_json::to_value(ApiError {
                     error: "run not found".to_string(),
                 }).unwrap_or_default()),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn get_run_triage_precedent(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    match state.store.triage_precedent_for_run(&id) {
+        Some(bundle) => {
+            info!(
+                run_id = %id,
+                entries = bundle.entries.len(),
+                suppressed = bundle.suppressed.len(),
+                "GET /api/runs/:id/triage-precedent"
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "run_id": id,
+                    "entries": bundle.entries,
+                    "suppressed": bundle.suppressed,
+                })),
+            )
+                .into_response()
+        }
+        None => {
+            warn!(run_id = %id, "GET /api/runs/:id/triage-precedent — run not found");
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::to_value(ApiError {
+                    error: "run not found".to_string(),
+                }).unwrap_or_default()),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ReasonPrecedentKeyBody {
+    detector: String,
+    reason: String,
+}
+
+async fn post_run_triage_precedent_ignore(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    Json(body): Json<ReasonPrecedentKeyBody>,
+) -> impl IntoResponse {
+    let key = ReasonPrecedentKey {
+        detector: body.detector.trim().to_string(),
+        reason: body.reason,
+    };
+    match state.store.add_triage_precedent_ignore(&id, key) {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
+        Err(e) => {
+            let msg = e.to_string();
+            let status = if msg.contains("run not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (
+                status,
+                Json(serde_json::to_value(ApiError { error: msg }).unwrap_or_default()),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn post_run_triage_precedent_unignore(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+    Json(body): Json<ReasonPrecedentKeyBody>,
+) -> impl IntoResponse {
+    let key = ReasonPrecedentKey {
+        detector: body.detector.trim().to_string(),
+        reason: body.reason,
+    };
+    match state.store.remove_triage_precedent_ignore(&id, &key) {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
+        Err(e) => {
+            let msg = e.to_string();
+            let status = if msg.contains("run not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (
+                status,
+                Json(serde_json::to_value(ApiError { error: msg }).unwrap_or_default()),
             )
                 .into_response()
         }
@@ -1193,6 +1353,98 @@ async fn get_honeycomb(
             )
                 .into_response()
         }
+    }
+}
+
+async fn get_fleet_triage_precedent(State(state): State<AppState>) -> impl IntoResponse {
+    let entries = state.store.triage_precedent_fleet_global();
+    let dropped = state.store.fleet_triage_precedent_drops();
+    let n = entries.len();
+    let d = dropped.len();
+    info!(entries = n, dropped = d, "GET /api/fleet/triage-precedent");
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "scope": "fleet",
+            "run_id": serde_json::Value::Null,
+            "entries": entries,
+            "suppressed": [],
+            "dropped": dropped,
+        })),
+    )
+        .into_response()
+}
+
+async fn post_fleet_triage_precedent_drop(
+    State(state): State<AppState>,
+    Json(body): Json<ReasonPrecedentKeyBody>,
+) -> impl IntoResponse {
+    let key = ReasonPrecedentKey {
+        detector: body.detector.trim().to_string(),
+        reason: body.reason,
+    };
+    match state.store.add_fleet_triage_precedent_drop(key) {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
+        Err(e) => {
+            let msg = e.to_string();
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::to_value(ApiError { error: msg }).unwrap_or_default()),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn post_fleet_triage_precedent_undrop(
+    State(state): State<AppState>,
+    Json(body): Json<ReasonPrecedentKeyBody>,
+) -> impl IntoResponse {
+    let key = ReasonPrecedentKey {
+        detector: body.detector.trim().to_string(),
+        reason: body.reason,
+    };
+    match state.store.remove_fleet_triage_precedent_drop(&key) {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
+        Ok(false) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "unchanged": true })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError {
+                error: e.to_string(),
+            })
+            .unwrap_or_default()),
+        )
+            .into_response(),
+    }
+}
+
+async fn post_fleet_triage_precedent_delete(
+    State(state): State<AppState>,
+    Json(body): Json<ReasonPrecedentKeyBody>,
+) -> impl IntoResponse {
+    let key = ReasonPrecedentKey {
+        detector: body.detector.trim().to_string(),
+        reason: body.reason,
+    };
+    match state.store.delete_fleet_triage_precedent_entry(key) {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
+        Ok(false) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "unchanged": true })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::to_value(ApiError {
+                error: e.to_string(),
+            })
+            .unwrap_or_default()),
+        )
+            .into_response(),
     }
 }
 

@@ -321,6 +321,7 @@ impl EventDb {
             let parent: i64 = row.get(6)?;
             let start_time: Option<i64> = row.get(7)?;
             let v = sigma_json_from_ingested_sql_row(
+                dataset_id,
                 &machine_id,
                 pid,
                 &name,
@@ -372,6 +373,7 @@ impl EventDb {
                 size,
                 mtime,
                 atime,
+                Some(dataset_id),
             );
             writeln!(
                 out,
@@ -404,6 +406,7 @@ impl EventDb {
         let n_file = export_file_sources_to_sigma_jsonl_writer(
             &[(ds.source_path.clone(), ds.format.clone())],
             out,
+            Some(&ds.id),
         )?;
         Ok((n_file, false, n_file > 0))
     }
@@ -428,6 +431,7 @@ impl EventDb {
         let n_file = crate::sigma_log_export::export_process_sources_to_sigma_jsonl_writer(
             &[(ds.source_path.clone(), ds.format.clone())],
             out,
+            Some(&ds.id),
         )?;
         Ok((n_file, false, n_file > 0))
     }
